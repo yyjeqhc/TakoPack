@@ -1101,15 +1101,16 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     )?;
     writeln!(control)?;
 
+    // gen subpackages when building.
     // Add %files for each feature package
-    for feature in &package_names {
-        if !feature.is_empty() {
-            let feature_name = base_deb_name(feature);
-            let feature_base_trimmed = feature_name.trim_start_matches('-');
-            writeln!(control, "%files -n %{{name}}+{}", feature_base_trimmed)?;
-            writeln!(control)?;
-        }
-    }
+    // for feature in &package_names {
+    //     if !feature.is_empty() {
+    //         let feature_name = base_deb_name(feature);
+    //         let feature_base_trimmed = feature_name.trim_start_matches('-');
+    //         writeln!(control, "%files -n %{{name}}+{}", feature_base_trimmed)?;
+    //         writeln!(control)?;
+    //     }
+    // }
 
     writeln!(control, "%changelog")?;
     writeln!(control, "%{{?autochangelog}}")?;
