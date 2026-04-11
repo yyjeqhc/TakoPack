@@ -23,6 +23,7 @@ pub struct Config {
     pub excludes: Option<Vec<String>>,
     pub whitelist: Option<Vec<String>>,
     pub allow_prerelease_deps: bool,
+    pub dynamic_feature_deps: bool,
     pub crate_src_path: Option<PathBuf>,
     pub summary: Option<String>,
     pub description: Option<String>,
@@ -116,6 +117,7 @@ impl Default for Config {
             excludes: None,
             whitelist: None,
             allow_prerelease_deps: false,
+            dynamic_feature_deps: true,
             crate_src_path: None,
             summary: None,
             description: None,
@@ -176,6 +178,10 @@ impl Config {
 
     pub fn build_bin_package(&self) -> bool {
         self.bin.unwrap_or(!self.semver_suffix)
+    }
+
+    pub fn dynamic_feature_deps(&self) -> bool {
+        self.dynamic_feature_deps
     }
 
     pub fn overlay_dir(&self, config_path: Option<&Path>) -> Option<PathBuf> {

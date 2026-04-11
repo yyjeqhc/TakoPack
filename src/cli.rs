@@ -127,4 +127,15 @@ pub enum CargoOpt {
         #[arg(long, value_name = "FILE")]
         action_file: Option<std::path::PathBuf>,
     },
+    /// Generate rustcrates feature manifest TSV from Cargo.toml
+    #[command(name = "gen-feature-manifest")]
+    GenFeatureManifest {
+        /// Path to Cargo.toml
+        #[arg(value_name = "CARGO_TOML")]
+        cargo_toml: std::path::PathBuf,
+
+        /// Output TSV path
+        #[arg(value_name = "OUTPUT_TSV")]
+        output: std::path::PathBuf,
+    },
 }

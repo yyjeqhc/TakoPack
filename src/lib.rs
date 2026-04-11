@@ -10,6 +10,7 @@ pub mod batch_package;
 pub mod build_order;
 pub mod crate_database;
 pub mod deb_dependencies;
+pub mod feature_manifest;
 pub mod local_package;
 pub mod lockfile_parser;
 pub mod package;

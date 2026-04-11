@@ -152,6 +152,11 @@ fn real_main() -> Result<()> {
                     )?;
                     Ok(())
                 }
+                CargoOpt::GenFeatureManifest { cargo_toml, output } => {
+                    log::info!("generating runtime rustcrates feature manifest");
+                    takopack::feature_manifest::generate_feature_manifest(&cargo_toml, &output)?;
+                    Ok(())
+                }
             }
         }
     }

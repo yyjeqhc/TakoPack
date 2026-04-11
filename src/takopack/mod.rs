@@ -643,6 +643,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         download_url,
         full_version,
         sha256,
+        config.dynamic_feature_deps(),
     )?;
 
     // If source overrides are present update related parts.
@@ -833,6 +834,9 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         }
 
         for (feature, (f_deps, o_deps)) in reduced_features_with_deps.into_iter() {
+            if config.dynamic_feature_deps() && !feature.is_empty() {
+                continue;
+            }
             let pk = PackageKey::feature(feature);
             let f_provides = provides.remove(feature).unwrap();
             let mut crate_features = f_provides.clone();
@@ -1000,7 +1004,9 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
                 }
             }
         }
-        assert!(provides.is_empty());
+        if !config.dynamic_feature_deps() {
+            assert!(provides.is_empty());
+        }
         // reduced_features_with_deps consumed by into_iter, no longer usable
     } else if !bins.is_empty() {
         // Binary-only crate (no lib): generate a base package with dependencies
@@ -1095,6 +1101,12 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     writeln!(control)?;
     // Add RPM spec file sections: %conf, %build, %install, %check, %files, %changelog
     writeln!(control, "%files")?;
+    if config.dynamic_feature_deps() {
+        writeln!(
+            control,
+            "%exclude %{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/.rpm/features/*.rpmdeps"
+        )?;
+    }
     writeln!(
         control,
         "%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/"
@@ -1113,7 +1125,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // }
 
     writeln!(control, "%changelog")?;
-    writeln!(control, "%{{?autochangelog}}")?;
+    writeln!(control, "%autochangelog")?;
 
     Ok((source, has_dev_deps, test_is_broken("default")?))
 }
@@ -1170,7 +1182,7 @@ fn collapse_features(
 ///   f3 depends on f4
 /// into
 ///   f4 provides f1, f2, f3
-fn reduce_provides(
+pub(crate) fn reduce_provides(
     mut features_with_deps: CrateDepInfo,
 ) -> (BTreeMap<&'static str, Vec<&'static str>>, CrateDepInfo) {
     // If any features have duplicate dependencies, deduplicate them by

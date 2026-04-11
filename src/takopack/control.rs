@@ -38,6 +38,7 @@ pub struct Source {
     requires_root: Option<String>,
     download_url: String,
     sha256: Option<String>, // SHA256 hash of the downloaded crate file
+    dynamic_feature_deps: bool,
 }
 
 pub struct Package {
@@ -230,6 +231,26 @@ impl fmt::Display for Source {
         writeln!(f, "%global full_version {}", self.full_version)?;
         writeln!(f, "%global pkgname {}-{}", pkg_name, compat_version)?;
 
+        if self.dynamic_feature_deps {
+            writeln!(f)?;
+            writeln!(f, "%define _source_payload w9.xzdio")?;
+            writeln!(f, "%define _binary_payload w9.xzdio")?;
+            writeln!(f, "%global _local_file_attrs rustcrates_feature")?;
+            writeln!(
+                f,
+                "%global __rustcrates_feature_path ^%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/\\.rpm/features/[^/]+\\.rpmdeps$"
+            )?;
+            writeln!(f, "%global __rustcrates_feature_protocol singlefile")?;
+            writeln!(
+                f,
+                "%global __rustcrates_feature_requires %rustcrates_depgen_helper --requires"
+            )?;
+            writeln!(
+                f,
+                "%global __rustcrates_feature_provides %rustcrates_depgen_helper --provides"
+            )?;
+        }
+
         writeln!(f)?;
 
         writeln!(f, "Name:           rust-{}-{}", pkg_name, compat_version)?;
@@ -272,6 +293,9 @@ impl fmt::Display for Source {
         writeln!(f, "BuildSystem:    rustcrates")?;
         writeln!(f, "")?;
         writeln!(f, "BuildRequires:  rust-rpm-macros")?;
+        if self.dynamic_feature_deps {
+            writeln!(f, "BuildRequires:  takopack")?;
+        }
         writeln!(f)?;
         Ok(())
     }
@@ -833,6 +857,7 @@ impl Source {
         download_url: String,
         full_version: String,   // Full version including build metadata
         sha256: Option<String>, // SHA256 hash of downloaded crate file
+        dynamic_feature_deps: bool,
     ) -> Result<Source> {
         let pkgbase = match name_suffix {
             None => basename.to_string(),
@@ -876,6 +901,7 @@ impl Source {
             requires_root,
             download_url,
             sha256,
+            dynamic_feature_deps,
         })
     }
 
@@ -980,6 +1006,67 @@ impl Package {
                 dep.version = Some(format!(">= {}", version_str));
             }
         }
+    }
+
+    pub fn exported_requires(&self) -> Vec<String> {
+        use std::collections::BTreeMap;
+        let mut dep_map: BTreeMap<String, String> = BTreeMap::new();
+
+        for dep in &self.crate_deps {
+            let formatted = dep.to_crate_format();
+            let key = if let Some(space_pos) = formatted.find(' ') {
+                formatted[..space_pos].to_string()
+            } else {
+                formatted.clone()
+            };
+            match dep_map.get(&key) {
+                Some(existing) if formatted.len() > existing.len() => {
+                    dep_map.insert(key, formatted);
+                }
+                None => {
+                    dep_map.insert(key, formatted);
+                }
+                _ => {}
+            }
+        }
+
+        dep_map.into_values().collect()
+    }
+
+    pub fn exported_provides(&self) -> Vec<String> {
+        let relative_name = self.feature.as_deref().unwrap_or("");
+        let Some(crate_name) = &self.crate_name else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        if relative_name.is_empty() {
+            return out;
+        }
+
+        use std::collections::HashSet;
+        let crate_base = crate_name.replace('_', "-");
+        let mut provided_features = HashSet::new();
+        let feature_base = base_deb_name(relative_name);
+        provided_features.insert(feature_base.clone());
+
+        for provide in &self.provides {
+            if let Some(additional_feature) =
+                extract_feature_from_package_name(provide, &crate_base)
+            {
+                provided_features.insert(additional_feature);
+            }
+        }
+
+        let mut features: Vec<_> = provided_features.into_iter().collect();
+        features.sort();
+        for feature in features {
+            out.push(format!(
+                "crate(%{{pkgname}}/{})",
+                feature.trim_start_matches('-')
+            ));
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
