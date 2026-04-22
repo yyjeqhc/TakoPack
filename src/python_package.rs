@@ -1,21 +1,45 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 
 const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
+
+fn re_license_ops_with_capture() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new("(?i)\\s*(/|\\||,|\\bor\\b|\\band\\b)\\s*").unwrap())
+}
+
+fn re_spdx_like_core() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9.+-]+(?:\s+WITH\s+[A-Za-z0-9.+-]+)?$").unwrap())
+}
+
+fn re_md_link() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]\([^\)]+\)").unwrap())
+}
+
+fn re_html_tag() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
+}
 
 pub fn process_python_package(
     package_name: &str,
     version: Option<&str>,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
+    // Always create the target folder first so both normal and fallback flows
+    // can write a deterministic spec path.
     let srcname = normalize_srcname(package_name);
     let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
     let package_dir = output_base.join(format!("python-{}", srcname));
@@ -26,6 +50,8 @@ pub fn process_python_package(
         )
     })?;
 
+    // If the package does not exist on PyPI, generate an editable skeleton
+    // instead of failing the whole batch.
     let pypi_json = match fetch_pypi_json(package_name) {
         Ok(v) => v,
         Err(e) => {
@@ -60,6 +86,8 @@ pub fn process_python_package(
             .context("failed to resolve latest version from PyPI metadata")?,
     };
 
+    // Some versions publish wheels only; in that case we still emit a skeleton
+    // because spec generation depends on source archives.
     let release_file = match pick_release_file(&pypi_json, &resolved_version) {
         Ok(v) => v,
         Err(e) => {
@@ -83,6 +111,7 @@ pub fn process_python_package(
         .context("failed to create temporary directory")?;
     let archive_path = temp_dir.path().join(&release_file.filename);
     download_file(&release_file.url, &archive_path)?;
+    verify_sha256(&archive_path, &release_file.sha256)?;
 
     let extract_dir = temp_dir.path().join("extract");
     fs::create_dir_all(&extract_dir)?;
@@ -103,6 +132,7 @@ pub fn process_python_package(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| format!("https://pypi.org/project/{}/", package_name)),
+        vcs: String::new(),
         description: info
             .get("description")
             .and_then(Value::as_str)
@@ -137,6 +167,7 @@ struct SpecMeta {
     summary: String,
     license: String,
     url: String,
+    vcs: String,
     description: String,
 }
 
@@ -149,16 +180,16 @@ struct ReleaseFile {
 
 fn fetch_pypi_json(package_name: &str) -> Result<Value> {
     let url = format!("https://pypi.org/pypi/{}/json", package_name);
-    let output = Command::new("curl")
-        .args(["-fsSL", &url])
-        .output()
-        .with_context(|| "failed to execute curl for PyPI metadata request")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to query PyPI metadata: {}", stderr.trim());
-    }
+    let response = ureq::get(&url)
+        .call()
+        .with_context(|| "failed to query PyPI metadata")?;
+    let mut reader = response.into_reader();
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .with_context(|| "failed to read PyPI metadata response")?;
     let json: Value =
-        serde_json::from_slice(&output.stdout).context("failed to parse PyPI JSON metadata")?;
+        serde_json::from_slice(&body).context("failed to parse PyPI JSON metadata")?;
     Ok(json)
 }
 
@@ -172,6 +203,7 @@ fn pick_release_file(pypi_json: &Value, version: &str) -> Result<ReleaseFile> {
         .and_then(Value::as_array)
         .with_context(|| format!("version {} not found on PyPI", version))?;
 
+    // Prefer .tar.gz over .tgz and, for equal formats, pick the latest upload.
     let mut selected: Option<ReleaseFile> = None;
     let mut selected_rank: i32 = -1;
     for file in files {
@@ -252,15 +284,67 @@ fn pick_release_file(pypi_json: &Value, version: &str) -> Result<ReleaseFile> {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let output = Command::new("curl")
-        .args(["-fsSL", url, "-o"])
-        .arg(destination)
-        .output()
-        .with_context(|| format!("failed to execute curl for download: {}", url))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to download source archive: {}", stderr.trim());
+    let response = ureq::get(url)
+        .call()
+        .with_context(|| format!("failed to download source archive: {}", url))?;
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(destination).with_context(|| {
+        format!(
+            "failed to create destination file: {}",
+            destination.display()
+        )
+    })?;
+    std::io::copy(&mut reader, &mut file).with_context(|| {
+        format!(
+            "failed to write downloaded archive: {}",
+            destination.display()
+        )
+    })?;
+    file.flush().with_context(|| {
+        format!(
+            "failed to flush downloaded archive: {}",
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn verify_sha256(path: &Path, expected_sha256: &str) -> Result<()> {
+    if expected_sha256.trim().is_empty() {
+        return Ok(());
     }
+
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open downloaded archive for checksum: {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).with_context(|| {
+            format!(
+                "failed to read downloaded archive for checksum: {}",
+                path.display()
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256.to_ascii_lowercase() {
+        anyhow::bail!(
+            "sha256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_sha256,
+            actual
+        );
+    }
+
     Ok(())
 }
 
@@ -298,6 +382,7 @@ fn detect_extract_root(extract_dir: &Path) -> Result<PathBuf> {
 
 fn preferred_url_from_info(info: &serde_json::Map<String, Value>) -> Option<String> {
     if let Some(project_urls) = info.get("project_urls").and_then(Value::as_object) {
+        // Try repository-like keys first so URL is as close as possible to VCS.
         let candidates = [
             "Repository",
             "Source",
@@ -520,7 +605,13 @@ fn finalize_meta(meta: &mut SpecMeta, fallback_name: &str) {
     meta.url = cleanup_single_line(&meta.url);
     if meta.url.is_empty() {
         meta.url = format!("https://pypi.org/project/{}/", fallback_name);
+    } else if is_git_repo_url(&meta.url)
+        && (meta.url.starts_with("https://") || meta.url.starts_with("http://"))
+    {
+        meta.url = meta.url.trim_end_matches('/').to_string();
     }
+
+    meta.vcs = cleanup_single_line(&meta.vcs);
 
     let description = best_description_paragraph(&meta.description, &meta.summary);
     meta.description = if description.is_empty() {
@@ -570,6 +661,28 @@ fn render_skeleton_spec(
 }
 
 fn assign_preferred_url(meta: &mut SpecMeta, candidate: &str) {
+    if let Some(git_url) = normalize_git_url(candidate) {
+        if git_url.starts_with("https://") || git_url.starts_with("http://") {
+            let cleaned = git_url.trim_end_matches('/').to_string();
+            meta.vcs.clear();
+            if meta.url.trim().is_empty() {
+                meta.url = cleaned;
+                return;
+            }
+
+            // Keep existing URL unless the new one clearly points to a VCS repository.
+            let current_is_git = is_git_repo_url(meta.url.trim());
+            if !current_is_git {
+                meta.url = cleaned;
+            }
+            return;
+        }
+
+        // Non-HTTP git endpoint should be emitted as VCS, not URL.
+        meta.vcs = format!("git:{}", git_url);
+        return;
+    }
+
     let Some(cleaned) = normalize_url(candidate) else {
         return;
     };
@@ -579,6 +692,7 @@ fn assign_preferred_url(meta: &mut SpecMeta, candidate: &str) {
         return;
     }
 
+    // Keep existing URL unless the new one clearly points to a VCS repository.
     let current_is_git = is_git_repo_url(meta.url.trim());
     let candidate_is_git = is_git_repo_url(&cleaned);
     if candidate_is_git && !current_is_git {
@@ -587,9 +701,6 @@ fn assign_preferred_url(meta: &mut SpecMeta, candidate: &str) {
 }
 
 fn normalize_url(raw: &str) -> Option<String> {
-    if let Some(git_url) = normalize_git_url(raw) {
-        return Some(git_url);
-    }
     let trimmed = cleanup_single_line(raw);
     if trimmed.is_empty() {
         return None;
@@ -711,6 +822,7 @@ fn detect_license_from_file(path: &Path) -> Option<String> {
 }
 
 fn detect_spdx_from_license_text(text: &str) -> Option<String> {
+    // Heuristic matcher for common license full texts in source tarballs.
     let lower = text.to_ascii_lowercase();
 
     if lower.contains("permission is hereby granted")
@@ -845,6 +957,9 @@ fn render_spec(
     out.push_str(&format!("Summary:        {}\n", meta.summary));
     out.push_str(&format!("License:        {}\n", meta.license));
     out.push_str(&format!("URL:            {}\n", meta.url));
+    if !meta.vcs.is_empty() {
+        out.push_str(&format!("VCS:            {}\n", meta.vcs));
+    }
     out.push_str(&format!("#!RemoteAsset:  sha256:{}\n", sha256));
     out.push_str(&format!("Source0:        {}\n", source0));
     out.push_str("BuildArch:      noarch\n");
@@ -916,30 +1031,88 @@ fn normalize_license_to_spdx(raw: &str) -> String {
 
     let operators = ["/", "|", " or ", " and ", ","];
     if operators.iter().any(|op| lower.contains(op)) {
-        let re = Regex::new("(?i)\\s*(/|\\||,|\\bor\\b|\\band\\b)\\s*").unwrap();
-        let mut expression = String::new();
-        let mut first = true;
-        for part in re.split(&cleaned) {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let mapped = map_license_alias(&token.to_ascii_lowercase());
-            if mapped.is_empty() {
-                continue;
-            }
-            if !first {
-                expression.push_str(" OR ");
-            }
-            expression.push_str(&mapped);
-            first = false;
-        }
-        if !expression.is_empty() {
-            return expression;
+        if let Some(expr) = normalize_composite_license_expression(&cleaned) {
+            return expr;
         }
     }
 
     String::new()
+}
+
+fn normalize_composite_license_expression(input: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut ops: Vec<String> = Vec::new();
+    let mut last = 0usize;
+
+    for m in re_license_ops_with_capture().find_iter(input) {
+        let token = input[last..m.start()].trim();
+        if token.is_empty() {
+            return None;
+        }
+        let normalized = normalize_license_token(token)?;
+        parts.push(normalized);
+
+        let op_raw = m.as_str().to_ascii_lowercase();
+        let op = if op_raw.contains("and") { "AND" } else { "OR" };
+        ops.push(op.to_string());
+        last = m.end();
+    }
+
+    let tail = input[last..].trim();
+    if tail.is_empty() {
+        return None;
+    }
+    parts.push(normalize_license_token(tail)?);
+
+    if parts.len() != ops.len() + 1 {
+        return None;
+    }
+
+    let mut out = String::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+            out.push_str(&ops[idx - 1]);
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+fn normalize_license_token(token: &str) -> Option<String> {
+    let mut t = cleanup_single_line(token);
+    if t.is_empty() {
+        return None;
+    }
+
+    let mut prefix = String::new();
+    while t.starts_with('(') {
+        prefix.push('(');
+        t = t[1..].trim_start().to_string();
+    }
+
+    let mut suffix = String::new();
+    while t.ends_with(')') {
+        suffix.insert(0, ')');
+        t.pop();
+        t = t.trim_end().to_string();
+    }
+
+    if t.is_empty() {
+        return None;
+    }
+
+    let mapped = map_license_alias(&t.to_ascii_lowercase());
+    if !mapped.is_empty() {
+        return Some(format!("{}{}{}", prefix, mapped, suffix));
+    }
+
+    if re_spdx_like_core().is_match(&t) {
+        return Some(format!("{}{}{}", prefix, t, suffix));
+    }
+
+    None
 }
 
 fn map_license_alias(lower: &str) -> String {
@@ -1012,11 +1185,9 @@ fn normalize_description_line(line: &str) -> String {
         return String::new();
     }
 
-    let md_link = Regex::new(r"\[([^\]]+)\]\([^\)]+\)").unwrap();
-    cleaned = md_link.replace_all(&cleaned, "$1").to_string();
+    cleaned = re_md_link().replace_all(&cleaned, "$1").to_string();
 
-    let html_tag = Regex::new(r"<[^>]+>").unwrap();
-    cleaned = html_tag.replace_all(&cleaned, " ").to_string();
+    cleaned = re_html_tag().replace_all(&cleaned, " ").to_string();
     cleanup_single_line(&cleaned)
 }
 
@@ -1080,6 +1251,8 @@ fn shorten_description(text: &str) -> String {
 }
 
 fn split_sentences(text: &str) -> Vec<String> {
+    // Manual sentence splitting keeps us compatible with Rust regex crate,
+    // which does not support look-behind.
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut chars = text.char_indices().peekable();

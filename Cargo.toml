@@ -43,4 +43,5 @@ textwrap = "0.16"
 tempfile = "3"
 toml = "0.8"
 toml_edit = "0.22"
+ureq = { version = "2", default-features = true, features = ["tls"] }
 walkdir = "2"
