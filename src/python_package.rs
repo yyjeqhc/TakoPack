@@ -1063,7 +1063,10 @@ fn filename_dist_name(filename: &str, version: &str) -> Option<String> {
 }
 
 fn normalize_srcname(name: &str) -> String {
-    name.trim().to_lowercase().replace('_', "-")
+    name.trim()
+        .to_lowercase()
+        .replace('_', "-")
+        .replace('.', "-")
 }
 
 fn non_empty(s: &str) -> Option<&str> {
