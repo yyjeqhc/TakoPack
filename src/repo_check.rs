@@ -108,7 +108,8 @@ pub struct RepoCheckOptions {
 
 #[derive(Debug, Clone)]
 struct DepRequest {
-    cargo_name: String,
+    alias: String,
+    package_name: String,
     repo_pkgname: String,
     required_version: Vec<u64>,
     default_features: bool,
@@ -378,6 +379,18 @@ fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
                     version: req_version,
                     subpackage: current_subpackage.clone(),
                 });
+            } else if regexes.cap.is_match(&payload) {
+                warnings.push(RepoWarning {
+                    warning_type: "unsupported-requires".to_string(),
+                    rpm_name: rpm_name.clone(),
+                    subpackage: current_subpackage.clone(),
+                    cap: String::new(),
+                    normalized_version: None,
+                    requirement: Some(payload),
+                    line: Some(line_no),
+                    message: "repo-index does not parse RPM rich dependency syntax in Requires"
+                        .to_string(),
+                });
             }
         }
     }
@@ -457,7 +470,7 @@ pub fn check_cargo_toml(
     let mut transitive_ok = Vec::new();
     let mut transitive_missing = Vec::new();
     let mut transitive_conflicts = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings = index.warnings.clone();
     let mut human_blocks = Vec::new();
 
     for request in requests {
@@ -522,11 +535,16 @@ fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
         .unwrap_or_default();
 
     let mut requests = Vec::new();
-    for (cargo_name, value) in dependencies {
+    for (alias, value) in dependencies {
         let mut warnings = Vec::new();
-        let (version, default_features, features) = match value {
-            Value::String(version) => (version, true, Vec::new()),
+        let (package_name, version, default_features, features) = match value {
+            Value::String(version) => (alias.clone(), version, true, Vec::new()),
             Value::Table(table) => {
+                let package_name = table
+                    .get("package")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&alias)
+                    .to_string();
                 let version = table
                     .get("version")
                     .and_then(Value::as_str)
@@ -547,18 +565,19 @@ fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
                             .collect()
                     })
                     .unwrap_or_default();
-                (version, default_features, features)
+                (package_name, version, default_features, features)
             }
             _ => continue,
         };
 
-        if let Some(warning) = unsupported_requirement_warning(&cargo_name, &version) {
+        if let Some(warning) = unsupported_requirement_warning(&package_name, &version) {
             warnings.push(warning);
         }
         let required_version = parse_version(&version);
         requests.push(DepRequest {
-            repo_pkgname: repo_pkgname_for_dependency(&cargo_name, &required_version),
-            cargo_name,
+            repo_pkgname: repo_pkgname_for_dependency(&package_name, &required_version),
+            alias,
+            package_name,
             required_version,
             default_features,
             features,
@@ -613,39 +632,15 @@ fn analyze_dependency(
 ) -> (Vec<CheckRecord>, Vec<CheckRecord>, Vec<String>) {
     let capabilities = sorted_capabilities(index);
     let packages_by_provider = packages_by_provider(index);
-    let package =
-        choose_package_by_crate_name(index, &request.cargo_name, &request.required_version);
+    let candidates = crate_name_candidates(index, &request.package_name);
     let mut direct = Vec::new();
     let mut transitive = Vec::new();
     let mut human = vec![format!(
         "  {} (version >= {})",
-        request.cargo_name,
+        request.alias,
         format_version(&request.required_version)
     )];
-
-    let Some(package) = package else {
-        let cap = package_capability(&request.repo_pkgname, None);
-        direct.push(CheckRecord {
-            dependency: request.cargo_name.clone(),
-            capability: cap.clone(),
-            status: "missing".to_string(),
-            requirement: requirement_text_for_floor(&request.required_version),
-            provider: None,
-            chain: vec![request.cargo_name.clone(), cap],
-            message: Some("no repo package matches crate name".to_string()),
-        });
-        human.push(format!(
-            "    no repo package matches crate name for {}",
-            request.cargo_name
-        ));
-        return (direct, transitive, human);
-    };
-
-    let pkgname = if package.pkgname.is_empty() {
-        &request.repo_pkgname
-    } else {
-        &package.pkgname
-    };
+    let pkgname = &request.repo_pkgname;
 
     let mut selected_features = Vec::new();
     if request.default_features {
@@ -666,7 +661,12 @@ fn analyze_dependency(
         } else {
             Vec::new()
         };
-        let result = analyze_requirement(&request.cargo_name, &cap, &floor, &capabilities);
+        let diagnostic = if cap == package_capability(pkgname, None) {
+            rejected_candidate_message(&request.repo_pkgname, &candidates)
+        } else {
+            None
+        };
+        let result = analyze_requirement(&request.alias, &cap, &floor, &capabilities, diagnostic);
         if result.status == "missing" {
             human.push(format!("    {} -> no provider found", cap));
             direct.push(result);
@@ -694,11 +694,11 @@ fn analyze_dependency(
 
         if check_transitive {
             walk_transitive(
-                &request.cargo_name,
+                &request.alias,
                 provider,
                 &capabilities,
                 &packages_by_provider,
-                vec![request.cargo_name.clone(), cap],
+                vec![request.alias.clone(), cap],
                 &mut BTreeSet::new(),
                 &mut transitive,
             );
@@ -733,29 +733,32 @@ fn packages_by_provider(index: &RepoIndex) -> BTreeMap<(String, String), Indexed
     map
 }
 
-fn choose_package_by_crate_name<'a>(
-    index: &'a RepoIndex,
-    cargo_name: &str,
-    minimum_version: &[u64],
-) -> Option<&'a IndexedPackage> {
+fn crate_name_candidates<'a>(index: &'a RepoIndex, cargo_name: &str) -> Vec<&'a IndexedPackage> {
     let normalized = normalize_crate_name(cargo_name);
-    let candidates: Vec<_> = index
+    index
         .packages
         .iter()
         .filter(|package| normalize_crate_name(&package.crate_name) == normalized)
-        .collect();
-    let satisfying: Vec<_> = candidates
+        .collect()
+}
+
+fn rejected_candidate_message(
+    expected_pkgname: &str,
+    candidates: &[&IndexedPackage],
+) -> Option<String> {
+    let rejected: Vec<_> = candidates
         .iter()
-        .copied()
-        .filter(|package| version_at_least(&package.version, minimum_version))
+        .filter(|package| package.pkgname != expected_pkgname)
+        .map(|package| format!("{} {}", package.pkgname, package.version))
         .collect();
-    let pool = if satisfying.is_empty() {
-        candidates
+    if rejected.is_empty() {
+        None
     } else {
-        satisfying
-    };
-    pool.into_iter()
-        .max_by(|a, b| parse_version(&a.version).cmp(&parse_version(&b.version)))
+        Some(format!(
+            "no provider found; expected capability crate({expected_pkgname}); rejected candidate(s): {}",
+            rejected.join(", ")
+        ))
+    }
 }
 
 fn analyze_requirement(
@@ -763,6 +766,7 @@ fn analyze_requirement(
     capability: &str,
     required_floor: &[u64],
     capabilities: &BTreeMap<String, Vec<CapabilityProvider>>,
+    missing_diagnostic: Option<String>,
 ) -> CheckRecord {
     let resolution = select_provider(capabilities, capability, required_floor);
     let chain = vec![root_dependency.to_string(), capability.to_string()];
@@ -792,7 +796,7 @@ fn analyze_requirement(
             requirement: requirement_text_for_floor(required_floor),
             provider: None,
             chain,
-            message: Some("no provider found".to_string()),
+            message: Some(missing_diagnostic.unwrap_or_else(|| "no provider found".to_string())),
         },
     }
 }
