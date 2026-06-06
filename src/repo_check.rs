@@ -139,6 +139,53 @@ pub struct RepoPlanSummary {
     pub unsupported: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildReqsKind {
+    Crate,
+    App,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildReqsOptions {
+    pub kind: BuildReqsKind,
+    pub include_build: bool,
+    pub include_dev: bool,
+    pub json: bool,
+    pub check: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildReqsResult {
+    pub cargo_toml: String,
+    pub kind: BuildReqsKind,
+    pub include_build: bool,
+    pub include_dev: bool,
+    pub buildrequires: Vec<BuildRequiresRecord>,
+    pub missing: Vec<CheckRecord>,
+    pub conflicts: Vec<CheckRecord>,
+    pub warnings: Vec<RepoWarning>,
+    pub summary: BuildReqsSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRequiresRecord {
+    pub section: String,
+    pub dependency: String,
+    pub package: String,
+    pub capability: String,
+    pub requirement: Option<String>,
+    pub feature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildReqsSummary {
+    pub buildrequires: usize,
+    pub missing: usize,
+    pub conflicts: usize,
+    pub warnings: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeedAddAction {
     pub capability: String,
@@ -240,6 +287,19 @@ struct DepRequest {
     alias: String,
     package_name: String,
     repo_pkgname: String,
+    required_version: Vec<u64>,
+    default_features: bool,
+    features: Vec<String>,
+    warnings: Vec<RepoWarning>,
+}
+
+#[derive(Debug, Clone)]
+struct BuildReqRequest {
+    section: String,
+    alias: String,
+    package_name: String,
+    repo_pkgname: String,
+    version_requirement: String,
     required_version: Vec<u64>,
     default_features: bool,
     features: Vec<String>,
@@ -862,6 +922,270 @@ pub fn run_repo_plan(
     }
 
     Ok(0)
+}
+
+pub fn run_buildreqs(
+    cargo_toml: &Path,
+    index_path: Option<&Path>,
+    options: BuildReqsOptions,
+) -> Result<i32> {
+    let index = match index_path {
+        Some(path) => {
+            let index_content = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            Some(
+                serde_json::from_str(&index_content)
+                    .with_context(|| format!("failed to parse {}", path.display()))?,
+            )
+        }
+        None => None,
+    };
+    let result = build_buildreqs(cargo_toml, index.as_ref(), &options)?;
+
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_buildreqs(&result);
+    }
+
+    if options.check
+        && index_path.is_some()
+        && (result.summary.missing > 0 || result.summary.conflicts > 0)
+    {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+pub fn build_buildreqs(
+    cargo_toml: &Path,
+    index: Option<&RepoIndex>,
+    options: &BuildReqsOptions,
+) -> Result<BuildReqsResult> {
+    let requests = load_buildreq_dependencies(cargo_toml, options)?;
+    let check_capabilities = index.is_some();
+    let capabilities = index.map(sorted_capabilities).unwrap_or_default();
+    let mut buildrequires = Vec::new();
+    let mut missing = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut warnings = Vec::new();
+
+    for request in requests {
+        warnings.extend(request.warnings.clone());
+        let mut records = buildrequires_for_request(&request);
+        buildrequires.append(&mut records);
+    }
+
+    dedup_buildrequires(&mut buildrequires);
+    if check_capabilities {
+        for record in &buildrequires {
+            let floor = buildreq_requirement_floor(record.requirement.as_deref());
+            let check = analyze_requirement(
+                &record.dependency,
+                &record.capability,
+                &floor,
+                &capabilities,
+                None,
+            );
+            match check.status.as_str() {
+                "missing" => missing.push(check),
+                "conflict" => conflicts.push(check),
+                _ => {}
+            }
+        }
+    }
+    Ok(BuildReqsResult {
+        cargo_toml: display_path(cargo_toml),
+        kind: options.kind,
+        include_build: options.include_build,
+        include_dev: options.include_dev,
+        summary: BuildReqsSummary {
+            buildrequires: buildrequires.len(),
+            missing: missing.len(),
+            conflicts: conflicts.len(),
+            warnings: warnings.len(),
+        },
+        buildrequires,
+        missing,
+        conflicts,
+        warnings,
+    })
+}
+
+fn load_buildreq_dependencies(
+    cargo_toml: &Path,
+    options: &BuildReqsOptions,
+) -> Result<Vec<BuildReqRequest>> {
+    let content = fs::read_to_string(cargo_toml)
+        .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+    let manifest: Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
+
+    let mut sections = vec!["dependencies"];
+    if options.include_build {
+        sections.push("build-dependencies");
+    }
+    if options.include_dev {
+        sections.push("dev-dependencies");
+    }
+
+    let mut requests = Vec::new();
+    for section in sections {
+        let Some(dependencies) = manifest.get(section).and_then(Value::as_table) else {
+            continue;
+        };
+        for (alias, value) in dependencies {
+            let Some(request) =
+                parse_buildreq_dependency(section, alias.to_string(), value.clone())
+            else {
+                continue;
+            };
+            requests.push(request);
+        }
+    }
+
+    Ok(requests)
+}
+
+fn parse_buildreq_dependency(
+    section: &str,
+    alias: String,
+    value: Value,
+) -> Option<BuildReqRequest> {
+    let (package_name, version, default_features, features) = match value {
+        Value::String(version) => (alias.clone(), version, true, Vec::new()),
+        Value::Table(table) => {
+            let package_name = table
+                .get("package")
+                .and_then(Value::as_str)
+                .unwrap_or(&alias)
+                .to_string();
+            let version = table
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let default_features = table
+                .get("default-features")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let features = table
+                .get("features")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(normalize_feature_name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (package_name, version, default_features, features)
+        }
+        _ => return None,
+    };
+
+    let mut warnings = Vec::new();
+    if let Some(mut warning) = unsupported_requirement_warning(&package_name, &version) {
+        warning.subpackage = section.to_string();
+        warning.message =
+            "buildreqs only derives lower bounds from simple Cargo requirements in this experimental version"
+                .to_string();
+        warnings.push(warning);
+    }
+
+    let required_version = parse_version(&version);
+    Some(BuildReqRequest {
+        section: section.to_string(),
+        repo_pkgname: repo_pkgname_for_dependency(&package_name, &required_version),
+        alias,
+        package_name,
+        version_requirement: version,
+        required_version,
+        default_features,
+        features,
+        warnings,
+    })
+}
+
+fn buildrequires_for_request(request: &BuildReqRequest) -> Vec<BuildRequiresRecord> {
+    let mut records = vec![BuildRequiresRecord {
+        section: request.section.clone(),
+        dependency: request.alias.clone(),
+        package: request.package_name.clone(),
+        capability: package_capability(&request.repo_pkgname, None),
+        requirement: buildreq_requirement_text(request),
+        feature: None,
+    }];
+
+    let mut features = BTreeSet::new();
+    if request.default_features {
+        features.insert("default".to_string());
+    }
+    features.extend(request.features.clone());
+
+    for feature in features {
+        records.push(BuildRequiresRecord {
+            section: request.section.clone(),
+            dependency: request.alias.clone(),
+            package: request.package_name.clone(),
+            capability: package_capability(&request.repo_pkgname, Some(&feature)),
+            requirement: None,
+            feature: Some(feature),
+        });
+    }
+
+    records
+}
+
+fn buildreq_requirement_text(request: &BuildReqRequest) -> Option<String> {
+    if request.version_requirement.trim().is_empty() {
+        None
+    } else {
+        requirement_text_for_floor(&request.required_version)
+    }
+}
+
+fn dedup_buildrequires(records: &mut Vec<BuildRequiresRecord>) {
+    records.sort_by(|a, b| {
+        (
+            &a.capability,
+            &a.requirement,
+            &a.section,
+            &a.dependency,
+            &a.feature,
+        )
+            .cmp(&(
+                &b.capability,
+                &b.requirement,
+                &b.section,
+                &b.dependency,
+                &b.feature,
+            ))
+    });
+    records.dedup_by(|a, b| a.capability == b.capability && a.requirement == b.requirement);
+}
+
+fn buildreq_requirement_floor(requirement: Option<&str>) -> Vec<u64> {
+    let Some(requirement) = requirement else {
+        return Vec::new();
+    };
+    let version = requirement
+        .trim()
+        .strip_prefix(">=")
+        .unwrap_or(requirement)
+        .trim();
+    parse_version(version)
+}
+
+fn print_buildreqs(result: &BuildReqsResult) {
+    for record in &result.buildrequires {
+        match &record.requirement {
+            Some(requirement) => println!("BuildRequires: {} {}", record.capability, requirement),
+            None => println!("BuildRequires: {}", record.capability),
+        }
+    }
 }
 
 pub fn build_repo_plan(

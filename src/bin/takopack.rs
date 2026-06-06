@@ -6,7 +6,7 @@ use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
 use takopack::recursive_package::RecursivePackager;
-use takopack::repo_check::{RepoCheckOptions, RepoIndexOptions};
+use takopack::repo_check::{BuildReqsOptions, RepoCheckOptions, RepoIndexOptions};
 use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
@@ -127,6 +127,25 @@ fn real_main() -> Result<i32> {
                     takopack::local_package::process_local_package(&path, output, finish)?;
                     Ok(0)
                 }
+                CargoOpt::BuildReqs {
+                    file,
+                    index,
+                    kind,
+                    include_build,
+                    include_dev,
+                    json,
+                    check,
+                } => takopack::repo_check::run_buildreqs(
+                    &file,
+                    index.as_deref(),
+                    BuildReqsOptions {
+                        kind,
+                        include_build,
+                        include_dev,
+                        json,
+                        check,
+                    },
+                ),
                 CargoOpt::RepoIndex {
                     spec_repo_dir,
                     ruyispec,

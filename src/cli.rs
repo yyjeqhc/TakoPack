@@ -3,6 +3,7 @@ use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
 use crate::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     recursive_package::RecursivePackageArgs,
+    repo_check::BuildReqsKind,
 };
 
 const CLI_STYLE: Styles = Styles::styled()
@@ -86,6 +87,37 @@ pub enum CargoOpt {
 
         #[command(flatten)]
         finish: PackageExecuteArgs,
+    },
+    /// Generate RPM BuildRequires candidates from Cargo.toml
+    #[command(name = "buildreqs")]
+    BuildReqs {
+        /// Input Cargo.toml
+        #[arg(short = 'f', long, value_name = "CARGO_TOML")]
+        file: std::path::PathBuf,
+
+        /// Optional repo-index JSON for capability existence/version checks
+        #[arg(long, value_name = "INDEX_JSON")]
+        index: Option<std::path::PathBuf>,
+
+        /// Package kind for policy defaults
+        #[arg(long, value_enum, default_value = "crate")]
+        kind: BuildReqsKind,
+
+        /// Include [build-dependencies]
+        #[arg(long, default_value_t = true)]
+        include_build: bool,
+
+        /// Include [dev-dependencies]
+        #[arg(long)]
+        include_dev: bool,
+
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Return non-zero when --index reports missing/conflict records
+        #[arg(long)]
+        check: bool,
     },
     /// Build a static crate capability index from RPM spec files
     #[command(name = "repo-index")]
