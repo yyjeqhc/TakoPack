@@ -180,14 +180,19 @@ fn real_main() -> Result<i32> {
                     index,
                     check_transitive,
                     json,
+                    include_global_warnings,
                 } => takopack::repo_check::run_repo_plan(
                     &cargo_toml,
                     &index,
-                    RepoCheckOptions {
+                    takopack::repo_check::RepoPlanOptions {
                         check_transitive,
                         json,
+                        include_global_warnings,
                     },
                 ),
+                CargoOpt::RepoHealth { index, json } => {
+                    takopack::repo_check::run_repo_health(&index, json)
+                }
                 CargoOpt::AppAudit {
                     ruyispec_dir,
                     ruyispec,

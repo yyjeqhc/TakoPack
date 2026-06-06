@@ -139,6 +139,66 @@ pub struct RepoPlanSummary {
     pub unsupported: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct RepoPlanOptions {
+    pub check_transitive: bool,
+    pub json: bool,
+    pub include_global_warnings: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoHealthReport {
+    pub index: String,
+    pub rename: Vec<RenameAction>,
+    pub dedupe: Vec<DedupeAction>,
+    pub remove_prerelease: Vec<RemovePrereleaseAction>,
+    pub exact_version_packages: Vec<ExactVersionPackageAction>,
+    pub duplicates: Vec<DuplicateAction>,
+    pub skipped: Vec<SkippedPackage>,
+    pub summary: RepoHealthSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameAction {
+    pub current: String,
+    pub target: String,
+    pub reason: String,
+    pub capability_current: String,
+    pub capability_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupeAction {
+    pub slot: String,
+    pub keep: String,
+    pub remove: Vec<String>,
+    pub reason: String,
+    pub manual_review: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovePrereleaseAction {
+    pub package: String,
+    pub suggested_action: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactVersionPackageAction {
+    pub package: String,
+    pub suggested_slot: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoHealthSummary {
+    pub rename: usize,
+    pub dedupe: usize,
+    pub remove_prerelease: usize,
+    pub exact_version_packages: usize,
+    pub duplicates: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuildReqsKind {
@@ -907,13 +967,13 @@ pub fn run_repo_check(
 pub fn run_repo_plan(
     cargo_toml: &Path,
     index_path: &Path,
-    options: RepoCheckOptions,
+    options: RepoPlanOptions,
 ) -> Result<i32> {
     let index_content = fs::read_to_string(index_path)
         .with_context(|| format!("failed to read {}", index_path.display()))?;
     let index: RepoIndex = serde_json::from_str(&index_content)
         .with_context(|| format!("failed to parse {}", index_path.display()))?;
-    let result = build_repo_plan(cargo_toml, &index, options.check_transitive)?;
+    let result = build_repo_plan_with_options(cargo_toml, &index, &options)?;
 
     if options.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -922,6 +982,278 @@ pub fn run_repo_plan(
     }
 
     Ok(0)
+}
+
+pub fn run_repo_health(index_path: &Path, json: bool) -> Result<i32> {
+    let index_content = fs::read_to_string(index_path)
+        .with_context(|| format!("failed to read {}", index_path.display()))?;
+    let index: RepoIndex = serde_json::from_str(&index_content)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let report = build_repo_health_report(index_path, &index);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_repo_health(&report);
+    }
+
+    Ok(0)
+}
+
+pub fn build_repo_health_report(index_path: &Path, index: &RepoIndex) -> RepoHealthReport {
+    let mut rename = Vec::new();
+    let mut exact_version_packages = Vec::new();
+    let mut remove_prerelease = Vec::new();
+    let mut duplicates = Vec::new();
+    let packages_by_name: BTreeMap<_, _> = index
+        .packages
+        .iter()
+        .map(|package| (package.rpm_name.as_str(), package))
+        .collect();
+
+    for warning in &index.warnings {
+        match warning.warning_type.as_str() {
+            "legacy-compat-name" => {
+                let target = warning
+                    .expected
+                    .clone()
+                    .unwrap_or_else(|| warning.rpm_name.clone());
+                let capability_current = packages_by_name
+                    .get(warning.rpm_name.as_str())
+                    .and_then(|package| main_package_capability(package))
+                    .unwrap_or_else(|| {
+                        if warning.cap.is_empty() {
+                            capability_from_rust_package_name(&warning.rpm_name)
+                                .unwrap_or_else(|| warning.cap.clone())
+                        } else {
+                            warning.cap.clone()
+                        }
+                    });
+                let capability_target = capability_from_rust_package_name(&target)
+                    .unwrap_or_else(|| warning.cap.clone());
+                rename.push(RenameAction {
+                    current: warning.rpm_name.clone(),
+                    target,
+                    reason: "legacy compat name".to_string(),
+                    capability_current,
+                    capability_target,
+                });
+            }
+            "exact-version-package" => {
+                exact_version_packages.push(ExactVersionPackageAction {
+                    package: warning.rpm_name.clone(),
+                    suggested_slot: warning
+                        .expected
+                        .clone()
+                        .unwrap_or_else(|| warning.rpm_name.clone()),
+                    reason: "exact version package in ordinary repo".to_string(),
+                });
+            }
+            "prerelease-version" => {
+                remove_prerelease.push(RemovePrereleaseAction {
+                    package: warning.rpm_name.clone(),
+                    suggested_action: "remove-or-exact-exception".to_string(),
+                    reason: "pre-release crate should not enter ordinary compat slot".to_string(),
+                });
+            }
+            "duplicate-provider" => {
+                duplicates.push(DuplicateAction {
+                    capability: warning.cap.clone(),
+                    providers: warning.rpm_name.clone(),
+                    reason: "multiple providers for same capability".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    rename.sort_by(|a, b| a.current.cmp(&b.current));
+    exact_version_packages.sort_by(|a, b| a.package.cmp(&b.package));
+    remove_prerelease.sort_by(|a, b| a.package.cmp(&b.package));
+    duplicates.sort_by(|a, b| a.capability.cmp(&b.capability));
+    duplicates.dedup_by(|a, b| a.capability == b.capability);
+
+    let mut dedupe = build_dedupe_actions(index);
+    dedupe.sort_by(|a, b| a.slot.cmp(&b.slot));
+
+    RepoHealthReport {
+        index: display_path(index_path),
+        summary: RepoHealthSummary {
+            rename: rename.len(),
+            dedupe: dedupe.len(),
+            remove_prerelease: remove_prerelease.len(),
+            exact_version_packages: exact_version_packages.len(),
+            duplicates: duplicates.len(),
+        },
+        rename,
+        dedupe,
+        remove_prerelease,
+        exact_version_packages,
+        duplicates,
+        skipped: index.skipped.clone(),
+    }
+}
+
+fn build_dedupe_actions(index: &RepoIndex) -> Vec<DedupeAction> {
+    let mut by_slot: BTreeMap<String, Vec<&IndexedPackage>> = BTreeMap::new();
+    for package in &index.packages {
+        let Some(slot) = expected_rust_package_name(&package.crate_name, &package.version) else {
+            continue;
+        };
+        by_slot.entry(slot).or_default().push(package);
+    }
+
+    let mut actions = Vec::new();
+    for (slot, packages) in by_slot {
+        let unique: BTreeSet<_> = packages
+            .iter()
+            .map(|package| package.rpm_name.clone())
+            .collect();
+        if unique.len() < 2 {
+            continue;
+        }
+
+        let (keep, manual_review) = select_dedupe_keep(&packages);
+        let remove = packages
+            .iter()
+            .map(|package| package.rpm_name.clone())
+            .filter(|name| name != &keep)
+            .collect();
+        actions.push(DedupeAction {
+            slot,
+            keep,
+            remove,
+            reason: "multiple packages in one compat branch".to_string(),
+            manual_review,
+        });
+    }
+
+    actions
+}
+
+fn select_dedupe_keep(packages: &[&IndexedPackage]) -> (String, bool) {
+    let stable: Vec<_> = packages
+        .iter()
+        .copied()
+        .filter(|package| !has_prerelease_package_version_marker(package))
+        .collect();
+    let candidates = if stable.is_empty() {
+        packages.to_vec()
+    } else {
+        stable
+    };
+    let manual_review = candidates
+        .iter()
+        .any(|package| parse_version(&package.version).is_empty());
+    let keep = candidates
+        .into_iter()
+        .max_by(|a, b| parse_version(&a.version).cmp(&parse_version(&b.version)))
+        .or_else(|| packages.first().copied())
+        .map(|package| package.rpm_name.clone())
+        .unwrap_or_default();
+    (keep, manual_review)
+}
+
+fn main_package_capability(package: &IndexedPackage) -> Option<String> {
+    package
+        .provides
+        .iter()
+        .find(|provide| provide.subpackage == "main" && !capability_has_feature(&provide.cap))
+        .map(|provide| provide.cap.clone())
+        .or_else(|| {
+            package
+                .provides
+                .iter()
+                .find(|provide| !capability_has_feature(&provide.cap))
+                .map(|provide| provide.cap.clone())
+        })
+}
+
+fn capability_has_feature(capability: &str) -> bool {
+    crate_capability_name(capability).is_some_and(|name| name.contains('/'))
+}
+
+fn capability_from_rust_package_name(package_name: &str) -> Option<String> {
+    package_name
+        .strip_prefix("rust-")
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("crate({name})"))
+}
+
+fn print_repo_health(report: &RepoHealthReport) {
+    println!("Repo health for {}", report.index);
+
+    println!();
+    println!("Rename legacy compat names:");
+    if report.rename.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &report.rename {
+            println!("  {} -> {}", action.current, action.target);
+        }
+    }
+
+    println!();
+    println!("Dedupe:");
+    if report.dedupe.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &report.dedupe {
+            println!("  {}", action.slot);
+            println!("    keep: {}", action.keep);
+            if action.remove.is_empty() {
+                println!("    remove: (none)");
+            } else {
+                println!("    remove: {}", action.remove.join(", "));
+            }
+            if action.manual_review {
+                println!("    manual-review");
+            }
+        }
+    }
+
+    println!();
+    println!("Pre-release:");
+    if report.remove_prerelease.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &report.remove_prerelease {
+            println!("  {} {}", action.package, action.suggested_action);
+        }
+    }
+
+    println!();
+    println!("Exact version packages:");
+    if report.exact_version_packages.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &report.exact_version_packages {
+            println!("  {} -> {}", action.package, action.suggested_slot);
+        }
+    }
+
+    println!();
+    println!("Duplicates:");
+    if report.duplicates.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &report.duplicates {
+            println!("  {}", action.capability);
+            println!("    providers: {}", action.providers);
+        }
+    }
+
+    let summary = &report.summary;
+    println!();
+    println!("Summary:");
+    println!(
+        "  rename={} dedupe={} prerelease={} exact_version_packages={} duplicates={}",
+        summary.rename,
+        summary.dedupe,
+        summary.remove_prerelease,
+        summary.exact_version_packages,
+        summary.duplicates
+    );
 }
 
 pub fn run_buildreqs(
@@ -1193,7 +1525,28 @@ pub fn build_repo_plan(
     index: &RepoIndex,
     check_transitive: bool,
 ) -> Result<RepoPlanResult> {
-    let check = check_cargo_toml(cargo_toml, index, check_transitive)?;
+    build_repo_plan_with_options(
+        cargo_toml,
+        index,
+        &RepoPlanOptions {
+            check_transitive,
+            json: false,
+            include_global_warnings: false,
+        },
+    )
+}
+
+pub fn build_repo_plan_with_options(
+    cargo_toml: &Path,
+    index: &RepoIndex,
+    options: &RepoPlanOptions,
+) -> Result<RepoPlanResult> {
+    let check = check_cargo_toml(cargo_toml, index, options.check_transitive)?;
+    let warnings = if options.include_global_warnings {
+        check.warnings.clone()
+    } else {
+        repo_plan_related_warnings(&check)
+    };
     let mut need_add = Vec::new();
     let mut need_update = Vec::new();
     let mut duplicates = Vec::new();
@@ -1220,7 +1573,7 @@ pub fn build_repo_plan(
             &mut need_update,
         );
     }
-    for warning in &check.warnings {
+    for warning in &warnings {
         match warning.warning_type.as_str() {
             "duplicate-provider" => {
                 if seen_duplicates.insert(warning.cap.clone()) {
@@ -1251,8 +1604,7 @@ pub fn build_repo_plan(
             _ => {}
         }
     }
-    let policy_warnings = check
-        .warnings
+    let policy_warnings = warnings
         .iter()
         .filter(|warning| is_repo_plan_policy_warning(&warning.warning_type))
         .cloned()
@@ -1272,8 +1624,67 @@ pub fn build_repo_plan(
         duplicates,
         unsupported,
         policy_warnings,
-        warnings: check.warnings,
+        warnings,
     })
+}
+
+fn repo_plan_related_warnings(check: &RepoCheckResult) -> Vec<RepoWarning> {
+    let mut capabilities = BTreeSet::new();
+    let mut providers = BTreeSet::new();
+    for record in check
+        .ok
+        .iter()
+        .chain(check.missing.iter())
+        .chain(check.conflicts.iter())
+        .chain(check.transitive_ok.iter())
+        .chain(check.transitive_missing.iter())
+        .chain(check.transitive_conflicts.iter())
+    {
+        capabilities.insert(record.capability.clone());
+        if let Some(provider) = &record.provider {
+            providers.insert(provider.rpm_name.clone());
+        }
+    }
+
+    check
+        .warnings
+        .iter()
+        .filter(|warning| {
+            repo_plan_warning_is_direct(warning)
+                || repo_plan_warning_matches_warning_capability(warning, &capabilities)
+                || repo_plan_warning_matches_provider(warning, &providers)
+                || warning
+                    .requirement
+                    .as_deref()
+                    .and_then(first_crate_capability)
+                    .is_some_and(|capability| capabilities.contains(&capability))
+        })
+        .cloned()
+        .collect()
+}
+
+fn repo_plan_warning_is_direct(warning: &RepoWarning) -> bool {
+    warning.warning_type == "unsupported-requirement"
+        || warning.subpackage == "direct"
+        || warning.rpm_name.is_empty()
+}
+
+fn repo_plan_warning_matches_warning_capability(
+    warning: &RepoWarning,
+    capabilities: &BTreeSet<String>,
+) -> bool {
+    !warning.cap.is_empty() && capabilities.contains(&warning.cap)
+}
+
+fn repo_plan_warning_matches_provider(warning: &RepoWarning, providers: &BTreeSet<String>) -> bool {
+    if warning.rpm_name.is_empty() {
+        return false;
+    }
+    warning
+        .rpm_name
+        .split(',')
+        .map(str::trim)
+        .any(|rpm_name| providers.contains(rpm_name))
 }
 
 pub fn run_app_audit(
