@@ -125,6 +125,7 @@ pub struct RepoPlanResult {
     pub need_update: Vec<NeedUpdateAction>,
     pub duplicates: Vec<DuplicateAction>,
     pub unsupported: Vec<UnsupportedAction>,
+    pub policy_warnings: Vec<RepoWarning>,
     pub summary: RepoPlanSummary,
     pub repo_check_summary: RepoCheckSummary,
     pub warnings: Vec<RepoWarning>,
@@ -394,7 +395,7 @@ pub fn build_repo_index_with_options(
         }
 
         if is_rust_candidate {
-            add_naming_warning(&package, dir_name, &mut package_warnings);
+            add_package_policy_warning(&package, dir_name, &mut package_warnings);
         }
 
         for provide in &package.provides {
@@ -483,7 +484,11 @@ fn cargo_package_name(cargo_toml: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn add_naming_warning(package: &IndexedPackage, dir_name: &str, warnings: &mut Vec<RepoWarning>) {
+fn add_package_policy_warning(
+    package: &IndexedPackage,
+    dir_name: &str,
+    warnings: &mut Vec<RepoWarning>,
+) {
     let Some(expected) = expected_rust_package_name(&package.crate_name, &package.version) else {
         return;
     };
@@ -493,8 +498,9 @@ fn add_naming_warning(package: &IndexedPackage, dir_name: &str, warnings: &mut V
         return;
     }
 
+    let warning_type = package_policy_warning_type(package);
     warnings.push(RepoWarning {
-        warning_type: "naming-mismatch".to_string(),
+        warning_type: warning_type.to_string(),
         rpm_name: package.rpm_name.clone(),
         subpackage: "main".to_string(),
         cap: package_capability(&package.pkgname, None),
@@ -502,8 +508,35 @@ fn add_naming_warning(package: &IndexedPackage, dir_name: &str, warnings: &mut V
         requirement: None,
         line: None,
         expected: Some(expected),
-        message: "Rust crate package name should follow rust-<crate>-<compat-branch>".to_string(),
+        message: package_policy_warning_message(warning_type).to_string(),
     });
+}
+
+fn package_policy_warning_type(package: &IndexedPackage) -> &'static str {
+    if has_prerelease_package_version_marker(package) {
+        "prerelease-version"
+    } else if exact_version_package_name(&package.rpm_name, &package.crate_name, &package.version) {
+        "exact-version-package"
+    } else if legacy_compat_name(&package.rpm_name, &package.crate_name, &package.version) {
+        "legacy-compat-name"
+    } else {
+        "naming-mismatch"
+    }
+}
+
+fn package_policy_warning_message(warning_type: &str) -> &'static str {
+    match warning_type {
+        "legacy-compat-name" => {
+            "Rust crate package uses an old dotted compat package name; prefer rust-<crate>-<compat-branch>"
+        }
+        "exact-version-package" => {
+            "Rust crate package appears to use an exact-version package name; keep exact exceptions out of ordinary compat capability"
+        }
+        "prerelease-version" => {
+            "Pre-release Rust crate package should not enter the ordinary compat branch by default"
+        }
+        _ => "Rust crate package name should follow rust-<crate>-<compat-branch>",
+    }
 }
 
 fn expected_rust_package_name(crate_name: &str, version: &str) -> Option<String> {
@@ -512,6 +545,60 @@ fn expected_rust_package_name(crate_name: &str, version: &str) -> Option<String>
     }
     let branch = compat_branch(&parse_version(version))?;
     Some(format!("rust-{}-{branch}", crate_name.replace('_', "-")))
+}
+
+fn legacy_compat_name(rpm_name: &str, crate_name: &str, version: &str) -> bool {
+    let parts = parse_version(version);
+    if parts.len() < 2 || parts[0] == 0 {
+        return false;
+    }
+    let legacy = format!(
+        "rust-{}-{}.{}",
+        crate_name.replace('_', "-"),
+        parts[0],
+        parts[1]
+    );
+    rpm_name == legacy
+}
+
+fn exact_version_package_name(rpm_name: &str, crate_name: &str, version: &str) -> bool {
+    let parts = parse_version(version);
+    if parts.len() < 3 {
+        return false;
+    }
+    let exact = format!(
+        "rust-{}-{}",
+        crate_name.replace('_', "-"),
+        parts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    );
+    rpm_name == exact
+}
+
+fn has_prerelease_package_version_marker(package: &IndexedPackage) -> bool {
+    if has_prerelease_version_marker(&package.version) {
+        return true;
+    }
+    let package_prefix = format!("rust-{}-", package.crate_name.replace('_', "-"));
+    package
+        .rpm_name
+        .strip_prefix(&package_prefix)
+        .is_some_and(has_prerelease_version_marker)
+}
+
+fn has_prerelease_version_marker(version: &str) -> bool {
+    let Some((release, suffix)) = version.split_once('-') else {
+        return false;
+    };
+    if parse_version(release).is_empty() {
+        return false;
+    }
+    suffix
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|segment| matches!(segment, "rc" | "pre" | "alpha" | "beta"))
 }
 
 fn pkgname_looks_like_crate_compat(pkgname: &str) -> bool {
@@ -840,6 +927,12 @@ pub fn build_repo_plan(
             _ => {}
         }
     }
+    let policy_warnings = check
+        .warnings
+        .iter()
+        .filter(|warning| is_repo_plan_policy_warning(&warning.warning_type))
+        .cloned()
+        .collect();
 
     Ok(RepoPlanResult {
         cargo_toml: check.cargo_toml,
@@ -854,6 +947,7 @@ pub fn build_repo_plan(
         need_update,
         duplicates,
         unsupported,
+        policy_warnings,
         warnings: check.warnings,
     })
 }
@@ -1123,6 +1217,13 @@ fn unsupported_warning_reason(warning_type: &str) -> &'static str {
         "unsupported-requires" => "RPM rich Requires not parsed",
         _ => "complex Cargo requirement not fully supported",
     }
+}
+
+fn is_repo_plan_policy_warning(warning_type: &str) -> bool {
+    matches!(
+        warning_type,
+        "prerelease-version" | "exact-version-package" | "legacy-compat-name" | "naming-mismatch"
+    )
 }
 
 fn crate_capability_name(capability: &str) -> Option<&str> {
@@ -1858,6 +1959,20 @@ fn print_human_plan(result: &RepoPlanResult) {
         }
     }
 
+    println!();
+    println!("Policy warnings:");
+    if result.policy_warnings.is_empty() {
+        println!("  (none)");
+    } else {
+        for warning in &result.policy_warnings {
+            println!("  {} {}", warning.warning_type, warning.rpm_name);
+            if let Some(expected) = &warning.expected {
+                println!("    expected: {expected}");
+            }
+            println!("    {}", warning.message);
+        }
+    }
+
     let summary = &result.summary;
     println!();
     println!("Summary:");
@@ -1885,6 +2000,18 @@ mod tests {
         }
     }
 
+    fn policy_package(rpm_name: &str, crate_name: &str, version: &str) -> IndexedPackage {
+        IndexedPackage {
+            rpm_name: rpm_name.to_string(),
+            version: version.to_string(),
+            crate_name: crate_name.to_string(),
+            pkgname: repo_pkgname_for_dependency(crate_name, &parse_version(version)),
+            spec_path: String::new(),
+            provides: Vec::new(),
+            requires: Vec::new(),
+        }
+    }
+
     #[test]
     fn parse_version_keeps_numeric_prefixes() {
         assert_eq!(parse_version("1.2.3"), vec![1, 2, 3]);
@@ -1908,6 +2035,36 @@ mod tests {
         assert_eq!(
             repo_pkgname_for_dependency("serde_with", &[3, 18, 0]),
             "serde-with-3"
+        );
+    }
+
+    #[test]
+    fn prerelease_detection_only_checks_version_segments() {
+        assert!(has_prerelease_version_marker("0.6.0-rc.10"));
+        assert!(has_prerelease_version_marker("1.2.3-alpha.1"));
+        assert!(has_prerelease_version_marker("1.2.3-beta"));
+        assert!(has_prerelease_version_marker("1.2.3-pre.4"));
+        assert!(!has_prerelease_version_marker("15.1.0"));
+        assert!(!has_prerelease_version_marker("im-rc-15.0"));
+    }
+
+    #[test]
+    fn package_policy_warning_types_are_specific() {
+        assert_eq!(
+            package_policy_warning_type(&policy_package("rust-serde-1.0", "serde", "1.0.228")),
+            "legacy-compat-name"
+        );
+        assert_eq!(
+            package_policy_warning_type(&policy_package("rust-cc-1.2.61", "cc", "1.2.61")),
+            "exact-version-package"
+        );
+        assert_eq!(
+            package_policy_warning_type(&policy_package("rust-aead-0.6.0-rc.10", "aead", "0.6.0")),
+            "prerelease-version"
+        );
+        assert_ne!(
+            package_policy_warning_type(&policy_package("rust-im-rc-15.0", "im_rc", "15.1.0")),
+            "prerelease-version"
         );
     }
 
