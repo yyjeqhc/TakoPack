@@ -59,7 +59,7 @@ impl DebInfo {
 
         let (name_suffix, uscan_version_pattern, package_name) = if semver_suffix {
             // semver now includes full version for prerelease (e.g., 0.26.0-beta.1)
-            // and compat version for normal releases (e.g., 0.26 or 1.0)
+            // and compat version for normal releases (e.g., 0.26 or 1)
             let semver = crate_info.semver();
             let name_suffix = format!("-{}", &semver);
             // See `man uscan` description of @ANY_VERSION@ on how these

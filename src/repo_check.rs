@@ -623,6 +623,14 @@ fn add_need_add_action(
 ) {
     let key = (record.capability.clone(), record.requirement.clone());
     if !seen.insert(key) {
+        if let Some(action) = actions.iter_mut().find(|action| {
+            action.capability == record.capability && action.requirement == record.requirement
+        }) {
+            if !action.required_by.contains(&record.dependency) {
+                action.required_by.push(record.dependency.clone());
+                action.required_by.sort();
+            }
+        }
         return;
     }
     actions.push(NeedAddAction {
@@ -1068,15 +1076,6 @@ fn walk_transitive(
         .iter()
         .filter(|requirement| requirement.subpackage == provider.subpackage)
     {
-        let req_floor = if requirement.op.as_deref() == Some(">=") {
-            requirement
-                .version
-                .as_deref()
-                .map(parse_version)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         let requirement_text =
             build_requirement_text(requirement.op.as_deref(), requirement.version.as_deref());
         let mut next_chain = chain.clone();
@@ -1089,7 +1088,12 @@ fn walk_transitive(
                 .unwrap_or_default()
         ));
 
-        let resolution = select_provider(capabilities, &requirement.cap, &req_floor);
+        let resolution = select_provider_for_requirement(
+            capabilities,
+            &requirement.cap,
+            requirement.op.as_deref(),
+            requirement.version.as_deref(),
+        );
         if resolution.provider.is_none() {
             records.push(CheckRecord {
                 dependency: root_dependency.to_string(),
@@ -1189,6 +1193,56 @@ fn select_provider(
     }
 }
 
+fn select_provider_for_requirement(
+    capabilities: &BTreeMap<String, Vec<CapabilityProvider>>,
+    cap: &str,
+    op: Option<&str>,
+    version: Option<&str>,
+) -> Resolution {
+    match (op, version) {
+        (Some(">="), Some(version)) => select_provider(capabilities, cap, &parse_version(version)),
+        (Some("="), Some(version)) => select_exact_provider(capabilities, cap, version),
+        _ => select_provider(capabilities, cap, &[]),
+    }
+}
+
+fn select_exact_provider(
+    capabilities: &BTreeMap<String, Vec<CapabilityProvider>>,
+    cap: &str,
+    exact_version: &str,
+) -> Resolution {
+    let providers = capabilities.get(cap).cloned().unwrap_or_default();
+    if providers.is_empty() {
+        return Resolution {
+            provider: None,
+            status: "missing",
+            message: Some("no provider found".to_string()),
+        };
+    }
+
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| version_equals(&provider.version, exact_version))
+        .cloned()
+    {
+        return Resolution {
+            provider: Some(provider),
+            status: "ok",
+            message: None,
+        };
+    }
+
+    let provider = providers.into_iter().next().unwrap();
+    Resolution {
+        message: Some(format!(
+            "selected/provider {} version {} does not satisfy requirement = {}",
+            provider.rpm_name, provider.version, exact_version
+        )),
+        provider: Some(provider),
+        status: "conflict",
+    }
+}
+
 fn parse_version(version: &str) -> Vec<u64> {
     let mut parts = Vec::new();
     for token in version.split('.') {
@@ -1237,6 +1291,15 @@ fn version_at_least(version: &str, minimum: &[u64]) -> bool {
     current.resize(len, 0);
     minimum.resize(len, 0);
     current >= minimum
+}
+
+fn version_equals(version: &str, exact: &str) -> bool {
+    let mut current = parse_version(version);
+    let mut exact = parse_version(exact);
+    let len = current.len().max(exact.len());
+    current.resize(len, 0);
+    exact.resize(len, 0);
+    current == exact
 }
 
 fn format_version(version: &[u64]) -> String {
@@ -1505,5 +1568,65 @@ mod tests {
         let selected = resolution.provider.expect("provider should be selected");
         assert_eq!(selected.rpm_name, "rust-base64-0.22");
         assert_eq!(selected.version, "0.22.1");
+    }
+
+    #[test]
+    fn select_provider_for_equal_requirement_checks_exact_version() {
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            "crate(clap-4)".to_string(),
+            vec![provider("rust-clap-4", "4.6.0")],
+        );
+
+        let resolution = select_provider_for_requirement(
+            &capabilities,
+            "crate(clap-4)",
+            Some("="),
+            Some("4.6.1"),
+        );
+        assert_eq!(resolution.status, "conflict");
+        assert!(resolution
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requirement = 4.6.1"));
+
+        capabilities.insert(
+            "crate(clap-4)".to_string(),
+            vec![provider("rust-clap-4", "4.6.1")],
+        );
+        let resolution = select_provider_for_requirement(
+            &capabilities,
+            "crate(clap-4)",
+            Some("="),
+            Some("4.6.1"),
+        );
+        assert_eq!(resolution.status, "ok");
+    }
+
+    #[test]
+    fn need_add_action_merges_required_by_sources() {
+        let mut seen = BTreeSet::new();
+        let mut actions = Vec::new();
+        for dependency in ["serde", "clap", "serde"] {
+            add_need_add_action(
+                &CheckRecord {
+                    dependency: dependency.to_string(),
+                    capability: "crate(unicode-ident-1/default)".to_string(),
+                    status: "missing".to_string(),
+                    requirement: Some(">= 1.0.0".to_string()),
+                    provider: None,
+                    chain: Vec::new(),
+                    message: None,
+                },
+                "transitive_missing",
+                &mut seen,
+                &mut actions,
+            );
+        }
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].suggested_package, "rust-unicode-ident-1");
+        assert_eq!(actions[0].required_by, vec!["clap", "serde"]);
     }
 }
