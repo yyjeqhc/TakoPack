@@ -1,4 +1,3 @@
-use core::panic;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -41,7 +40,7 @@ fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
 
 /// Calculate compatibility branch following openRuyi Rust crate naming policy.
 /// - Prerelease versions (e.g., 0.26.0-beta.1) -> full version (0.26.0-beta.1)
-/// - BuildMetadata versions (e.g., 0.7.5+spec-1.1.0) -> full version (0.7.0)
+/// - Build metadata is ignored by semver compatibility and does not affect the branch
 /// - 0.x.y -> 0.x (0.x series, minor version compatibility)
 /// - 1.x.y+ -> 1 (major version compatibility)
 /// - 0.0.x+ -> 0.0.x (0.0.x series, patch version compatibility)
@@ -52,15 +51,6 @@ pub fn calculate_compat_version(version: &Version) -> String {
             "{}.{}.{}-{}",
             version.major, version.minor, version.patch, version.pre
         )
-    } else if false {
-        // } else if !version.build.is_empty() {
-        // TODO: In crates.io, build metadata is ignored for version precedence.
-        // There can't be 0.9.11+spec-1.1.0 and 0.9.11+spec-1.2.0 at crates.io.
-        // So we just use the full version. major.minor.patch without build metadata.
-        // format!("{}.{}.{}", version.major, version.minor, version.patch)
-
-        // format!("{}.{}.{}+{}", version.major, version.minor, version.patch, version.build)
-        panic!("nerver to be here.")
     } else if version.major > 0 {
         version.major.to_string()
     } else if version.minor > 0 {
@@ -513,7 +503,7 @@ pub fn backup_cargo_lock(
         log::info!("Backed up Cargo.lock to: {:?}", backup_path);
     } else {
         log::warn!("Cargo.lock not found at: {:?}", cargo_lock_path);
-        panic!("Cargo.lock backup failed!");
+        bail!("Cargo.lock not found at {:?}", cargo_lock_path);
     }
 
     Ok(backup_path)

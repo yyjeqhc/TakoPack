@@ -315,10 +315,11 @@ fn generate_version_constraints(
             vr.constrain_ge(mmp);
         }
 
-        (_, _) => {
-            // https://github.com/dtolnay/semver/issues/262
-            panic!("Op is non-exhaustive for some reason");
-        }
+        (_, _) => takopack_bail!(
+            "Unhandled dependency version predicate for {}: {:?}",
+            dep.package_name(),
+            p
+        ),
     }
 
     Ok(())

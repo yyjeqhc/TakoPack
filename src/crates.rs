@@ -886,7 +886,7 @@ impl CrateInfo {
 
 /// Collect information about the dependency structure of features and
 /// their external crate dependencies, in a simple output format.
-pub fn all_dependencies_and_features(manifest: &Manifest) -> CrateDepInfo {
+pub fn all_dependencies_and_features(manifest: &Manifest) -> Result<CrateDepInfo> {
     all_dependencies_and_features_filtered(manifest, false)
 }
 
@@ -896,7 +896,7 @@ pub fn all_dependencies_and_features(manifest: &Manifest) -> CrateDepInfo {
 pub fn all_dependencies_and_features_filtered(
     manifest: &Manifest,
     include_dev_dependencies: bool,
-) -> CrateDepInfo {
+) -> Result<CrateDepInfo> {
     use cargo::core::dependency::DepKind;
 
     let mut deps_by_name: BTreeMap<&str, Vec<&Dependency>> = BTreeMap::new();
@@ -923,12 +923,28 @@ pub fn all_dependencies_and_features_filtered(
                     feature_deps.push(InternedString::new(dep_feature).as_str())
                 }
                 // another package is a dependency
-                Dep { dep_name } => {
-                    // unwrap is ok, valid Cargo.toml files must have this
-                    for &dep in deps_by_name.get(dep_name.as_str()).unwrap() {
-                        other_deps.push(dep.clone());
+                Dep { dep_name } => match deps_by_name.get(dep_name.as_str()) {
+                    Some(dd) => {
+                        for &dep in dd {
+                            other_deps.push(dep.clone());
+                        }
                     }
-                }
+                    None if dependency_is_dev_dependency(manifest, dep_name.as_str()) => {
+                        takopack_warn!(
+                            "Ignoring \"{}\" feature \"{}\" as it depends on a \
+                                 dev-dependency \"{}\"",
+                            manifest.package_id(),
+                            feature,
+                            dep_name
+                        );
+                    }
+                    None => takopack_bail!(
+                        "failed to account for dependency \"{}\" of \"{}\" feature \"{}\"",
+                        dep_name,
+                        manifest.package_id(),
+                        feature
+                    ),
+                },
                 // another package is a dependency
                 DepFeature {
                     dep_name,
@@ -949,16 +965,7 @@ pub fn all_dependencies_and_features_filtered(
                             }
                         }
                         None => {
-                            let mut expected = false;
-                            for dep in manifest.dependencies() {
-                                if dep.kind() == DepKind::Development {
-                                    let s = dep.name_in_toml().as_str();
-                                    if s == dep_name.as_str() {
-                                        expected = true;
-                                    }
-                                }
-                            }
-                            if expected {
+                            if dependency_is_dev_dependency(manifest, dep_name.as_str()) {
                                 takopack_warn!(
                                     "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                      dev-dependency \"{}\"",
@@ -967,9 +974,11 @@ pub fn all_dependencies_and_features_filtered(
                                     dep_name
                                 );
                             } else {
-                                panic!(
+                                takopack_bail!(
                                     "failed to account for dependency \"{}\" of \"{}\" feature \"{}\"",
-                                    dep_name, manifest.package_id(), feature
+                                    dep_name,
+                                    manifest.package_id(),
+                                    feature
                                 );
                             }
                         }
@@ -1002,7 +1011,16 @@ pub fn all_dependencies_and_features_filtered(
         features_with_deps.insert("default", (vec![""], vec![]));
     }
 
-    features_with_deps
+    Ok(features_with_deps)
+}
+
+fn dependency_is_dev_dependency(manifest: &Manifest, dep_name: &str) -> bool {
+    use cargo::core::dependency::DepKind;
+
+    manifest
+        .dependencies()
+        .iter()
+        .any(|dep| dep.kind() == DepKind::Development && dep.name_in_toml().as_str() == dep_name)
 }
 
 /// Calculate all feature-dependencies and external-dependencies of a given

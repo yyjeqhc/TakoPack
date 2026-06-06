@@ -49,7 +49,7 @@ pub fn deb_dependencies(
     };
 
     let deps_and_features =
-        all_dependencies_and_features_filtered(&manifest, args.include_dev_dependencies);
+        all_dependencies_and_features_filtered(&manifest, args.include_dev_dependencies)?;
 
     let features = {
         let mut features: std::collections::HashSet<_> = if args.all_features {

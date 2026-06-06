@@ -516,7 +516,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         .map(String::as_str)
         .collect();
 
-    let features_with_deps = all_dependencies_and_features(crate_info.manifest());
+    let features_with_deps = all_dependencies_and_features(crate_info.manifest())?;
     // for winapi 0.3.9
     // dev_deps: winapi-i686-pc-windows-gnu ^0.4
     // dev_deps: winapi-x86_64-pc-windows-gnu ^0.4

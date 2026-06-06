@@ -302,31 +302,6 @@ fn process_complete_crate(
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
 ) -> Result<()> {
-    if false {
-        // Backup the original Cargo.toml FIRST (before any cleaning or processing)
-        // Need to parse just to get name and version for backup filename
-        // TODO: may not necessary, keep the code temporarily.
-        let backup_content = fs::read_to_string(&cargo_toml)
-            .with_context(|| format!("Failed to read Cargo.toml: {:?}", cargo_toml))?;
-
-        let backup_manifest: toml::Value = toml::from_str(&backup_content)
-            .with_context(|| format!("Failed to parse Cargo.toml: {:?}", cargo_toml))?;
-
-        if let Some(package) = backup_manifest.get("package") {
-            if let (Some(name), Some(version)) = (
-                package.get("name").and_then(|n| n.as_str()),
-                package.get("version").and_then(|v| v.as_str()),
-            ) {
-                // Backup original under the takopack cargo_back patch/origin path
-                if let Err(e) =
-                    crate::util::backup_cargo_toml(&cargo_toml, name, version, Some("patch/origin"))
-                {
-                    log::warn!("Failed to backup original Cargo.toml: {:?}", e);
-                }
-            }
-        }
-    }
-
     // Load config if available
     let config_path = temp_crate_dir.join("takopack.toml");
     let (config_path, config) = if config_path.exists() {

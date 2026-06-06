@@ -1,4 +1,3 @@
-use core::panic;
 use std::collections::HashMap;
 #[cfg(not(test))]
 use std::env::{self, VarError};
@@ -168,13 +167,16 @@ impl CrateDep {
                     let compat_version = crate::util::calculate_compat_version(&ver);
                     format!("{}-{}", crate_base, compat_version)
                 } else {
-                    // bitflags-2.0 the bytemuck is 1.4,so parse error.
-                    // so we add ".0" on the other branch. this code must't be reached.
-                    panic!(
-                        "Failed to parse version '{}' for crate '{}'",
-                        version_num, crate_base
+                    // Legacy fallback only: structured Cargo requirements use
+                    // cargo_dep_crate_name instead. If this old path sees a
+                    // shape it cannot parse, keep an unversioned capability
+                    // rather than aborting spec rendering.
+                    log::warn!(
+                        "failed to parse legacy crate dependency version '{}' for crate '{}'",
+                        version_num,
+                        crate_base
                     );
-                    // format!("{}-{}", crate_base, version_without_build)
+                    crate_base
                 }
             }
         } else {

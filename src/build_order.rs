@@ -173,7 +173,7 @@ fn resolve_info(
                 (process.crate_info, process.config)
             }
         };
-        let dep_info = all_dependencies_and_features(info.manifest());
+        let dep_info = all_dependencies_and_features(info.manifest())?;
         e.insert((info, dep_info, config));
     };
     Ok(id)
