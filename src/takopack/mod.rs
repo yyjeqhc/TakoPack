@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind, Read, Seek, Write as IoWrite};
+use std::io::{self, ErrorKind, Seek, Write as IoWrite};
 use std::ops::Deref;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -317,25 +317,13 @@ pub fn prepare_takopack_folder(
     output_dir: &Path,
     tempdir: &tempfile::TempDir,
     changelog_ready: bool,
-    copyright_guess_harder: bool,
+    _copyright_guess_harder: bool,
     overlay_write_back: bool,
     sha256: Option<String>, // SHA256 hash of downloaded crate
     lockfile_deps: Option<std::collections::HashMap<String, semver::Version>>, // Optional: dependencies from Cargo.lock
 ) -> Result<()> {
     let mut create = fs::OpenOptions::new();
     create.write(true).create_new(true);
-
-    let crate_name = crate_info.package_id().name();
-    let crate_version = crate_info.package_id().version();
-    let upstream_name = deb_info.upstream_name();
-
-    let maintainer = config.maintainer();
-    let uploaders: Vec<&str> = config
-        .uploaders()
-        .into_iter()
-        .flatten()
-        .map(String::as_str)
-        .collect();
 
     let mut new_hints = vec![];
     let mut file = |name: &str| {
@@ -370,7 +358,7 @@ pub fn prepare_takopack_folder(
     }
 
     // takopack/control & takopack/tests/control
-    let (source, has_dev_depends, default_test_broken) = prepare_takopack_control(
+    let (_source, has_dev_depends, default_test_broken) = prepare_takopack_control(
         deb_info,
         crate_info,
         config,
@@ -613,17 +601,6 @@ fn prepare_control_source(
     let repository = meta.repository.as_deref().unwrap_or("");
     let license = meta.license.as_deref().unwrap_or("").replace('/', " OR ");
     let full_version = crate_info.version().to_string();
-    let download_url = format!(
-        "https://static.crates.io/crates/{}/{}/download",
-        crate_name, &full_version
-    );
-    let uploaders: Vec<String> = config
-        .uploaders()
-        .into_iter()
-        .flatten()
-        .map(ToString::to_string)
-        .collect();
-
     let mut source = Source::new(
         deb_info.base_package_name(),
         deb_info.deb_upstream_version(),
@@ -633,11 +610,7 @@ fn prepare_control_source(
         repository,
         &license,
         lib,
-        config.maintainer().to_string(),
-        uploaders,
         build_deps,
-        config.requires_root().cloned(),
-        download_url,
         full_version,
         sha256,
     )?;
@@ -1377,17 +1350,6 @@ fn rustc_dep(min_ver: &Option<String>, native: bool) -> String {
     }
 }
 
-fn changelog_or_new(tempdir: &Path) -> Result<(fs::File, String)> {
-    let mut changelog = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(tempdir.join("changelog"))?;
-    let mut changelog_data = String::new();
-    changelog.read_to_string(&mut changelog_data)?;
-    Ok((changelog, changelog_data))
-}
 #[cfg(test)]
 mod test {
     use super::rustc_dep;

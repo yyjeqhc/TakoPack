@@ -72,6 +72,15 @@ pub fn rust_crate_output_names(crate_name: &str, version: &Version) -> RustCrate
     }
 }
 
+pub fn write_file_ensuring_dir(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory for {:?}", path))?;
+    }
+
+    fs::write(path, contents).with_context(|| format!("Failed to write {:?}", path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{calculate_compat_version, rust_crate_output_names};

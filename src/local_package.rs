@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::crates::CrateInfo;
 use crate::package::PackageExecuteArgs;
 use crate::takopack::{self, DebInfo};
+use crate::util::write_file_ensuring_dir;
 
 /// Process a local crate directory and generate spec file
 pub fn process_local_package(
@@ -186,11 +187,6 @@ fn should_materialize_include(path: &str) -> bool {
 fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
     let relative = safe_manifest_relative_path(relative_path)?;
     let path = root.join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory for {:?}", path))?;
-    }
-
     if path.exists() {
         return Ok(());
     }
@@ -200,8 +196,7 @@ fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
         Some("md") => "# Placeholder\n",
         _ => "Placeholder for takopack localpkg spec generation.\n",
     };
-    fs::write(&path, content).with_context(|| format!("Failed to create {:?}", path))?;
-    Ok(())
+    write_file_ensuring_dir(&path, content)
 }
 
 fn safe_manifest_relative_path(path: &str) -> Result<PathBuf> {

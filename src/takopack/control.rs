@@ -1,10 +1,6 @@
 use std::collections::HashMap;
-#[cfg(not(test))]
-use std::env::{self, VarError};
 use std::fmt::{self, Write};
 
-#[cfg(not(test))]
-use anyhow::{format_err, Error};
 use cargo::{
     core::{dependency::DepKind, Dependency},
     util::OptVersionReq,
@@ -30,9 +26,6 @@ pub struct Source {
     version: String,
     full_version: String, // Full version including build metadata (e.g., "0.7.5+spec-1.1.0")
     section: String,
-    priority: String,
-    maintainer: String,
-    uploaders: Vec<String>,
     standards: String,
     build_deps: BuildDeps,
     vcs_git: String,
@@ -40,8 +33,6 @@ pub struct Source {
     homepage: String,
     crate_name: String,
     license: String,
-    requires_root: Option<String>,
-    download_url: String,
     sha256: Option<String>, // SHA256 hash of the downloaded crate file
 }
 
@@ -327,78 +318,6 @@ fn clean_package_name(pkg_name: &str) -> String {
     cleaned_parts.join("-")
 }
 
-fn convert_to_crate_format(pkg_name: &str) -> String {
-    // Legacy fallback only. New RPM crate capability generation should use
-    // CrateCapability/CrateRequirement with structured Cargo feature data.
-    // Only an explicit +feature segment is treated as a feature here.
-    // Examples:
-    //   rust-serde-core-result -> crate(serde-core-result)
-    //   rust-serde -> crate(serde)
-    //   rust-serde-derive-1+default-dev -> crate(serde-derive/default)
-    if let Some(dep) = parse_package_name_simple(pkg_name) {
-        let crate_name = spec::normalize_crate_name(&dep.crate_name);
-        if let Some(feature) = dep.feature {
-            format!(
-                "crate({}/{})",
-                crate_name,
-                spec::normalize_feature_name(&feature)
-            )
-        } else {
-            format!("crate({})", crate_name)
-        }
-    } else {
-        let cleaned = clean_package_name(pkg_name);
-        let without_prefix = cleaned.strip_prefix("rust-").unwrap_or(&cleaned);
-        format!("crate({})", without_prefix)
-    }
-}
-
-fn extract_version_from_pkg_name(pkg_name: &str) -> Option<String> {
-    // Extract version from package names like:
-    // "rust-pyo3-build-config-0.26+default-dev" -> Some(">= 0.26.0")
-    // "rust-serde-1+default-dev" -> Some(">= 1.0.0")
-
-    let mut name = pkg_name.trim().to_string();
-
-    // Remove -dev suffix
-    if name.ends_with("-dev") {
-        name = name[..name.len() - 4].to_string();
-    }
-
-    // Remove rust- or librust- prefix
-    if name.starts_with("librust-") {
-        name = name[8..].to_string();
-    } else if name.starts_with("rust-") {
-        name = name[5..].to_string();
-    }
-
-    // Remove feature part (after +)
-    if let Some(idx) = name.find('+') {
-        name = name[..idx].to_string();
-    }
-
-    // Now we have something like "pyo3-build-config-0.26" or "serde-1"
-    // Find the last part that looks like a version number
-    let parts: Vec<&str> = name.split('-').collect();
-    if let Some(last_part) = parts.last() {
-        // Check if it's a version number (starts with digit)
-        if last_part
-            .chars()
-            .next()
-            .map_or(false, |c| c.is_ascii_digit())
-        {
-            // Assume it's a major.minor version, add .0 for patch
-            if last_part.contains('.') {
-                return Some(format!(">= {}.0", last_part));
-            } else {
-                return Some(format!(">= {}.0.0", last_part));
-            }
-        }
-    }
-
-    None
-}
-
 fn crate_requirements_from_cargo_deps(
     deps: &[Dependency],
     current_crate_name: &str,
@@ -552,13 +471,7 @@ fn compare_version_strings(a: &String, b: &String) -> std::cmp::Ordering {
     }
 }
 
-fn parse_deb_package_to_crate_dep(pkg_name: &str) -> Option<CrateDep> {
-    // Legacy fallback for Debian dependency strings. This intentionally only
-    // treats explicit +feature syntax as a feature; plain hyphen suffixes such
-    // as -rc, -std, or -derive remain part of the crate/package name.
-    parse_package_name_simple(pkg_name)
-}
-
+#[cfg(test)]
 /// 简化的包名解析函数
 /// 规则：
 /// 1. 去掉开头的 rust- 或 librust-
@@ -629,20 +542,6 @@ fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
     }
 
     Some(CrateDep::new(crate_name, feature))
-}
-
-fn extract_feature_from_package_name(pkg_name: &str, crate_base: &str) -> Option<String> {
-    // Legacy fallback only. New feature subpackage generation uses structured
-    // Cargo feature data stored on Package::feature and Package::feature_provides.
-    // Only explicit +feature syntax is accepted to avoid mistaking crate names
-    // like rust-foo-rc for a feature package.
-    let dep = parse_package_name_simple(pkg_name)?;
-    let normalized_crate = spec::normalize_crate_name(&dep.crate_name);
-    if normalized_crate == spec::normalize_crate_name(crate_base) {
-        dep.feature
-    } else {
-        None
-    }
 }
 
 impl fmt::Display for Package {
@@ -766,11 +665,7 @@ impl Source {
         repository: &str,
         license: &str,
         lib: bool,
-        maintainer: String,
-        uploaders: Vec<String>,
         build_deps: BuildDeps,
-        requires_root: Option<String>,
-        download_url: String,
         full_version: String,   // Full version including build metadata
         sha256: Option<String>, // SHA256 hash of downloaded crate file
     ) -> Result<Source> {
@@ -783,7 +678,6 @@ impl Source {
         } else {
             "FIXME-IN-THE-SOURCE-SECTION"
         };
-        let priority = "optional".to_string();
         let vcs_browser = format!(
             "https://salsa.debian.org/rust-team/takopack-conf/tree/master/src/{}",
             pkgbase
@@ -803,9 +697,6 @@ impl Source {
             version: version.to_string(),
             full_version,
             section: section.to_string(),
-            priority,
-            maintainer,
-            uploaders,
             standards: "4.7.2".to_string(),
             build_deps,
             vcs_git,
@@ -813,8 +704,6 @@ impl Source {
             homepage: home.to_string(),
             crate_name: crate_name.to_string(),
             license: license.to_string(),
-            requires_root,
-            download_url,
             sha256,
         })
     }
@@ -1384,47 +1273,10 @@ pub fn deb_feature_name(name: &str, feature: &str) -> String {
     )
 }
 
-/// Retrieve one of a series of environment variables, and provide a friendly error message for
-/// non-UTF-8 values.
-#[cfg(not(test))]
-fn get_envs(keys: &[&str]) -> Result<Option<String>> {
-    for key in keys {
-        match env::var(key) {
-            Ok(val) => {
-                return Ok(Some(val));
-            }
-            Err(e @ VarError::NotUnicode(_)) => {
-                return Err(Error::from(e)
-                    .context(format!("Environment variable ${} not valid UTF-8", key)));
-            }
-            Err(VarError::NotPresent) => {}
-        }
-    }
-    Ok(None)
-}
-
-#[cfg(test)]
-pub(crate) fn get_deb_author() -> Result<String> {
-    Ok("takopack Test <takopack@example.com>".to_string())
-}
-
-/// Determine a name and email address from environment variables.
-#[cfg(not(test))]
-pub fn get_deb_author() -> Result<String> {
-    let name = get_envs(&["DEBFULLNAME", "NAME"])?.ok_or_else(|| {
-        format_err!("Unable to determine your name; please set $DEBFULLNAME or $NAME")
-    })?;
-    let email = get_envs(&["DEBEMAIL", "EMAIL"])?.ok_or_else(|| {
-        format_err!("Unable to determine your email; please set $DEBEMAIL or $EMAIL")
-    })?;
-    Ok(format!("{} <{}>", name, email))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_to_crate_format, crate_requirements_from_cargo_deps,
-        extract_feature_from_package_name, parse_package_name_simple, BuildDeps, CrateDep, Source,
+        crate_requirements_from_cargo_deps, parse_package_name_simple, BuildDeps, CrateDep, Source,
     };
     use crate::takopack::spec;
     use cargo::core::{dependency::DepKind, Dependency, SourceId};
@@ -1460,11 +1312,7 @@ mod tests {
             "",
             "MIT OR Apache-2.0",
             true,
-            "takopack Test <takopack@example.com>".to_string(),
-            vec![],
             BuildDeps::default(),
-            None,
-            String::new(),
             "4.6.1".to_string(),
             None,
         )
@@ -1585,25 +1433,9 @@ mod tests {
         let plain_rc = parse_package_name_simple("rust-example-rc-dev").unwrap();
         assert_eq!("example-rc", plain_rc.crate_name);
         assert_eq!(None, plain_rc.feature.as_deref());
-        assert_eq!(
-            "crate(example-rc)",
-            convert_to_crate_format("rust-example-rc-dev")
-        );
-        assert_eq!(
-            None,
-            extract_feature_from_package_name("rust-example-rc-dev", "example")
-        );
 
         let feature_rc = parse_package_name_simple("rust-example-1.0+rc-dev").unwrap();
         assert_eq!("example", feature_rc.crate_name);
         assert_eq!(Some("rc"), feature_rc.feature.as_deref());
-        assert_eq!(
-            "crate(example/rc)",
-            convert_to_crate_format("rust-example-1.0+rc-dev")
-        );
-        assert_eq!(
-            Some("rc".to_string()),
-            extract_feature_from_package_name("rust-example-1.0+rc-dev", "example")
-        );
     }
 }

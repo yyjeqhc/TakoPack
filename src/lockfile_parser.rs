@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use cargo::core::{Resolve, Workspace};
-use cargo::ops;
-use cargo::util::GlobalContext;
+use cargo::core::Resolve;
 use semver::Version;
 use std::collections::BTreeMap;
 use std::path::Path;
