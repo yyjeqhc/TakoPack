@@ -6,6 +6,7 @@ use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
 use takopack::recursive_package::RecursivePackager;
+use takopack::repo_check::RepoCheckOptions;
 use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
@@ -14,13 +15,13 @@ fn verify_app() {
     Cli::command().debug_assert()
 }
 
-fn real_main() -> Result<()> {
+fn real_main() -> Result<i32> {
     let m = Cli::parse();
     use Opt::*;
     match m.command {
         Cargo(cargo_opt) => {
             match cargo_opt {
-                CargoOpt::Update => invalidate_crates_io_cache(),
+                CargoOpt::Update => invalidate_crates_io_cache().map(|_| 0),
                 CargoOpt::Package {
                     init,
                     extract,
@@ -94,7 +95,7 @@ fn real_main() -> Result<()> {
                         eprintln!("ERROR: Spec file not found!");
                     };
 
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::Vendor { args } => {
                     log::info!("starting vendor operation (recursive packaging)");
@@ -105,17 +106,17 @@ fn real_main() -> Result<()> {
                         args.config,
                     )?;
                     packager.print_summary();
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::ParseToml { toml_path, output } => {
                     log::info!("parsing dependencies from Cargo.toml");
                     parse_dependencies_from_toml(&toml_path, output)?;
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::Batch { file, output } => {
                     log::info!("starting batch operation from file: {:?}", file);
                     takopack::batch_package::process_batch_file(&file, output)?;
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::LocalPackage {
                     path,
@@ -124,8 +125,28 @@ fn real_main() -> Result<()> {
                 } => {
                     log::info!("packaging from local directory: {:?}", path);
                     takopack::local_package::process_local_package(&path, output, finish)?;
-                    Ok(())
+                    Ok(0)
                 }
+                CargoOpt::RepoIndex {
+                    spec_repo_dir,
+                    output,
+                } => {
+                    takopack::repo_check::write_repo_index(&spec_repo_dir, &output)?;
+                    Ok(0)
+                }
+                CargoOpt::RepoCheck {
+                    cargo_toml,
+                    index,
+                    check_transitive,
+                    json,
+                } => takopack::repo_check::run_repo_check(
+                    &cargo_toml,
+                    &index,
+                    RepoCheckOptions {
+                        check_transitive,
+                        json,
+                    },
+                ),
                 CargoOpt::Track {
                     crate_name,
                     version,
@@ -143,7 +164,7 @@ fn real_main() -> Result<()> {
                         database,
                         action_file,
                     )?;
-                    Ok(())
+                    Ok(0)
                 }
             }
         }
@@ -159,7 +180,7 @@ fn real_main() -> Result<()> {
                     version.as_deref(),
                     output,
                 )?;
-                Ok(())
+                Ok(0)
             }
         },
     }
@@ -167,8 +188,11 @@ fn real_main() -> Result<()> {
 
 fn main() {
     env_logger::init();
-    if let Err(e) = real_main() {
-        eprintln!("{}", Red.bold().paint(format!("takopack failed: {:?}", e)));
-        std::process::exit(1);
+    match real_main() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{}", Red.bold().paint(format!("takopack failed: {:?}", e)));
+            std::process::exit(1);
+        }
     }
 }
