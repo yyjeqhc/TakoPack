@@ -6,7 +6,7 @@ use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
 use takopack::recursive_package::RecursivePackager;
-use takopack::spec_from_toml::{generate_spec_from_toml, parse_dependencies_from_toml};
+use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
 fn verify_app() {
@@ -105,11 +105,6 @@ fn real_main() -> Result<()> {
                         args.config,
                     )?;
                     packager.print_summary();
-                    Ok(())
-                }
-                CargoOpt::FromToml { toml_path, output } => {
-                    log::info!("generating spec file from Cargo.toml");
-                    generate_spec_from_toml(&toml_path, output)?;
                     Ok(())
                 }
                 CargoOpt::ParseToml { toml_path, output } => {

@@ -51,17 +51,6 @@ pub enum CargoOpt {
         #[command(flatten)]
         args: RecursivePackageArgs,
     },
-    /// Generate spec file from a local Cargo.toml (without downloading)
-    #[command(name = "fromtoml", alias = "from")]
-    FromToml {
-        /// Path to Cargo.toml file
-        #[arg(value_name = "CARGO_TOML")]
-        toml_path: std::path::PathBuf,
-
-        /// Output directory for generated spec file
-        #[arg(short, long, value_name = "DIR")]
-        output: Option<std::path::PathBuf>,
-    },
     /// Parse Cargo.toml dependencies and recursively generate spec files for all
     #[command(name = "parsetoml", alias = "parse")]
     ParseToml {
