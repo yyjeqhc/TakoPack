@@ -147,6 +147,19 @@ fn real_main() -> Result<i32> {
                         json,
                     },
                 ),
+                CargoOpt::RepoPlan {
+                    cargo_toml,
+                    index,
+                    check_transitive,
+                    json,
+                } => takopack::repo_check::run_repo_plan(
+                    &cargo_toml,
+                    &index,
+                    RepoCheckOptions {
+                        check_transitive,
+                        json,
+                    },
+                ),
                 CargoOpt::Track {
                     crate_name,
                     version,

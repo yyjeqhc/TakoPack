@@ -90,6 +90,62 @@ pub struct RepoCheckSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoPlanResult {
+    pub cargo_toml: String,
+    pub need_add: Vec<NeedAddAction>,
+    pub need_update: Vec<NeedUpdateAction>,
+    pub duplicates: Vec<DuplicateAction>,
+    pub unsupported: Vec<UnsupportedAction>,
+    pub summary: RepoPlanSummary,
+    pub repo_check_summary: RepoCheckSummary,
+    pub warnings: Vec<RepoWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoPlanSummary {
+    pub need_add: usize,
+    pub need_update: usize,
+    pub duplicates: usize,
+    pub unsupported: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedAddAction {
+    pub capability: String,
+    pub suggested_package: String,
+    pub reason: String,
+    pub requirement: Option<String>,
+    pub required_by: Vec<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedUpdateAction {
+    pub capability: String,
+    pub package: String,
+    pub current_version: String,
+    pub required: Option<String>,
+    pub reason: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateAction {
+    pub capability: String,
+    pub providers: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsupportedAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub capability: String,
+    pub requirement: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRecord {
     pub dependency: String,
     pub capability: String,
@@ -456,6 +512,195 @@ pub fn run_repo_check(
     } else {
         Ok(0)
     }
+}
+
+pub fn run_repo_plan(
+    cargo_toml: &Path,
+    index_path: &Path,
+    options: RepoCheckOptions,
+) -> Result<i32> {
+    let index_content = fs::read_to_string(index_path)
+        .with_context(|| format!("failed to read {}", index_path.display()))?;
+    let index: RepoIndex = serde_json::from_str(&index_content)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let result = build_repo_plan(cargo_toml, &index, options.check_transitive)?;
+
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_human_plan(&result);
+    }
+
+    Ok(0)
+}
+
+pub fn build_repo_plan(
+    cargo_toml: &Path,
+    index: &RepoIndex,
+    check_transitive: bool,
+) -> Result<RepoPlanResult> {
+    let check = check_cargo_toml(cargo_toml, index, check_transitive)?;
+    let mut need_add = Vec::new();
+    let mut need_update = Vec::new();
+    let mut duplicates = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut seen_add = BTreeSet::new();
+    let mut seen_update = BTreeSet::new();
+    let mut seen_duplicates = BTreeSet::new();
+    let mut seen_unsupported = BTreeSet::new();
+
+    for record in &check.missing {
+        add_need_add_action(record, "missing", &mut seen_add, &mut need_add);
+    }
+    for record in &check.transitive_missing {
+        add_need_add_action(record, "transitive_missing", &mut seen_add, &mut need_add);
+    }
+    for record in &check.conflicts {
+        add_need_update_action(record, "conflicts", &mut seen_update, &mut need_update);
+    }
+    for record in &check.transitive_conflicts {
+        add_need_update_action(
+            record,
+            "transitive_conflicts",
+            &mut seen_update,
+            &mut need_update,
+        );
+    }
+    for warning in &check.warnings {
+        match warning.warning_type.as_str() {
+            "duplicate-provider" => {
+                if seen_duplicates.insert(warning.cap.clone()) {
+                    duplicates.push(DuplicateAction {
+                        capability: warning.cap.clone(),
+                        providers: warning.rpm_name.clone(),
+                        reason: "multiple providers for same capability".to_string(),
+                    });
+                }
+            }
+            "unsupported-requirement" | "unsupported-requires" => {
+                let requirement = warning.requirement.clone();
+                let capability = unsupported_warning_capability(warning);
+                let key = (
+                    warning.warning_type.clone(),
+                    capability.clone(),
+                    requirement.clone(),
+                );
+                if seen_unsupported.insert(key) {
+                    unsupported.push(UnsupportedAction {
+                        action_type: warning.warning_type.clone(),
+                        capability,
+                        requirement,
+                        reason: unsupported_warning_reason(&warning.warning_type).to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(RepoPlanResult {
+        cargo_toml: check.cargo_toml,
+        summary: RepoPlanSummary {
+            need_add: need_add.len(),
+            need_update: need_update.len(),
+            duplicates: duplicates.len(),
+            unsupported: unsupported.len(),
+        },
+        repo_check_summary: check.summary,
+        need_add,
+        need_update,
+        duplicates,
+        unsupported,
+        warnings: check.warnings,
+    })
+}
+
+fn add_need_add_action(
+    record: &CheckRecord,
+    source: &str,
+    seen: &mut BTreeSet<(String, Option<String>)>,
+    actions: &mut Vec<NeedAddAction>,
+) {
+    let key = (record.capability.clone(), record.requirement.clone());
+    if !seen.insert(key) {
+        return;
+    }
+    actions.push(NeedAddAction {
+        capability: record.capability.clone(),
+        suggested_package: suggested_package_for_capability(&record.capability),
+        reason: "missing provider".to_string(),
+        requirement: record.requirement.clone(),
+        required_by: vec![record.dependency.clone()],
+        source: source.to_string(),
+    });
+}
+
+fn add_need_update_action(
+    record: &CheckRecord,
+    source: &str,
+    seen: &mut BTreeSet<(String, String, Option<String>)>,
+    actions: &mut Vec<NeedUpdateAction>,
+) {
+    let Some(provider) = &record.provider else {
+        return;
+    };
+    let key = (
+        record.capability.clone(),
+        provider.rpm_name.clone(),
+        record.requirement.clone(),
+    );
+    if !seen.insert(key) {
+        return;
+    }
+    actions.push(NeedUpdateAction {
+        capability: record.capability.clone(),
+        package: provider.rpm_name.clone(),
+        current_version: provider.version.clone(),
+        required: record.requirement.clone(),
+        reason: "provider version does not satisfy requirement".to_string(),
+        source: source.to_string(),
+    });
+}
+
+fn suggested_package_for_capability(capability: &str) -> String {
+    match crate_capability_name(capability) {
+        Some(name) => {
+            let package = name.split('/').next().unwrap_or(name);
+            format!("rust-{package}")
+        }
+        None => capability.to_string(),
+    }
+}
+
+fn unsupported_warning_capability(warning: &RepoWarning) -> String {
+    if !warning.cap.is_empty() {
+        return warning.cap.clone();
+    }
+    warning
+        .requirement
+        .as_deref()
+        .and_then(first_crate_capability)
+        .unwrap_or_default()
+}
+
+fn unsupported_warning_reason(warning_type: &str) -> &'static str {
+    match warning_type {
+        "unsupported-requires" => "RPM rich Requires not parsed",
+        _ => "complex Cargo requirement not fully supported",
+    }
+}
+
+fn crate_capability_name(capability: &str) -> Option<&str> {
+    capability
+        .strip_prefix("crate(")
+        .and_then(|value| value.strip_suffix(')'))
+}
+
+fn first_crate_capability(text: &str) -> Option<String> {
+    let start = text.find("crate(")?;
+    let rest = &text[start..];
+    let end = rest.find(')')?;
+    Some(rest[..=end].to_string())
 }
 
 pub fn check_cargo_toml(
@@ -1060,6 +1305,73 @@ fn print_human_result(result: &RepoCheckResult) {
         summary.transitive_ok,
         summary.transitive_missing,
         summary.transitive_conflicts
+    );
+}
+
+fn print_human_plan(result: &RepoPlanResult) {
+    println!("Repo plan for {}", result.cargo_toml);
+
+    println!();
+    println!("Need add:");
+    if result.need_add.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &result.need_add {
+            println!("  {}", action.suggested_package);
+            println!("    capability: {}", action.capability);
+            if let Some(requirement) = &action.requirement {
+                println!("    requirement: {requirement}");
+            }
+            println!("    reason: {}", action.reason);
+        }
+    }
+
+    println!();
+    println!("Need update:");
+    if result.need_update.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &result.need_update {
+            println!("  {}", action.package);
+            println!("    current: {}", action.current_version);
+            if let Some(required) = &action.required {
+                println!("    required: {required}");
+            }
+            println!("    capability: {}", action.capability);
+        }
+    }
+
+    println!();
+    println!("Duplicates:");
+    if result.duplicates.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &result.duplicates {
+            println!("  {}", action.capability);
+            println!("    providers: {}", action.providers);
+        }
+    }
+
+    println!();
+    println!("Unsupported:");
+    if result.unsupported.is_empty() {
+        println!("  (none)");
+    } else {
+        for action in &result.unsupported {
+            let requirement = action.requirement.as_deref().unwrap_or("");
+            println!(
+                "  {} {} {}",
+                action.action_type, action.capability, requirement
+            );
+        }
+    }
+
+    let summary = &result.summary;
+    println!();
+    println!("Summary:");
+    println!(
+        "  need_add={} need_update={} duplicates={} unsupported={}",
+        summary.need_add, summary.need_update, summary.duplicates, summary.unsupported
     );
 }
 
