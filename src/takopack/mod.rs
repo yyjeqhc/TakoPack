@@ -1075,10 +1075,8 @@ fn write_feature_tests(
         }
 
         let test_depends = generate_test_dependencies(f, &feature_deps, config, test_deps);
-        let test_arch = match feature_test_architecture(config, features_with_deps, f)? {
-            Some(v) => v,
-            None => Vec::new(),
-        };
+        let test_arch: Vec<String> =
+            feature_test_architecture(config, features_with_deps, f)?.unwrap_or_default();
         let test_arch: Vec<&str> = test_arch.iter().map(AsRef::as_ref).collect();
         let pkgtest = PkgTest::new(
             package.name(),

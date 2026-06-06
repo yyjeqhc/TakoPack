@@ -56,6 +56,7 @@ pub struct SourceOverride {
 }
 
 impl SourceOverride {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         section: Option<String>,
         policy: Option<String>,

@@ -31,6 +31,9 @@ pub struct FailedPackage {
     pub error: String,
 }
 
+type DependencySpec = (String, Option<String>);
+type PackagedCrate = (PathBuf, String, Vec<DependencySpec>);
+
 /// State for recursive package processing
 pub struct RecursivePackager {
     /// Base output directory with timestamp
@@ -231,8 +234,7 @@ impl RecursivePackager {
 
         // Map dependencies to their real names before processing
         // (dependencies already contain the real crate names from Cargo.toml)
-        let deps_with_real_names: Vec<(String, Option<String>)> =
-            dependencies.into_iter().collect();
+        let deps_with_real_names: Vec<DependencySpec> = dependencies.into_iter().collect();
 
         // Recursively process each dependency
         for (real_dep_name, dep_version) in deps_with_real_names {
@@ -252,7 +254,7 @@ impl RecursivePackager {
         crate_name: &str,
         version: Option<&str>,
         config_path: Option<PathBuf>,
-    ) -> Result<(PathBuf, String, Vec<(String, Option<String>)>)> {
+    ) -> Result<PackagedCrate> {
         let pkg_base = format!("rust-{}", crate_name.replace('_', "-"));
 
         // Use a temporary directory for extraction and processing
@@ -353,7 +355,7 @@ impl RecursivePackager {
         &self,
         crate_info: &crate::crates::CrateInfo,
         current_crate: &str,
-    ) -> Result<Vec<(String, Option<String>)>> {
+    ) -> Result<Vec<DependencySpec>> {
         use cargo::core::dependency::DepKind;
 
         let mut dependencies = Vec::new();

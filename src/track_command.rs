@@ -21,8 +21,7 @@ pub fn execute_track(
     _action_file_path: Option<PathBuf>,
 ) -> Result<()> {
     // Use unified database path in ~/.config/takopack/
-    let db_path =
-        database_path.unwrap_or_else(|| crate::crate_database::get_default_database_path());
+    let db_path = database_path.unwrap_or_else(crate::crate_database::get_default_database_path);
 
     // Determine which mode to use
     let lockfile_path = if let Some(file_path) = from_file {

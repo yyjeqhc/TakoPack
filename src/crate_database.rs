@@ -32,7 +32,7 @@ mod git_helper {
     pub fn init_repo_if_needed(dir: &Path) -> bool {
         if !dir.join(".git").exists() {
             Command::new("git")
-                .args(&["init"])
+                .args(["init"])
                 .current_dir(dir)
                 .output()
                 .is_ok()
@@ -45,7 +45,7 @@ mod git_helper {
     pub fn commit_file(dir: &Path, file: &str, message: &str) -> bool {
         // Add file
         let add_ok = Command::new("git")
-            .args(&["add", file])
+            .args(["add", file])
             .current_dir(dir)
             .output()
             .is_ok();
@@ -56,7 +56,7 @@ mod git_helper {
 
         // Commit (might fail if no changes, that's ok)
         Command::new("git")
-            .args(&["commit", "-m", message])
+            .args(["commit", "-m", message])
             .current_dir(dir)
             .output()
             .is_ok()
@@ -215,14 +215,12 @@ impl CrateDatabase {
     #[cfg(feature = "back_db")]
     pub fn git_commit(path: &Path, commit_message: &str) {
         if let Some(dir) = path.parent() {
-            if git_helper::is_git_available() {
-                if git_helper::init_repo_if_needed(dir) {
-                    let filename = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("crate_db.txt");
-                    git_helper::commit_file(dir, filename, commit_message);
-                }
+            if git_helper::is_git_available() && git_helper::init_repo_if_needed(dir) {
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("crate_db.txt");
+                git_helper::commit_file(dir, filename, commit_message);
             }
         }
     }

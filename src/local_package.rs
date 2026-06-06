@@ -215,6 +215,107 @@ fn safe_manifest_relative_path(path: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Process a complete crate directory (with src/) using full takopack pipeline
+fn process_complete_crate(
+    temp_crate_dir: &Path,
+    cargo_toml: &Path,
+    output_dir: Option<PathBuf>,
+    finish_args: PackageExecuteArgs,
+) -> Result<()> {
+    // Load config if available
+    let config_path = temp_crate_dir.join("takopack.toml");
+    let (config_path, config) = if config_path.exists() {
+        let config = Config::parse(&config_path).context("failed to parse takopack.toml")?;
+        (Some(config_path), config)
+    } else {
+        (None, Config::default())
+    };
+
+    // Create CrateInfo from local crate (now it has src/ so Cargo APIs will work)
+    let mut crate_info = CrateInfo::new_with_local_crate_from_path(cargo_toml)
+        .with_context(|| format!("Failed to load crate from: {:?}", cargo_toml))?;
+
+    let crate_name = crate_info.crate_name();
+    // It's a full version,like "0.9.11+spec-1.1.0"
+    let version = crate_info.version();
+
+    log::info!("Crate: {} {}", crate_name, version);
+
+    // Create DebInfo
+    let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
+
+    let output_names = crate::util::rust_crate_output_names(crate_name, version);
+
+    // Determine output directory
+    let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
+    let final_output = output_base.join(&output_names.directory);
+
+    fs::create_dir_all(&final_output)
+        .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
+
+    // Create a temporary directory for takopack processing
+    let tempdir =
+        tempfile::tempdir_in(temp_crate_dir).context("Failed to create temporary directory")?;
+
+    log::info!("Tempdir created at: {:?}", tempdir.path());
+    log::info!("Preparing takopack folder");
+
+    // Apply overrides and generate spec file
+    let prepare_result = takopack::prepare_takopack_folder(
+        &mut crate_info,
+        &deb_info,
+        config_path.as_deref(),
+        &config,
+        temp_crate_dir,
+        &tempdir,
+        finish_args.changelog_ready,
+        finish_args.copyright_guess_harder,
+        !finish_args.no_overlay_write_back,
+        None, // TODO: sha256: local packages don't have downloaded crate files, maybe consider record the sha256 when use pkg.
+        finish_args.lockfile_deps, // Pass lockfile dependencies if available
+    );
+
+    if let Err(e) = &prepare_result {
+        log::error!("prepare_takopack_folder failed: {:?}", e);
+    }
+    prepare_result?;
+
+    // Note: prepare_takopack_folder renames tempdir to output_dir/takopack
+    let takopack_dir = temp_crate_dir.join("takopack");
+    log::info!("Takopack folder should be at: {:?}", takopack_dir);
+    log::info!("Takopack dir exists: {}", takopack_dir.exists());
+
+    // Copy spec file to output directory
+    let source_spec = takopack_dir.join(&output_names.spec_file);
+    let final_spec = final_output.join(&output_names.spec_file);
+
+    // List files in takopack dir for debugging
+    log::debug!("Listing files in takopack dir: {:?}", takopack_dir);
+    match fs::read_dir(&takopack_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                log::debug!("  - {:?}", entry.file_name());
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to read takopack dir: {:?}", e);
+        }
+    }
+
+    if source_spec.exists() {
+        fs::copy(&source_spec, &final_spec)
+            .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
+        crate::util::copy_original_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
+
+        log::info!("Spec file saved to: {}", final_spec.display());
+        println!("Spec file: {}", final_spec.display());
+    } else {
+        anyhow::bail!("Spec file not found at: {:?}", source_spec);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::materialize_manifest_backed_temp_crate;
@@ -288,107 +389,4 @@ edition = "2021"
 
         assert!(temp.path().join("src/lib.rs").exists());
     }
-}
-
-/// Process a complete crate directory (with src/) using full takopack pipeline
-fn process_complete_crate(
-    temp_crate_dir: &Path,
-    cargo_toml: &Path,
-    output_dir: Option<PathBuf>,
-    finish_args: PackageExecuteArgs,
-) -> Result<()> {
-    // Load config if available
-    let config_path = temp_crate_dir.join("takopack.toml");
-    let (config_path, config) = if config_path.exists() {
-        let config = Config::parse(&config_path).context("failed to parse takopack.toml")?;
-        (Some(config_path), config)
-    } else {
-        (None, Config::default())
-    };
-
-    // Create CrateInfo from local crate (now it has src/ so Cargo APIs will work)
-    let mut crate_info = CrateInfo::new_with_local_crate_from_path(cargo_toml)
-        .with_context(|| format!("Failed to load crate from: {:?}", cargo_toml))?;
-
-    let crate_name = crate_info.crate_name();
-    // It's a full version,like "0.9.11+spec-1.1.0"
-    let version = crate_info.version();
-
-    log::info!("Crate: {} {}", crate_name, version);
-
-    // Create DebInfo
-    let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
-
-    let output_names = crate::util::rust_crate_output_names(crate_name, version);
-
-    // Determine output directory
-    let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
-    let final_output = output_base.join(&output_names.directory);
-
-    fs::create_dir_all(&final_output)
-        .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
-
-    // Create a temporary directory for takopack processing
-    let tempdir =
-        tempfile::tempdir_in(&temp_crate_dir).context("Failed to create temporary directory")?;
-
-    log::info!("Tempdir created at: {:?}", tempdir.path());
-    log::info!("Preparing takopack folder");
-
-    // Apply overrides and generate spec file
-    let prepare_result = takopack::prepare_takopack_folder(
-        &mut crate_info,
-        &deb_info,
-        config_path.as_deref(),
-        &config,
-        &temp_crate_dir,
-        &tempdir,
-        finish_args.changelog_ready,
-        finish_args.copyright_guess_harder,
-        !finish_args.no_overlay_write_back,
-        None, // TODO: sha256: local packages don't have downloaded crate files, maybe consider record the sha256 when use pkg.
-        finish_args.lockfile_deps, // Pass lockfile dependencies if available
-    );
-
-    if let Err(e) = &prepare_result {
-        log::error!("prepare_takopack_folder failed: {:?}", e);
-    }
-    prepare_result?;
-
-    // Note: prepare_takopack_folder renames tempdir to output_dir/takopack
-    let takopack_dir = temp_crate_dir.join("takopack");
-    log::info!("Takopack folder should be at: {:?}", takopack_dir);
-    log::info!("Takopack dir exists: {}", takopack_dir.exists());
-
-    // Copy spec file to output directory
-    let source_spec = takopack_dir.join(&output_names.spec_file);
-    let final_spec = final_output.join(&output_names.spec_file);
-
-    // List files in takopack dir for debugging
-    log::debug!("Listing files in takopack dir: {:?}", takopack_dir);
-    match fs::read_dir(&takopack_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    log::debug!("  - {:?}", entry.file_name());
-                }
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to read takopack dir: {:?}", e);
-        }
-    }
-
-    if source_spec.exists() {
-        fs::copy(&source_spec, &final_spec)
-            .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
-        crate::util::copy_original_cargo_toml_to_dir(&temp_crate_dir, &final_output)?;
-
-        log::info!("Spec file saved to: {}", final_spec.display());
-        println!("Spec file: {}", final_spec.display());
-    } else {
-        anyhow::bail!("Spec file not found at: {:?}", source_spec);
-    }
-
-    Ok(())
 }

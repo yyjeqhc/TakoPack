@@ -81,50 +81,6 @@ pub fn write_file_ensuring_dir(path: &Path, contents: impl AsRef<[u8]>) -> Resul
     fs::write(path, contents).with_context(|| format!("Failed to write {:?}", path))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{calculate_compat_version, rust_crate_output_names};
-    use semver::Version;
-
-    #[test]
-    fn calculate_compat_version_uses_openruyi_policy() {
-        for (version, expected) in [
-            ("1.0.228", "1"),
-            ("1.2.3", "1"),
-            ("2.0.0", "2"),
-            ("3.18.0", "3"),
-            ("4.6.1", "4"),
-            ("0.22.1", "0.22"),
-            ("0.9.3", "0.9"),
-            ("0.0.7", "0.0.7"),
-        ] {
-            assert_eq!(
-                calculate_compat_version(&Version::parse(version).unwrap()),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn rust_crate_output_names_follow_compat_directory() {
-        assert_eq!(
-            rust_crate_output_names("clap", &Version::parse("4.6.1").unwrap()),
-            super::RustCrateOutputNames {
-                directory: "rust-clap-4".to_string(),
-                spec_file: "rust-clap-4.spec".to_string(),
-            }
-        );
-        assert_eq!(
-            rust_crate_output_names("serde_core", &Version::parse("1.0.228").unwrap()).spec_file,
-            "rust-serde-core-1.spec"
-        );
-        assert_eq!(
-            rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
-            "rust-base64-0.22.spec"
-        );
-    }
-}
-
 #[cfg(unix)]
 pub fn hint_file_for(file: &Path) -> Option<Cow<'_, Path>> {
     let file = file.as_os_str().as_bytes();
@@ -242,6 +198,8 @@ where
     show_vec_with(it, std::string::ToString::to_string)
 }
 
+type TransitiveValueResult<K, V> = Result<Option<V>, (K, Vec<(K, V)>)>;
+
 pub fn expect_success(cmd: &mut Command, err: &str) -> Result<(), anyhow::Error> {
     match cmd.status() {
         Ok(status) if status.success() => Ok(()),
@@ -270,7 +228,6 @@ where
 
 /// Get a value that might be set at a key or any of its ancestor keys,
 /// whichever is closest. Error if there are conflicting definitions.
-#[allow(clippy::type_complexity)]
 pub(crate) fn get_transitive_val<
     'a,
     P: Fn(K) -> Option<&'a Vec<K>>,
@@ -281,7 +238,7 @@ pub(crate) fn get_transitive_val<
     getparents: &'a P,
     f: &F,
     key: K,
-) -> Result<Option<V>, (K, Vec<(K, V)>)> {
+) -> TransitiveValueResult<K, V> {
     let mut visited = std::collections::BTreeSet::new();
     get_transitive_val_impl(getparents, f, key, &mut visited)
 }
@@ -297,7 +254,7 @@ fn get_transitive_val_impl<
     f: &F,
     key: K,
     visited: &mut std::collections::BTreeSet<K>,
-) -> Result<Option<V>, (K, Vec<(K, V)>)> {
+) -> TransitiveValueResult<K, V> {
     // Check for cycles
     if visited.contains(&key) {
         // Cycle detected, return None to break the recursion
@@ -619,4 +576,48 @@ pub fn process_single_crate(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_compat_version, rust_crate_output_names};
+    use semver::Version;
+
+    #[test]
+    fn calculate_compat_version_uses_openruyi_policy() {
+        for (version, expected) in [
+            ("1.0.228", "1"),
+            ("1.2.3", "1"),
+            ("2.0.0", "2"),
+            ("3.18.0", "3"),
+            ("4.6.1", "4"),
+            ("0.22.1", "0.22"),
+            ("0.9.3", "0.9"),
+            ("0.0.7", "0.0.7"),
+        ] {
+            assert_eq!(
+                calculate_compat_version(&Version::parse(version).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rust_crate_output_names_follow_compat_directory() {
+        assert_eq!(
+            rust_crate_output_names("clap", &Version::parse("4.6.1").unwrap()),
+            super::RustCrateOutputNames {
+                directory: "rust-clap-4".to_string(),
+                spec_file: "rust-clap-4.spec".to_string(),
+            }
+        );
+        assert_eq!(
+            rust_crate_output_names("serde_core", &Version::parse("1.0.228").unwrap()).spec_file,
+            "rust-serde-core-1.spec"
+        );
+        assert_eq!(
+            rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
+            "rust-base64-0.22.spec"
+        );
+    }
 }

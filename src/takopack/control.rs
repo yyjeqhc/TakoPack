@@ -306,10 +306,10 @@ fn clean_package_name(pkg_name: &str) -> String {
                 return false;
             }
             // Check if it's a version number: starts with digit and only contains digits/dots
-            if part.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-                if part.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                    return false; // This is a version number, filter it out
-                }
+            if part.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+            {
+                return false; // This is a version number, filter it out
             }
             true
         })
@@ -367,10 +367,7 @@ fn crate_requirements_from_cargo_deps(
         }
     }
 
-    requirements
-        .into_iter()
-        .map(|(_, requirement)| requirement)
-        .collect()
+    requirements.into_values().collect()
 }
 
 fn cargo_dep_crate_name(crate_name: &str, lower_bound: Option<&str>) -> String {
@@ -401,7 +398,7 @@ fn lower_bound_from_opt_version_req(version_req: &OptVersionReq) -> Option<Strin
             .comparators
             .iter()
             .filter_map(lower_bound_from_comparator)
-            .max_by(|a, b| compare_version_strings(a, b)),
+            .max_by(compare_version_strings),
         OptVersionReq::Locked(version, _) | OptVersionReq::Precise(version, _) => {
             Some(version_without_build_metadata(version))
         }
@@ -520,7 +517,7 @@ fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
     // 找到最后一个版本号段的位置
     let version_idx = parts.iter().rposition(|part| {
         !part.is_empty()
-            && part.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && part.chars().next().is_some_and(|c| c.is_ascii_digit())
             && part.chars().all(|c| c.is_ascii_digit() || c == '.')
     });
 
@@ -796,10 +793,7 @@ impl Package {
             insert_crate_requirement(&mut dep_map, requirement);
         }
 
-        dep_map
-            .into_iter()
-            .map(|(_, requirement)| requirement)
-            .collect()
+        dep_map.into_values().collect()
     }
 
     fn spec_provides(&self) -> Vec<CrateCapability> {
