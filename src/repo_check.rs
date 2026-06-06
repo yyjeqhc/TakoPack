@@ -1380,3 +1380,130 @@ pub fn validate_json_summary(path: &Path) -> Result<RepoCheckSummary> {
     let result: RepoCheckResult = serde_json::from_str(&content)?;
     Ok(result.summary)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(rpm_name: &str, version: &str) -> CapabilityProvider {
+        CapabilityProvider {
+            rpm_name: rpm_name.to_string(),
+            subpackage: "main".to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_version_keeps_numeric_prefixes() {
+        assert_eq!(parse_version("1.2.3"), vec![1, 2, 3]);
+        assert_eq!(parse_version("0.22.1"), vec![0, 22, 1]);
+        assert_eq!(parse_version("1.2.3-alpha"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn compat_branch_matches_cargo_compat_policy() {
+        assert_eq!(compat_branch(&[1, 2, 3]), Some("1".to_string()));
+        assert_eq!(compat_branch(&[0, 22, 1]), Some("0.22".to_string()));
+        assert_eq!(compat_branch(&[0, 0, 7]), Some("0.0.7".to_string()));
+    }
+
+    #[test]
+    fn repo_pkgname_uses_normalized_crate_name_and_compat_branch() {
+        assert_eq!(
+            repo_pkgname_for_dependency("base64", &[0, 22, 1]),
+            "base64-0.22"
+        );
+        assert_eq!(
+            repo_pkgname_for_dependency("serde_with", &[3, 18, 0]),
+            "serde-with-3"
+        );
+    }
+
+    #[test]
+    fn suggested_package_is_derived_from_capability_package_part() {
+        assert_eq!(
+            suggested_package_for_capability("crate(base64-0.22)"),
+            "rust-base64-0.22"
+        );
+        assert_eq!(
+            suggested_package_for_capability("crate(serde-with-3/base64)"),
+            "rust-serde-with-3"
+        );
+        assert_eq!(
+            suggested_package_for_capability("crate(foo-1/default)"),
+            "rust-foo-1"
+        );
+    }
+
+    #[test]
+    fn unsupported_requirement_warning_flags_complex_requirements() {
+        for requirement in [">=1.2, <1.6", "=1.5.0", "~1.5"] {
+            let warning = unsupported_requirement_warning("foo", requirement)
+                .expect("complex requirement should warn");
+            assert_eq!(warning.warning_type, "unsupported-requirement");
+            assert_eq!(warning.requirement.as_deref(), Some(requirement));
+        }
+    }
+
+    #[test]
+    fn unsupported_requirement_warning_allows_simple_requirements() {
+        assert!(unsupported_requirement_warning("foo", "1").is_none());
+        assert!(unsupported_requirement_warning("foo", "0.22").is_none());
+    }
+
+    #[test]
+    fn select_provider_accepts_matching_version_floor() {
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            "crate(base64-0.22)".to_string(),
+            vec![provider("rust-base64-0.22", "0.22.1")],
+        );
+
+        let resolution = select_provider(&capabilities, "crate(base64-0.22)", &[0, 22, 1]);
+        assert_eq!(resolution.status, "ok");
+        assert_eq!(
+            resolution
+                .provider
+                .as_ref()
+                .map(|provider| provider.version.as_str()),
+            Some("0.22.1")
+        );
+    }
+
+    #[test]
+    fn select_provider_conflicts_when_version_is_too_low() {
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            "crate(base64-0.22)".to_string(),
+            vec![provider("rust-base64-0.22", "0.22.0")],
+        );
+
+        let resolution = select_provider(&capabilities, "crate(base64-0.22)", &[0, 22, 1]);
+        assert_eq!(resolution.status, "conflict");
+        assert_eq!(
+            resolution
+                .provider
+                .as_ref()
+                .map(|provider| provider.version.as_str()),
+            Some("0.22.0")
+        );
+    }
+
+    #[test]
+    fn select_provider_skips_low_version_when_later_provider_satisfies() {
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            "crate(base64-0.22)".to_string(),
+            vec![
+                provider("rust-base64-0.22-old", "0.22.0"),
+                provider("rust-base64-0.22", "0.22.1"),
+            ],
+        );
+
+        let resolution = select_provider(&capabilities, "crate(base64-0.22)", &[0, 22, 1]);
+        assert_eq!(resolution.status, "ok");
+        let selected = resolution.provider.expect("provider should be selected");
+        assert_eq!(selected.rpm_name, "rust-base64-0.22");
+        assert_eq!(selected.version, "0.22.1");
+    }
+}
