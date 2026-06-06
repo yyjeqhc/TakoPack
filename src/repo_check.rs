@@ -146,6 +146,33 @@ pub struct UnsupportedAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppAuditReport {
+    pub ruyispec_dir: String,
+    pub index: String,
+    pub apps: Vec<AppAuditRecord>,
+    pub summary: AppAuditSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppAuditRecord {
+    pub name: String,
+    pub path: String,
+    pub cargo_toml: String,
+    pub status: String,
+    pub summary: RepoPlanSummary,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppAuditSummary {
+    pub total: usize,
+    pub green: usize,
+    pub yellow: usize,
+    pub orange: usize,
+    pub red: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRecord {
     pub dependency: String,
     pub capability: String,
@@ -613,6 +640,141 @@ pub fn build_repo_plan(
         unsupported,
         warnings: check.warnings,
     })
+}
+
+pub fn run_app_audit(ruyispec_dir: &Path, index_path: &Path, output: &Path) -> Result<()> {
+    let index_content = fs::read_to_string(index_path)
+        .with_context(|| format!("failed to read {}", index_path.display()))?;
+    let index: RepoIndex = serde_json::from_str(&index_content)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let report = build_app_audit_report(ruyispec_dir, index_path, &index)?;
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&report)?;
+    fs::write(output, format!("{json}\n"))
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    println!("App audit report: {}", output.display());
+    Ok(())
+}
+
+pub fn build_app_audit_report(
+    ruyispec_dir: &Path,
+    index_path: &Path,
+    index: &RepoIndex,
+) -> Result<AppAuditReport> {
+    let mut apps = Vec::new();
+    for app_dir in rust_application_dirs(ruyispec_dir)? {
+        apps.push(audit_app_dir(&app_dir, index));
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut summary = AppAuditSummary {
+        total: apps.len(),
+        ..Default::default()
+    };
+    for app in &apps {
+        match app.status.as_str() {
+            "green" => summary.green += 1,
+            "yellow" => summary.yellow += 1,
+            "orange" => summary.orange += 1,
+            _ => summary.red += 1,
+        }
+    }
+
+    Ok(AppAuditReport {
+        ruyispec_dir: display_path(ruyispec_dir),
+        index: display_path(index_path),
+        apps,
+        summary,
+    })
+}
+
+fn audit_app_dir(app_dir: &Path, index: &RepoIndex) -> AppAuditRecord {
+    let name = app_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let cargo_toml = app_dir.join("Cargo.toml");
+
+    match build_repo_plan(&cargo_toml, index, true) {
+        Ok(plan) => {
+            let status = status_for_plan_summary(&plan.summary).to_string();
+            AppAuditRecord {
+                name,
+                path: display_path(app_dir),
+                cargo_toml: display_path(&cargo_toml),
+                status,
+                summary: plan.summary,
+                notes: Vec::new(),
+            }
+        }
+        Err(error) => AppAuditRecord {
+            name,
+            path: display_path(app_dir),
+            cargo_toml: display_path(&cargo_toml),
+            status: "red".to_string(),
+            summary: RepoPlanSummary {
+                need_add: 0,
+                need_update: 0,
+                duplicates: 0,
+                unsupported: 1,
+            },
+            notes: vec![error.to_string()],
+        },
+    }
+}
+
+fn rust_application_dirs(ruyispec_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut app_dirs = Vec::new();
+    for entry in fs::read_dir(ruyispec_dir)
+        .with_context(|| format!("failed to read {}", ruyispec_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if is_rust_application_dir(&path)? {
+            app_dirs.push(path);
+        }
+    }
+    app_dirs.sort();
+    Ok(app_dirs)
+}
+
+fn is_rust_application_dir(path: &Path) -> Result<bool> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if name.starts_with("rust-") || !path.join("Cargo.toml").is_file() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "spec")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn status_for_plan_summary(summary: &RepoPlanSummary) -> &'static str {
+    if summary.unsupported > 0 {
+        "red"
+    } else if summary.need_update > 0 || summary.duplicates > 0 {
+        "orange"
+    } else if summary.need_add > 0 {
+        "yellow"
+    } else {
+        "green"
+    }
 }
 
 fn add_need_add_action(

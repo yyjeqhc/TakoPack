@@ -129,8 +129,11 @@ fn real_main() -> Result<i32> {
                 }
                 CargoOpt::RepoIndex {
                     spec_repo_dir,
+                    ruyispec,
                     output,
                 } => {
+                    let spec_repo_dir =
+                        takopack::config::resolve_ruyispec_dir(spec_repo_dir.as_deref(), ruyispec)?;
                     takopack::repo_check::write_repo_index(&spec_repo_dir, &output)?;
                     Ok(0)
                 }
@@ -160,6 +163,17 @@ fn real_main() -> Result<i32> {
                         json,
                     },
                 ),
+                CargoOpt::AppAudit {
+                    ruyispec_dir,
+                    ruyispec,
+                    index,
+                    output,
+                } => {
+                    let ruyispec_dir =
+                        takopack::config::resolve_ruyispec_dir(ruyispec_dir.as_deref(), ruyispec)?;
+                    takopack::repo_check::run_app_audit(&ruyispec_dir, &index, &output)?;
+                    Ok(0)
+                }
                 CargoOpt::Track {
                     crate_name,
                     version,
