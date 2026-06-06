@@ -220,12 +220,20 @@ impl fmt::Display for Source {
         // Package name uses hyphens instead of underscores
         let pkg_name = self.crate_name.replace('_', "-");
 
-        // Calculate compatibility version following openRuyi Rust crate policy:
-        // 0.x.y -> 0.x, 1.x.y -> 1, 0.0.x -> 0.0.x.
-        let compat_version = if let Ok(ver) = Version::parse(&self.version) {
-            crate::util::calculate_compat_version(&ver)
+        let (pkgname, rpm_name) = if let Ok(ver) = Version::parse(&self.version) {
+            let output_names = crate::util::rust_crate_output_names(&self.crate_name, &ver);
+            let pkgname = output_names
+                .directory
+                .strip_prefix("rust-")
+                .unwrap_or(&output_names.directory)
+                .to_string();
+            (pkgname, output_names.directory)
         } else {
-            self.version.clone()
+            let compat_version = self.version.clone();
+            (
+                format!("{}-{}", pkg_name, compat_version),
+                format!("rust-{}-{}", pkg_name, compat_version),
+            )
         };
 
         // For RPM Version field, strip prerelease suffix (RPM doesn't allow '-' in Version)
@@ -244,8 +252,8 @@ impl fmt::Display for Source {
         let source = SpecSource {
             crate_name: self.crate_name.clone(),
             full_version: self.full_version.clone(),
-            pkgname: format!("{}-{}", pkg_name, compat_version),
-            rpm_name: format!("rust-{}-{}", pkg_name, compat_version),
+            pkgname,
+            rpm_name,
             rpm_version,
             summary: format!("Rust crate \"{}\"", self.crate_name),
             license: if !self.license.is_empty() {

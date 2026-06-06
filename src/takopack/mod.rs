@@ -653,8 +653,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // If source overrides are present update related parts.
     source.apply_overrides(config);
 
-    let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-    let mut control = io::BufWriter::new(file(&spec_filename)?);
+    let output_names = util::rust_crate_output_names(crate_name, crate_info.version());
+    let mut control = io::BufWriter::new(file(&output_names.spec_file)?);
     write!(control, "{}", source)?;
     // Summary and description generated from Cargo.toml
     let (crate_summary, crate_description) = crate_info.get_summary_description();

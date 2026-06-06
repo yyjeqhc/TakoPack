@@ -171,13 +171,11 @@ fn process_complete_crate(
     // Create DebInfo
     let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
-    // Calculate compatibility version following Rust semver rules
-    let compat_version = crate::util::calculate_compat_version(version);
+    let output_names = crate::util::rust_crate_output_names(crate_name, version);
 
     // Determine output directory
     let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
-    let output_dirname = format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
-    let final_output = output_base.join(&output_dirname);
+    let final_output = output_base.join(&output_names.directory);
 
     fs::create_dir_all(&final_output)
         .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
@@ -215,9 +213,8 @@ fn process_complete_crate(
     log::info!("Takopack dir exists: {}", takopack_dir.exists());
 
     // Copy spec file to output directory
-    let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-    let source_spec = takopack_dir.join(&spec_filename);
-    let final_spec = final_output.join(&spec_filename);
+    let source_spec = takopack_dir.join(&output_names.spec_file);
+    let final_spec = final_output.join(&output_names.spec_file);
 
     // List files in takopack dir for debugging
     log::debug!("Listing files in takopack dir: {:?}", takopack_dir);
@@ -237,6 +234,7 @@ fn process_complete_crate(
     if source_spec.exists() {
         fs::copy(&source_spec, &final_spec)
             .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
+        crate::util::copy_original_cargo_toml_to_dir(&temp_crate_dir, &final_output)?;
 
         log::info!("Spec file saved to: {}", final_spec.display());
         println!("Spec file: {}", final_spec.display());

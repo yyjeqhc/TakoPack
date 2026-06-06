@@ -27,7 +27,6 @@ fn real_main() -> Result<()> {
                     finish,
                 } => {
                     use std::fs;
-                    use std::path::PathBuf;
 
                     log::info!("preparing crate info");
                     let mut process = PackageProcess::init(init)?;
@@ -36,13 +35,8 @@ fn real_main() -> Result<()> {
                     let crate_name = process.crate_info().crate_name();
                     let version = process.crate_info().version();
 
-                    // Calculate compatibility version following Rust semver rules
-                    let compat_version = takopack::util::calculate_compat_version(version);
-
-                    let output_dirname =
-                        format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
-                    let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-                    let final_output = PathBuf::from(&output_dirname);
+                    let output_names = takopack::util::rust_crate_output_names(crate_name, version);
+                    let final_output = std::path::PathBuf::from(&output_names.directory);
 
                     process.extract(extract)?;
                     process.apply_overrides()?;
@@ -55,14 +49,18 @@ fn real_main() -> Result<()> {
                     log::debug!("output_dirname: {}", final_output.display());
 
                     let takopack_dir = output_path.join("takopack");
-                    let source_spec = takopack_dir.join(&spec_filename);
+                    let source_spec = takopack_dir.join(&output_names.spec_file);
 
-                    // Create final output directory and copy only the spec file
+                    // Create final output directory and copy the spec plus original Cargo.toml.
                     fs::create_dir_all(&final_output)?;
-                    let final_spec = final_output.join(&spec_filename);
+                    let final_spec = final_output.join(&output_names.spec_file);
 
                     if source_spec.exists() {
                         fs::copy(&source_spec, &final_spec)?;
+                        let final_cargo_toml = takopack::util::copy_original_cargo_toml_to_dir(
+                            output_path,
+                            &final_output,
+                        )?;
                         log::info!("Spec file saved to: {}", final_spec.display());
                         println!("Spec file: {}", final_spec.display());
 
@@ -77,7 +75,7 @@ fn real_main() -> Result<()> {
                             for entry in fs::read_dir(output_path)? {
                                 let entry = entry?;
                                 let path = entry.path();
-                                if path != final_spec {
+                                if path != final_spec && path != final_cargo_toml {
                                     if path.is_dir() {
                                         fs::remove_dir_all(&path)?;
                                     } else {

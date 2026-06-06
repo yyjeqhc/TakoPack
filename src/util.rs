@@ -21,6 +21,12 @@ use semver::Version;
 use walkdir::WalkDir;
 pub const HINT_SUFFIX: &str = ".takopack.hint";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustCrateOutputNames {
+    pub directory: String,
+    pub spec_file: String,
+}
+
 fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
     use anyhow::Context;
 
@@ -64,9 +70,21 @@ pub fn calculate_compat_version(version: &Version) -> String {
     }
 }
 
+pub fn rust_crate_output_names(crate_name: &str, version: &Version) -> RustCrateOutputNames {
+    let crate_name = crate_name.replace('_', "-");
+    let compat_version = calculate_compat_version(version);
+    let directory = format!("rust-{}-{}", crate_name, compat_version);
+    let spec_file = format!("{}.spec", directory);
+
+    RustCrateOutputNames {
+        directory,
+        spec_file,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::calculate_compat_version;
+    use super::{calculate_compat_version, rust_crate_output_names};
     use semver::Version;
 
     #[test]
@@ -86,6 +104,25 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn rust_crate_output_names_follow_compat_directory() {
+        assert_eq!(
+            rust_crate_output_names("clap", &Version::parse("4.6.1").unwrap()),
+            super::RustCrateOutputNames {
+                directory: "rust-clap-4".to_string(),
+                spec_file: "rust-clap-4.spec".to_string(),
+            }
+        );
+        assert_eq!(
+            rust_crate_output_names("serde_core", &Version::parse("1.0.228").unwrap()).spec_file,
+            "rust-serde-core-1.spec"
+        );
+        assert_eq!(
+            rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
+            "rust-base64-0.22.spec"
+        );
     }
 }
 
@@ -416,6 +453,36 @@ pub fn backup_cargo_toml(
     Ok(())
 }
 
+pub fn copy_original_cargo_toml_to_dir(source_dir: &Path, target_dir: &Path) -> Result<PathBuf> {
+    let cargo_toml_orig = source_dir.join("Cargo.toml.orig");
+    let cargo_toml = source_dir.join("Cargo.toml");
+    let source = if cargo_toml_orig.exists() {
+        cargo_toml_orig
+    } else {
+        cargo_toml
+    };
+
+    if !source.exists() {
+        bail!("Cargo.toml not found under {}", source_dir.display());
+    }
+
+    fs::create_dir_all(target_dir)
+        .with_context(|| format!("Failed to create output directory: {:?}", target_dir))?;
+    let target = target_dir.join("Cargo.toml");
+
+    if target.exists() {
+        if let (Ok(source_path), Ok(target_path)) = (source.canonicalize(), target.canonicalize()) {
+            if source_path == target_path {
+                return Ok(target);
+            }
+        }
+    }
+
+    fs::copy(&source, &target)
+        .with_context(|| format!("Failed to copy original Cargo.toml to {:?}", target))?;
+    Ok(target)
+}
+
 /// Backup Cargo.lock to ${XDG_DATA_HOME:-$HOME/.local/share}/takopack/cargo_back directory
 /// File will be named as: crate_name-version.lock
 /// If subdir is provided, file will be saved in the matching subdirectory
@@ -519,22 +586,18 @@ pub fn process_single_crate(
         // Copy spec file to base_dir (use absolute path)
         let output_path = process.output_dir.as_ref().unwrap();
         let takopack_dir = output_path.join("takopack");
-        let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-        let source_spec = takopack_dir.join(&spec_filename);
-
-        // Calculate compatibility version for target directory name
-        let version_obj = process.crate_info().version();
-        let compat_version = crate::util::calculate_compat_version(version_obj);
-        let target_dirname = format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
+        let output_names = rust_crate_output_names(crate_name, process.crate_info().version());
+        let source_spec = takopack_dir.join(&output_names.spec_file);
 
         // Create target directory in base_dir_abs (not work_dir)
-        let target_dir = base_dir_abs.join(&target_dirname);
+        let target_dir = base_dir_abs.join(&output_names.directory);
         fs::create_dir_all(&target_dir)?;
-        let final_spec = target_dir.join(&spec_filename);
+        let final_spec = target_dir.join(&output_names.spec_file);
 
         // Copy spec file to target directory
         if source_spec.exists() {
             fs::copy(&source_spec, &final_spec)?;
+            copy_original_cargo_toml_to_dir(output_path, &target_dir)?;
             log::debug!("Copied spec file to: {:?}", final_spec);
         } else {
             return Err(anyhow::anyhow!(
