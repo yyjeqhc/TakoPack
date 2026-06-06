@@ -25,9 +25,14 @@ use crate::util::{self, copy_tree, expect_success, get_transitive_val, traverse_
 use self::control::{base_deb_name, deb_upstream_version};
 use self::control::{Description, Package, PkgTest, Source};
 pub use self::dependency::{deb_dep_add_nocheck, deb_deps};
+use self::spec::{
+    render_build_check_install_placeholder, render_changelog_section, render_files_section,
+    render_patch_prep_placeholder, SpecFiles,
+};
 
 pub mod control;
 mod dependency;
+pub mod spec;
 
 pub struct DebInfo {
     upstream_name: String,
@@ -1093,13 +1098,18 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     }
 
     writeln!(control)?;
-    // Add RPM spec file sections: %conf, %build, %install, %check, %files, %changelog
-    writeln!(control, "%files")?;
-    writeln!(
-        control,
-        "%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/"
+    // Add RPM spec file sections. Patch/prep/build/check/install are structured
+    // no-op placeholders for now to preserve current output behavior.
+    let mut trailing_sections = String::new();
+    render_patch_prep_placeholder(&mut trailing_sections)?;
+    render_build_check_install_placeholder(&mut trailing_sections)?;
+    render_files_section(
+        &mut trailing_sections,
+        &[SpecFiles {
+            package: None,
+            entries: vec!["%{_datadir}/cargo/registry/%{crate_name}-%{version}/".to_string()],
+        }],
     )?;
-    writeln!(control)?;
 
     // gen subpackages when building.
     // Add %files for each feature package
@@ -1112,8 +1122,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     //     }
     // }
 
-    writeln!(control, "%changelog")?;
-    writeln!(control, "%autochangelog")?;
+    render_changelog_section(&mut trailing_sections)?;
+    write!(control, "{}", trailing_sections)?;
 
     Ok((source, has_dev_deps, test_is_broken("default")?))
 }
