@@ -666,7 +666,11 @@ fn build_deps_for_source(
     if !bins.is_empty() {
         build_deps.build_depends_arch.extend(build_deps_arch);
     } else {
-        assert!(lib);
+        if !lib {
+            log::warn!(
+                "Crate has no library or binary targets; generating source-only build dependencies"
+            );
+        }
         build_deps
             .build_depends_arch
             .extend(build_deps_arch.map(|d| {

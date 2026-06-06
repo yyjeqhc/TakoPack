@@ -91,8 +91,14 @@ fn materialize_manifest_backed_temp_crate(cargo_toml: &Path, temp_dir: &Path) ->
 fn materialize_manifest_paths(manifest: &Value, root: &Path) -> Result<()> {
     let mut files = BTreeSet::new();
     let mut explicit_targets = 0usize;
+    let mut has_lib_target = false;
+    let mut autolib = true;
 
     if let Some(package) = manifest.get("package").and_then(Value::as_table) {
+        if let Some(value) = package.get("autolib").and_then(Value::as_bool) {
+            autolib = value;
+        }
+
         if let Some(build) = package.get("build") {
             match build {
                 Value::Boolean(false) => {}
@@ -113,7 +119,8 @@ fn materialize_manifest_paths(manifest: &Value, root: &Path) -> Result<()> {
 
         if let Some(include) = package.get("include").and_then(Value::as_array) {
             for item in include.iter().filter_map(Value::as_str) {
-                if should_materialize_include(item) {
+                let item = normalize_package_root_relative_path(item);
+                if should_materialize_include(&item) {
                     files.insert(item.trim_end_matches('/').to_string());
                 }
             }
@@ -122,6 +129,7 @@ fn materialize_manifest_paths(manifest: &Value, root: &Path) -> Result<()> {
 
     if let Some(lib) = manifest.get("lib").and_then(Value::as_table) {
         explicit_targets += 1;
+        has_lib_target = true;
         files.insert(
             lib.get("path")
                 .and_then(Value::as_str)
@@ -155,9 +163,19 @@ fn materialize_manifest_paths(manifest: &Value, root: &Path) -> Result<()> {
         }
     }
 
+    if !has_lib_target && autolib {
+        files.insert("src/lib.rs".to_string());
+    }
+
     if explicit_targets == 0 {
         files.insert("src/lib.rs".to_string());
     }
+
+    let files: Vec<_> = files
+        .iter()
+        .filter(|path| !has_materialized_child_path(path, &files))
+        .cloned()
+        .collect();
 
     for path in files {
         write_placeholder_file(root, &path)?;
@@ -182,6 +200,17 @@ fn should_materialize_include(path: &str) -> bool {
         && !path.contains('?')
         && !path.contains('[')
         && path != "Cargo.toml"
+}
+
+fn normalize_package_root_relative_path(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
+fn has_materialized_child_path(path: &str, files: &BTreeSet<String>) -> bool {
+    let path = Path::new(path);
+    files
+        .iter()
+        .any(|other| Path::new(other) != path && Path::new(other).starts_with(path))
 }
 
 fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
@@ -318,7 +347,10 @@ fn process_complete_crate(
 
 #[cfg(test)]
 mod tests {
-    use super::materialize_manifest_backed_temp_crate;
+    use super::{materialize_manifest_backed_temp_crate, process_local_package};
+    use crate::package::PackageExecuteArgs;
+    use crate::util::rust_crate_output_names;
+    use semver::Version;
     use std::fs;
 
     #[test]
@@ -388,5 +420,126 @@ edition = "2021"
             .unwrap();
 
         assert!(temp.path().join("src/lib.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_materializes_root_relative_includes() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "rooted"
+version = "0.1.0"
+edition = "2021"
+include = [
+    "/Cargo.toml",
+    "/CHANGELOG.md",
+    "/src",
+]
+
+[lib]
+path = "src/lib.rs"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("CHANGELOG.md").exists());
+        assert!(temp.path().join("src").is_dir());
+        assert!(temp.path().join("src/lib.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_does_not_materialize_parent_include_as_file() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "benchy"
+version = "0.1.0"
+edition = "2021"
+include = ["benches"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "mod"
+path = "benches/mod.rs"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("benches").is_dir());
+        assert!(temp.path().join("benches/mod.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_materializes_auto_lib_with_other_targets() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "auto_lib"
+version = "0.1.0"
+edition = "2021"
+
+[[test]]
+name = "tests"
+
+[[bench]]
+name = "benchmarks"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("src/lib.rs").exists());
+        assert!(temp.path().join("tests/tests.rs").exists());
+        assert!(temp.path().join("benches/benchmarks.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_generates_spec_from_manifest_only_crate() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "localpkg_smoke"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            lockfile_deps: None,
+        };
+
+        process_local_package(source.path(), Some(output.path().to_path_buf()), finish).unwrap();
+
+        let output_names =
+            rust_crate_output_names("localpkg_smoke", &Version::parse("0.1.0").unwrap());
+        let package_dir = output.path().join(&output_names.directory);
+        assert!(package_dir.join(&output_names.spec_file).exists());
+        assert!(package_dir.join("Cargo.toml").exists());
     }
 }

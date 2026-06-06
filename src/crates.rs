@@ -12,7 +12,7 @@ use cargo::{
     },
     util::{
         cache_lock::CacheLockMode, interning::InternedString, toml::read_manifest, FileLock,
-        GlobalContext,
+        Filesystem, GlobalContext,
     },
 };
 use filetime::{set_file_times, FileTime};
@@ -244,59 +244,37 @@ impl CrateInfo {
         let context = GlobalContext::default()?;
         let crate_dir = cargo_toml.parent().unwrap();
 
-        // Check if we have a complete crate with src/
-        let has_src = crate_dir.join("src").exists();
+        log::info!("Creating CrateInfo directly from local Cargo.toml");
 
-        if has_src {
-            // Use path source for complete crates
-            let source_id = SourceId::for_path(crate_dir)?;
-            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
-                EitherManifest::Real(m) => m,
-                _ => anyhow::bail!("Virtual manifests are not supported"),
-            };
+        let source_id = SourceId::for_path(crate_dir)?;
+        let manifest = match read_manifest(cargo_toml, source_id, &context)? {
+            EitherManifest::Real(m) => m,
+            _ => anyhow::bail!("Virtual manifests are not supported"),
+        };
 
-            let crate_name = manifest.name().as_str();
-            let version = manifest.version().to_string();
-            Self::new_with_local_crate(crate_name, Some(&version), crate_dir)
-        } else {
-            // For standalone Cargo.toml without source code, use a dummy source_id
-            log::info!("Creating CrateInfo from standalone Cargo.toml without source code");
+        let crate_name = manifest.name().as_str();
+        let version = manifest.version().to_string();
+        let package = Package::new(manifest.clone(), cargo_toml);
 
-            // Use registry source_id since we don't have a real path source
-            let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
+        let package_dir = crate_dir.join(".takopack-localpkg").join("package");
+        fs::create_dir_all(&package_dir)?;
 
-            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
-                EitherManifest::Real(m) => m,
-                _ => anyhow::bail!("Virtual manifests are not supported"),
-            };
+        let filename = format!("{}-{}.crate", crate_name, version);
+        let crate_file = Filesystem::new(package_dir).open_rw_exclusive_create(
+            filename,
+            &context,
+            "dummy localpkg crate file",
+        )?;
 
-            let crate_name = manifest.name().as_str();
-            let version = manifest.version().to_string();
-
-            // Create Package directly from manifest
-            let package = Package::new(manifest.clone(), cargo_toml);
-
-            // Create a dummy crate file
-            let target_dir = context
-                .target_dir()?
-                .ok_or_else(|| anyhow::anyhow!("Target directory not set"))?;
-            let package_dir = target_dir.join("package");
-            fs::create_dir_all(package_dir.as_path_unlocked())?;
-
-            let filename = format!("{}-{}.crate", crate_name, version);
-            let crate_file =
-                package_dir.open_rw_exclusive_create(filename, &context, "dummy crate file")?;
-
-            Ok(CrateInfo {
-                package,
-                manifest,
-                crate_file,
-                context,
-                source_id,
-                excludes: vec![],
-                includes: vec![],
-            })
-        }
+        Ok(CrateInfo {
+            package,
+            manifest,
+            crate_file,
+            context,
+            source_id,
+            excludes: vec![],
+            includes: vec![],
+        })
     }
 
     pub fn new_with_update(
