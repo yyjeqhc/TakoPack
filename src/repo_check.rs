@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use toml::Value;
 use walkdir::WalkDir;
@@ -13,6 +13,33 @@ pub struct RepoIndex {
     pub packages: Vec<IndexedPackage>,
     pub capabilities: BTreeMap<String, Vec<CapabilityProvider>>,
     pub warnings: Vec<RepoWarning>,
+    #[serde(default)]
+    pub skipped: Vec<SkippedPackage>,
+    #[serde(default)]
+    pub summary: RepoIndexSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedPackage {
+    pub name: String,
+    pub path: String,
+    pub reason: String,
+    pub has_spec: bool,
+    pub has_cargo_toml: bool,
+    pub has_crate_capabilities: bool,
+    pub is_rust_candidate: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoIndexSummary {
+    pub scanned_specs: usize,
+    pub indexed_packages: usize,
+    pub capabilities: usize,
+    pub warnings: usize,
+    pub ignored_non_rust_specs: usize,
+    pub skipped_rust_candidates: usize,
+    pub rust_candidates_missing_cargo_toml: usize,
+    pub rust_candidates_missing_capabilities: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +89,8 @@ pub struct RepoWarning {
     pub requirement: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,8 +177,10 @@ pub struct UnsupportedAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppAuditReport {
     pub ruyispec_dir: String,
+    pub package_root: String,
     pub index: String,
     pub apps: Vec<AppAuditRecord>,
+    pub skipped: Vec<AppAuditSkipped>,
     pub summary: AppAuditSummary,
 }
 
@@ -161,6 +192,15 @@ pub struct AppAuditRecord {
     pub status: String,
     pub summary: RepoPlanSummary,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppAuditSkipped {
+    pub name: String,
+    pub path: String,
+    pub reason: String,
+    pub has_spec: bool,
+    pub has_cargo_toml: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -187,6 +227,11 @@ pub struct CheckRecord {
 pub struct RepoCheckOptions {
     pub check_transitive: bool,
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepoIndexOptions {
+    pub include_all_specs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +307,13 @@ fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 }
 
 pub fn build_repo_index(spec_root: &Path) -> Result<RepoIndex> {
+    build_repo_index_with_options(spec_root, RepoIndexOptions::default())
+}
+
+pub fn build_repo_index_with_options(
+    spec_root: &Path,
+    options: RepoIndexOptions,
+) -> Result<RepoIndex> {
     if !spec_root.is_dir() {
         bail!(
             "spec repo directory does not exist: {}",
@@ -272,6 +324,8 @@ pub fn build_repo_index(spec_root: &Path) -> Result<RepoIndex> {
     let mut packages = Vec::new();
     let mut capabilities: BTreeMap<String, Vec<CapabilityProvider>> = BTreeMap::new();
     let mut warnings = Vec::new();
+    let mut skipped = Vec::new();
+    let mut summary = RepoIndexSummary::default();
 
     let mut spec_paths = Vec::new();
     for entry in WalkDir::new(spec_root) {
@@ -282,9 +336,67 @@ pub fn build_repo_index(spec_root: &Path) -> Result<RepoIndex> {
         }
     }
     spec_paths.sort();
+    summary.scanned_specs = spec_paths.len();
 
     for spec_path in spec_paths {
-        let (package, package_warnings) = parse_spec(&spec_path)?;
+        let (mut package, mut package_warnings) = parse_spec(&spec_path)?;
+        let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
+        let dir_name = spec_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let has_cargo_toml = spec_dir.join("Cargo.toml").is_file();
+        let has_crate_capabilities = !package.provides.is_empty() || !package.requires.is_empty();
+        let has_crate_syntax = has_crate_capabilities
+            || package_warnings
+                .iter()
+                .any(|warning| warning.warning_type == "unsupported-requires");
+        let has_crate_macros =
+            !package.crate_name.is_empty() || pkgname_looks_like_crate_compat(&package.pkgname);
+        let rust_named = package.rpm_name.starts_with("rust-") || dir_name.starts_with("rust-");
+        let is_rust_candidate =
+            rust_named || has_crate_syntax || has_crate_macros || has_cargo_toml;
+
+        if !options.include_all_specs && !is_rust_candidate {
+            summary.ignored_non_rust_specs += 1;
+            continue;
+        }
+
+        let new_takopack_spec = !package.crate_name.is_empty()
+            && !package.pkgname.is_empty()
+            && !package.version.is_empty();
+        let inferred_from_cargo =
+            rust_named && infer_package_identity_from_cargo_toml(&mut package, spec_dir);
+        let indexable = options.include_all_specs
+            || has_crate_syntax
+            || new_takopack_spec
+            || inferred_from_cargo;
+
+        if !indexable {
+            let reason = if !has_cargo_toml {
+                summary.rust_candidates_missing_cargo_toml += 1;
+                "missing-cargo-toml"
+            } else {
+                summary.rust_candidates_missing_capabilities += 1;
+                "missing-capabilities"
+            };
+            skipped.push(SkippedPackage {
+                name: skipped_package_name(&package, dir_name),
+                path: display_path(&spec_path),
+                reason: reason.to_string(),
+                has_spec: true,
+                has_cargo_toml,
+                has_crate_capabilities,
+                is_rust_candidate,
+            });
+            warnings.extend(package_warnings);
+            continue;
+        }
+
+        if is_rust_candidate {
+            add_naming_warning(&package, dir_name, &mut package_warnings);
+        }
+
         for provide in &package.provides {
             capabilities
                 .entry(provide.cap.clone())
@@ -325,17 +437,97 @@ pub fn build_repo_index(spec_root: &Path) -> Result<RepoIndex> {
                 normalized_version: None,
                 requirement: None,
                 line: None,
+                expected: None,
                 message: "multiple packages/subpackages provide the same crate capability"
                     .to_string(),
             });
         }
     }
 
+    summary.indexed_packages = packages.len();
+    summary.capabilities = capabilities.len();
+    summary.warnings = warnings.len();
+    summary.skipped_rust_candidates = skipped.len();
+
     Ok(RepoIndex {
         packages,
         capabilities,
         warnings,
+        skipped,
+        summary,
     })
+}
+
+fn infer_package_identity_from_cargo_toml(package: &mut IndexedPackage, spec_dir: &Path) -> bool {
+    let Some(crate_name) = cargo_package_name(&spec_dir.join("Cargo.toml")) else {
+        return false;
+    };
+    if package.crate_name.is_empty() {
+        package.crate_name = crate_name;
+    }
+    if package.pkgname.is_empty() {
+        package.pkgname =
+            repo_pkgname_for_dependency(&package.crate_name, &parse_version(&package.version));
+    }
+    !package.crate_name.is_empty() && !package.pkgname.is_empty() && !package.version.is_empty()
+}
+
+fn cargo_package_name(cargo_toml: &Path) -> Option<String> {
+    let content = fs::read_to_string(cargo_toml).ok()?;
+    let manifest: Value = toml::from_str(&content).ok()?;
+    manifest
+        .get("package")
+        .and_then(Value::as_table)?
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn add_naming_warning(package: &IndexedPackage, dir_name: &str, warnings: &mut Vec<RepoWarning>) {
+    let Some(expected) = expected_rust_package_name(&package.crate_name, &package.version) else {
+        return;
+    };
+    let name_mismatch = package.rpm_name != expected;
+    let dir_mismatch = !dir_name.is_empty() && dir_name != expected;
+    if !name_mismatch && !dir_mismatch {
+        return;
+    }
+
+    warnings.push(RepoWarning {
+        warning_type: "naming-mismatch".to_string(),
+        rpm_name: package.rpm_name.clone(),
+        subpackage: "main".to_string(),
+        cap: package_capability(&package.pkgname, None),
+        normalized_version: None,
+        requirement: None,
+        line: None,
+        expected: Some(expected),
+        message: "Rust crate package name should follow rust-<crate>-<compat-branch>".to_string(),
+    });
+}
+
+fn expected_rust_package_name(crate_name: &str, version: &str) -> Option<String> {
+    if crate_name.is_empty() {
+        return None;
+    }
+    let branch = compat_branch(&parse_version(version))?;
+    Some(format!("rust-{}-{branch}", crate_name.replace('_', "-")))
+}
+
+fn pkgname_looks_like_crate_compat(pkgname: &str) -> bool {
+    let Some((_, branch)) = pkgname.rsplit_once('-') else {
+        return false;
+    };
+    let parts = parse_version(branch);
+    !parts.is_empty()
+}
+
+fn skipped_package_name(package: &IndexedPackage, dir_name: &str) -> String {
+    if !package.rpm_name.is_empty() {
+        package.rpm_name.clone()
+    } else {
+        dir_name.to_string()
+    }
 }
 
 fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
@@ -423,6 +615,7 @@ fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
                         normalized_version: Some(version.clone()),
                         requirement: None,
                         line: Some(line_no),
+                        expected: None,
                         message: format!(
                             "repo-index normalized this Provides to version {}, but RPM metadata may remain unversioned",
                             version
@@ -453,6 +646,7 @@ fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
                         normalized_version: None,
                         requirement: Some(payload.clone()),
                         line: Some(line_no),
+                        expected: None,
                         message: "repo-index kept this Requires without a version constraint; RPM metadata may differ".to_string(),
                     });
                 }
@@ -471,6 +665,7 @@ fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
                     normalized_version: None,
                     requirement: Some(payload),
                     line: Some(line_no),
+                    expected: None,
                     message: "repo-index does not parse RPM rich dependency syntax in Requires"
                         .to_string(),
                 });
@@ -500,7 +695,15 @@ fn parse_spec(path: &Path) -> Result<(IndexedPackage, Vec<RepoWarning>)> {
 }
 
 pub fn write_repo_index(spec_root: &Path, output: &Path) -> Result<()> {
-    let index = build_repo_index(spec_root)?;
+    write_repo_index_with_options(spec_root, output, RepoIndexOptions::default())
+}
+
+pub fn write_repo_index_with_options(
+    spec_root: &Path,
+    output: &Path,
+    options: RepoIndexOptions,
+) -> Result<()> {
+    let index = build_repo_index_with_options(spec_root, options)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -509,6 +712,19 @@ pub fn write_repo_index(spec_root: &Path, output: &Path) -> Result<()> {
     fs::write(output, format!("{json}\n"))
         .with_context(|| format!("failed to write {}", output.display()))?;
     println!("Repo index: {}", output.display());
+    println!("package_root: {}", spec_root.display());
+    println!("scanned_specs: {}", index.summary.scanned_specs);
+    println!("indexed_packages: {}", index.summary.indexed_packages);
+    println!("capabilities: {}", index.summary.capabilities);
+    println!("warnings: {}", index.summary.warnings);
+    println!(
+        "ignored_non_rust_specs: {}",
+        index.summary.ignored_non_rust_specs
+    );
+    println!(
+        "skipped_rust_candidates: {}",
+        index.summary.skipped_rust_candidates
+    );
     Ok(())
 }
 
@@ -642,12 +858,17 @@ pub fn build_repo_plan(
     })
 }
 
-pub fn run_app_audit(ruyispec_dir: &Path, index_path: &Path, output: &Path) -> Result<()> {
+pub fn run_app_audit(
+    ruyispec_dir: &Path,
+    package_root: &Path,
+    index_path: &Path,
+    output: &Path,
+) -> Result<()> {
     let index_content = fs::read_to_string(index_path)
         .with_context(|| format!("failed to read {}", index_path.display()))?;
     let index: RepoIndex = serde_json::from_str(&index_content)
         .with_context(|| format!("failed to parse {}", index_path.display()))?;
-    let report = build_app_audit_report(ruyispec_dir, index_path, &index)?;
+    let report = build_app_audit_report(ruyispec_dir, package_root, index_path, &index)?;
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -662,14 +883,17 @@ pub fn run_app_audit(ruyispec_dir: &Path, index_path: &Path, output: &Path) -> R
 
 pub fn build_app_audit_report(
     ruyispec_dir: &Path,
+    package_root: &Path,
     index_path: &Path,
     index: &RepoIndex,
 ) -> Result<AppAuditReport> {
+    let (app_dirs, mut skipped) = rust_application_scan(package_root)?;
     let mut apps = Vec::new();
-    for app_dir in rust_application_dirs(ruyispec_dir)? {
+    for app_dir in app_dirs {
         apps.push(audit_app_dir(&app_dir, index));
     }
     apps.sort_by(|a, b| a.name.cmp(&b.name));
+    skipped.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut summary = AppAuditSummary {
         total: apps.len(),
@@ -686,8 +910,10 @@ pub fn build_app_audit_report(
 
     Ok(AppAuditReport {
         ruyispec_dir: display_path(ruyispec_dir),
+        package_root: display_path(package_root),
         index: display_path(index_path),
         apps,
+        skipped,
         summary,
     })
 }
@@ -728,33 +954,72 @@ fn audit_app_dir(app_dir: &Path, index: &RepoIndex) -> AppAuditRecord {
     }
 }
 
-fn rust_application_dirs(ruyispec_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+fn rust_application_scan(package_root: &Path) -> Result<(Vec<PathBuf>, Vec<AppAuditSkipped>)> {
     let mut app_dirs = Vec::new();
-    for entry in fs::read_dir(ruyispec_dir)
-        .with_context(|| format!("failed to read {}", ruyispec_dir.display()))?
+    let mut skipped = Vec::new();
+    for entry in fs::read_dir(package_root)
+        .with_context(|| format!("failed to read {}", package_root.display()))?
     {
         let entry = entry?;
         let path = entry.path();
-        if is_rust_application_dir(&path)? {
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with("rust-") {
+            continue;
+        }
+        let has_spec = has_spec_file(&path)?;
+        if !has_spec {
+            continue;
+        }
+        let has_cargo_toml = path.join("Cargo.toml").is_file();
+        if has_cargo_toml {
             app_dirs.push(path);
+        } else if spec_dir_looks_like_rust_app(&path)? {
+            skipped.push(AppAuditSkipped {
+                name,
+                path: display_path(&path),
+                reason: "missing-cargo-toml".to_string(),
+                has_spec,
+                has_cargo_toml,
+            });
         }
     }
     app_dirs.sort();
-    Ok(app_dirs)
+    skipped.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((app_dirs, skipped))
 }
 
-fn is_rust_application_dir(path: &Path) -> Result<bool> {
+fn spec_dir_looks_like_rust_app(path: &Path) -> Result<bool> {
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || !entry.path().extension().is_some_and(|ext| ext == "spec")
+        {
+            continue;
+        }
+        let content = fs::read_to_string(entry.path())?;
+        let lower = content.to_ascii_lowercase();
+        if lower.contains("rust application")
+            || lower.contains("buildsystem:    rust")
+            || lower.contains("buildsystem: rust")
+            || lower.contains("%cargo")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_spec_file(path: &Path) -> Result<bool> {
     if !path.is_dir() {
         return Ok(false);
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if name.starts_with("rust-") || !path.join("Cargo.toml").is_file() {
-        return Ok(false);
-    }
-
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
         let entry = entry?;
         if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "spec")
@@ -1013,6 +1278,7 @@ fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Optio
             normalized_version: None,
             requirement: Some(requirement.to_string()),
             line: None,
+            expected: None,
             message: "dependency has no simple version requirement; repo-check treated it as any"
                 .to_string(),
         });
@@ -1033,6 +1299,7 @@ fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Optio
             normalized_version: None,
             requirement: Some(requirement.to_string()),
             line: None,
+            expected: None,
             message: "repo-check only derives lower bounds from simple Cargo requirements in this experimental version".to_string(),
         })
     } else {

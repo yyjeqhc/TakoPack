@@ -6,7 +6,7 @@ use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
 use takopack::recursive_package::RecursivePackager;
-use takopack::repo_check::RepoCheckOptions;
+use takopack::repo_check::{RepoCheckOptions, RepoIndexOptions};
 use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
@@ -130,11 +130,17 @@ fn real_main() -> Result<i32> {
                 CargoOpt::RepoIndex {
                     spec_repo_dir,
                     ruyispec,
+                    include_all_specs,
                     output,
                 } => {
-                    let spec_repo_dir =
+                    let ruyispec_dir =
                         takopack::config::resolve_ruyispec_dir(spec_repo_dir.as_deref(), ruyispec)?;
-                    takopack::repo_check::write_repo_index(&spec_repo_dir, &output)?;
+                    let package_root = takopack::config::ruyispec_package_root(&ruyispec_dir);
+                    takopack::repo_check::write_repo_index_with_options(
+                        &package_root,
+                        &output,
+                        RepoIndexOptions { include_all_specs },
+                    )?;
                     Ok(0)
                 }
                 CargoOpt::RepoCheck {
@@ -171,7 +177,13 @@ fn real_main() -> Result<i32> {
                 } => {
                     let ruyispec_dir =
                         takopack::config::resolve_ruyispec_dir(ruyispec_dir.as_deref(), ruyispec)?;
-                    takopack::repo_check::run_app_audit(&ruyispec_dir, &index, &output)?;
+                    let package_root = takopack::config::ruyispec_package_root(&ruyispec_dir);
+                    takopack::repo_check::run_app_audit(
+                        &ruyispec_dir,
+                        &package_root,
+                        &index,
+                        &output,
+                    )?;
                     Ok(0)
                 }
                 CargoOpt::Track {

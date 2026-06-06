@@ -104,6 +104,10 @@ pub enum CargoOpt {
         #[arg(long)]
         ruyispec: bool,
 
+        /// Include every spec in packages, preserving the old broad scan behavior
+        #[arg(long)]
+        include_all_specs: bool,
+
         /// Output JSON index path
         #[arg(long, value_name = "INDEX_JSON")]
         output: std::path::PathBuf,

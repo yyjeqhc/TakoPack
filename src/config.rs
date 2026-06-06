@@ -428,6 +428,15 @@ pub fn resolve_ruyispec_dir(explicit: Option<&Path>, use_config: bool) -> Result
     require_directory(&local_path, "ruyispec.local_path")
 }
 
+pub fn ruyispec_package_root(ruyispec_dir: &Path) -> PathBuf {
+    let specs_dir = ruyispec_dir.join("SPECS");
+    if specs_dir.is_dir() {
+        specs_dir
+    } else {
+        ruyispec_dir.to_path_buf()
+    }
+}
+
 fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
     let Some(path) = find_takopack_toml() else {
         return Ok(None);
