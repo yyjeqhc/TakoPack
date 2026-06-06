@@ -1,3 +1,8 @@
 *.tar.gz
 target/
 sieve/
+Cargo.lock
+*.patch
+track_*
+experiments*
+parser*
