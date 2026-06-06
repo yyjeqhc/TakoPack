@@ -126,7 +126,7 @@ impl CrateDep {
     fn crate_name_with_compat(&self) -> String {
         let crate_base = self.crate_name.replace('_', "-");
         // Extract compatibility version from version constraint
-        // E.g., ">= 0.6.2" -> "0.6", ">= 2.2.1" -> "2.0", ">= 1.13" -> "1.0"
+        // E.g., ">= 0.6.2" -> "0.6", ">= 2.2.1" -> "2", ">= 1.13" -> "1"
         // For prerelease: ">= 0.26.0-beta.1" -> "0.26.0-beta.1" (full version with - separator)
         // log::debug!("before version_num: {} {:?}", crate_base, &self.version);
 
@@ -220,9 +220,8 @@ impl fmt::Display for Source {
         // Package name uses hyphens instead of underscores
         let pkg_name = self.crate_name.replace('_', "-");
 
-        // Calculate compatibility version following Rust semver rules
-        // 0.x.y -> 0.x, 1.x.y -> 1.0
-        // BUT: if version has build metadata, use full version instead
+        // Calculate compatibility version following openRuyi Rust crate policy:
+        // 0.x.y -> 0.x, 1.x.y -> 1, 0.0.x -> 0.0.x.
         let compat_version = if let Ok(ver) = Version::parse(&self.version) {
             crate::util::calculate_compat_version(&ver)
         } else {
@@ -347,7 +346,7 @@ fn convert_to_crate_format(pkg_name: &str) -> String {
 fn extract_version_from_pkg_name(pkg_name: &str) -> Option<String> {
     // Extract version from package names like:
     // "rust-pyo3-build-config-0.26+default-dev" -> Some(">= 0.26.0")
-    // "rust-serde-1.0+default-dev" -> Some(">= 1.0.0")
+    // "rust-serde-1+default-dev" -> Some(">= 1.0.0")
 
     let mut name = pkg_name.trim().to_string();
 
@@ -368,7 +367,7 @@ fn extract_version_from_pkg_name(pkg_name: &str) -> Option<String> {
         name = name[..idx].to_string();
     }
 
-    // Now we have something like "pyo3-build-config-0.26" or "serde-1.0"
+    // Now we have something like "pyo3-build-config-0.26" or "serde-1"
     // Find the last part that looks like a version number
     let parts: Vec<&str> = name.split('-').collect();
     if let Some(last_part) = parts.last() {
@@ -560,7 +559,7 @@ fn parse_deb_package_to_crate_dep(pkg_name: &str) -> Option<CrateDep> {
 ///
 /// 示例：
 ///   rust-md-5-0.10+default-dev -> CrateDep { crate_name: "md-5", feature: Some("default") }
-///   rust-serde-1.0+derive-dev -> CrateDep { crate_name: "serde", feature: Some("derive") }
+///   rust-serde-1+derive-dev -> CrateDep { crate_name: "serde", feature: Some("derive") }
 ///   rust-utf-8-0.7-dev -> CrateDep { crate_name: "utf-8", feature: None }
 ///   rust-proc-macro2-1-dev -> CrateDep { crate_name: "proc-macro2", feature: None }
 fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
@@ -1415,7 +1414,7 @@ pub fn get_deb_author() -> Result<String> {
 mod tests {
     use super::{
         convert_to_crate_format, crate_requirements_from_cargo_deps,
-        extract_feature_from_package_name, parse_package_name_simple, CrateDep,
+        extract_feature_from_package_name, parse_package_name_simple, BuildDeps, CrateDep, Source,
     };
     use crate::takopack::spec;
     use cargo::core::{dependency::DepKind, Dependency, SourceId};
@@ -1438,6 +1437,32 @@ mod tests {
             .into_iter()
             .map(|requirement| spec::render_crate_requires(&requirement))
             .collect()
+    }
+
+    #[test]
+    fn source_header_uses_major_branch_for_package_names() {
+        let source = Source::new(
+            "clap",
+            "4.6.1",
+            None,
+            "clap",
+            "https://example.invalid/clap",
+            "",
+            "MIT OR Apache-2.0",
+            true,
+            "takopack Test <takopack@example.com>".to_string(),
+            vec![],
+            BuildDeps::default(),
+            None,
+            String::new(),
+            "4.6.1".to_string(),
+            None,
+        )
+        .unwrap();
+        let rendered = source.to_string();
+
+        assert!(rendered.contains("%global pkgname clap-4"));
+        assert!(rendered.contains("Name:           rust-clap-4"));
     }
 
     #[test]
@@ -1472,9 +1497,9 @@ mod tests {
 
         assert_eq!(
             vec![
-                "Requires:       crate(serde-1.0/default) >= 1.0.0",
-                "Requires:       crate(serde-1.0/derive) >= 1.0.0",
-                "Requires:       crate(serde-1.0/std) >= 1.0.0",
+                "Requires:       crate(serde-1/default) >= 1.0.0",
+                "Requires:       crate(serde-1/derive) >= 1.0.0",
+                "Requires:       crate(serde-1/std) >= 1.0.0",
             ],
             rendered
         );
@@ -1487,9 +1512,20 @@ mod tests {
 
         assert!(rendered
             .iter()
-            .all(|line| !line.contains("crate(serde-1.0/default)")));
+            .all(|line| !line.contains("crate(serde-1/default)")));
         assert_eq!(
-            vec!["Requires:       crate(serde-1.0/derive) >= 1.0.0"],
+            vec!["Requires:       crate(serde-1/derive) >= 1.0.0"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_dependency_major_four_uses_major_branch() {
+        let dep = test_dep("clap-builder", "4.6.0", true, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert_eq!(
+            vec!["Requires:       crate(clap-builder-4/default) >= 4.6.0"],
             rendered
         );
     }
@@ -1519,7 +1555,7 @@ mod tests {
         let dep = test_dep("serde", "> 1.2.3", false, &[]);
         let rendered = rendered_cargo_requirements(&[dep]);
 
-        assert_eq!(vec!["Requires:       crate(serde-1.0) >= 1.2.4"], rendered);
+        assert_eq!(vec!["Requires:       crate(serde-1) >= 1.2.4"], rendered);
     }
 
     #[test]

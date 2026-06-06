@@ -294,8 +294,8 @@ mod tests {
             source: SpecSource {
                 crate_name: "serde_with".to_string(),
                 full_version: "3.18.0".to_string(),
-                pkgname: "serde-with-3.0".to_string(),
-                rpm_name: "rust-serde-with-3.0".to_string(),
+                pkgname: "serde-with-3".to_string(),
+                rpm_name: "rust-serde-with-3".to_string(),
                 rpm_version: "3.18.0".to_string(),
                 summary: "Rust crate \"serde_with\"".to_string(),
                 license: "MIT OR Apache-2.0".to_string(),

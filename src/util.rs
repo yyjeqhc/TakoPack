@@ -33,11 +33,11 @@ fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
     Ok(data_home.join("takopack").join("cargo_back"))
 }
 
-/// Calculate compatibility version following Rust semver rules
+/// Calculate compatibility branch following openRuyi Rust crate naming policy.
 /// - Prerelease versions (e.g., 0.26.0-beta.1) -> full version (0.26.0-beta.1)
 /// - BuildMetadata versions (e.g., 0.7.5+spec-1.1.0) -> full version (0.7.0)
 /// - 0.x.y -> 0.x (0.x series, minor version compatibility)
-/// - 1.x.y+ -> 1.0 (1.0+ series, major version compatibility)
+/// - 1.x.y+ -> 1 (major version compatibility)
 /// - 0.0.x+ -> 0.0.x (0.0.x series, patch version compatibility)
 pub fn calculate_compat_version(version: &Version) -> String {
     // For prerelease versions, use the full version including prerelease tag
@@ -55,12 +55,37 @@ pub fn calculate_compat_version(version: &Version) -> String {
 
         // format!("{}.{}.{}+{}", version.major, version.minor, version.patch, version.build)
         panic!("nerver to be here.")
-    } else if version.major != 0 {
-        format!("{}.0", version.major)
-    } else if version.minor != 0 {
+    } else if version.major > 0 {
+        version.major.to_string()
+    } else if version.minor > 0 {
         format!("0.{}", version.minor)
     } else {
         format!("0.0.{}", version.patch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_compat_version;
+    use semver::Version;
+
+    #[test]
+    fn calculate_compat_version_uses_openruyi_policy() {
+        for (version, expected) in [
+            ("1.0.228", "1"),
+            ("1.2.3", "1"),
+            ("2.0.0", "2"),
+            ("3.18.0", "3"),
+            ("4.6.1", "4"),
+            ("0.22.1", "0.22"),
+            ("0.9.3", "0.9"),
+            ("0.0.7", "0.0.7"),
+        ] {
+            assert_eq!(
+                calculate_compat_version(&Version::parse(version).unwrap()),
+                expected
+            );
+        }
     }
 }
 

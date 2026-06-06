@@ -98,7 +98,7 @@ impl CrateEntry {
     }
 
     /// Calculate the compatibility version string
-    /// For compatible versions: "0.x" or "major.0"
+    /// For compatible versions: "major", "0.x", or "0.0.patch"
     /// For incompatible versions: full version string
     pub fn compat_version(&self) -> String {
         crate::util::calculate_compat_version(&self.version)
@@ -323,8 +323,8 @@ mod tests {
     #[test]
     fn test_compat_version() {
         let e1 = CrateEntry::new("serde".to_string(), Version::parse("1.0.0").unwrap());
-        assert_eq!(e1.compat_version(), "1.0");
-        assert_eq!(e1.key(), "serde@1.0");
+        assert_eq!(e1.compat_version(), "1");
+        assert_eq!(e1.key(), "serde@1");
 
         let e2 = CrateEntry::new("toml".to_string(), Version::parse("0.8.23").unwrap());
         assert_eq!(e2.compat_version(), "0.8");
