@@ -672,13 +672,14 @@ fn legacy_compat_name(rpm_name: &str, crate_name: &str, version: &str) -> bool {
     if parts.len() < 2 || parts[0] == 0 {
         return false;
     }
-    let legacy = format!(
+    let legacy_actual_minor = format!(
         "rust-{}-{}.{}",
         crate_name.replace('_', "-"),
         parts[0],
         parts[1]
     );
-    rpm_name == legacy
+    let legacy_major_zero = format!("rust-{}-{}.0", crate_name.replace('_', "-"), parts[0]);
+    rpm_name == legacy_actual_minor || rpm_name == legacy_major_zero
 }
 
 fn exact_version_package_name(rpm_name: &str, crate_name: &str, version: &str) -> bool {
@@ -2786,7 +2787,19 @@ mod tests {
     #[test]
     fn package_policy_warning_types_are_specific() {
         assert_eq!(
+            package_policy_warning_type(&policy_package("rust-clap-4.0", "clap", "4.5.50")),
+            "legacy-compat-name"
+        );
+        assert_eq!(
+            package_policy_warning_type(&policy_package("rust-regex-1.0", "regex", "1.12.2")),
+            "legacy-compat-name"
+        );
+        assert_eq!(
             package_policy_warning_type(&policy_package("rust-serde-1.0", "serde", "1.0.228")),
+            "legacy-compat-name"
+        );
+        assert_ne!(
+            package_policy_warning_type(&policy_package("rust-base64-0.22", "base64", "0.22.1")),
             "legacy-compat-name"
         );
         assert_eq!(

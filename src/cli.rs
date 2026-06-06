@@ -59,8 +59,8 @@ pub enum CargoOpt {
         #[arg(value_name = "CARGO_TOML")]
         toml_path: std::path::PathBuf,
 
-        /// Output directory for generated spec files (default: timestamped directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Output root directory. Each package is generated under this root.
+        #[arg(short, long, value_name = "OUT_ROOT")]
         output: Option<std::path::PathBuf>,
     },
     /// Batch process multiple crates from a text file (one crate per line: "crate_name version")
@@ -70,8 +70,8 @@ pub enum CargoOpt {
         #[arg(value_name = "FILE")]
         file: std::path::PathBuf,
 
-        /// Output directory for generated spec files (default: timestamped directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Output root directory. Each package is generated under this root.
+        #[arg(short, long, value_name = "OUT_ROOT")]
         output: Option<std::path::PathBuf>,
     },
     /// Package from a local crate directory (with Cargo.toml)
@@ -81,8 +81,13 @@ pub enum CargoOpt {
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
 
-        /// Output directory for generated spec file (default: current directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Final output package directory. Files are written directly into this directory.
+        #[arg(
+            short = 'o',
+            long = "directory",
+            alias = "output",
+            value_name = "OUT_DIR"
+        )]
         output: Option<std::path::PathBuf>,
 
         #[command(flatten)]

@@ -275,9 +275,8 @@ fn process_complete_crate(
 
     let output_names = crate::util::rust_crate_output_names(crate_name, version);
 
-    // Determine output directory
-    let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
-    let final_output = output_base.join(&output_names.directory);
+    // Determine final output package directory.
+    let final_output = crate::util::package_final_output_dir(output_dir.as_deref(), &output_names)?;
 
     fs::create_dir_all(&final_output)
         .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
@@ -534,12 +533,14 @@ edition = "2021"
             lockfile_deps: None,
         };
 
-        process_local_package(source.path(), Some(output.path().to_path_buf()), finish).unwrap();
-
         let output_names =
             rust_crate_output_names("localpkg_smoke", &Version::parse("0.1.0").unwrap());
-        let package_dir = output.path().join(&output_names.directory);
+        let package_dir = output.path().join("explicit-final-package-dir");
+
+        process_local_package(source.path(), Some(package_dir.clone()), finish).unwrap();
+
         assert!(package_dir.join(&output_names.spec_file).exists());
         assert!(package_dir.join("Cargo.toml").exists());
+        assert!(!output.path().join(&output_names.directory).exists());
     }
 }

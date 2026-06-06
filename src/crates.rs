@@ -1,4 +1,4 @@
-use anyhow::{format_err, Error};
+use anyhow::{format_err, Context, Error};
 use cargo::{
     core::{
         manifest::ManifestMetadata, registry::PackageRegistry, resolver::features::CliFeatures,
@@ -661,9 +661,19 @@ impl CrateInfo {
 
     pub fn extract_crate(&mut self, path: &Path) -> Result<bool> {
         let mut archive = Archive::new(GzDecoder::new(self.crate_file.file()));
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Could not create parent directory for source directory {}",
+                path.display()
+            )
+        })?;
         let tempdir = tempfile::Builder::new()
             .prefix("takopack")
-            .tempdir_in(".")?;
+            .tempdir_in(parent)?;
         let mut source_modified = false;
         let mut last_mtime = 0;
         let mut err = vec![];

@@ -81,6 +81,50 @@ pub fn write_file_ensuring_dir(path: &Path, contents: impl AsRef<[u8]>) -> Resul
     fs::write(path, contents).with_context(|| format!("Failed to write {:?}", path))
 }
 
+pub fn resolve_output_dir(path: &Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    Ok(resolve_output_dir_with_base(path, &cwd))
+}
+
+pub fn resolve_output_dir_with_base(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+pub fn package_final_output_dir(
+    explicit_dir: Option<&Path>,
+    output_names: &RustCrateOutputNames,
+) -> Result<PathBuf> {
+    let default_dir;
+    let requested = match explicit_dir {
+        Some(path) => path,
+        None => {
+            default_dir = PathBuf::from(&output_names.directory);
+            &default_dir
+        }
+    };
+    resolve_output_dir(requested)
+}
+
+pub fn package_final_output_dir_with_base(
+    explicit_dir: Option<&Path>,
+    output_names: &RustCrateOutputNames,
+    cwd: &Path,
+) -> PathBuf {
+    let default_dir;
+    let requested = match explicit_dir {
+        Some(path) => path,
+        None => {
+            default_dir = PathBuf::from(&output_names.directory);
+            &default_dir
+        }
+    };
+    resolve_output_dir_with_base(requested, cwd)
+}
+
 #[cfg(unix)]
 pub fn hint_file_for(file: &Path) -> Option<Cow<'_, Path>> {
     let file = file.as_os_str().as_bytes();
@@ -580,8 +624,12 @@ pub fn process_single_crate(
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_compat_version, rust_crate_output_names};
+    use super::{
+        calculate_compat_version, package_final_output_dir_with_base, resolve_output_dir_with_base,
+        rust_crate_output_names,
+    };
     use semver::Version;
+    use std::path::Path;
 
     #[test]
     fn calculate_compat_version_uses_openruyi_policy() {
@@ -618,6 +666,51 @@ mod tests {
         assert_eq!(
             rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
             "rust-base64-0.22.spec"
+        );
+    }
+
+    #[test]
+    fn explicit_absolute_output_dir_remains_absolute() {
+        let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
+        let out = Path::new("/tmp/takopack-test/rust-libc-0.2");
+
+        assert_eq!(
+            package_final_output_dir_with_base(
+                Some(out),
+                &output_names,
+                Path::new("/root/git/TakoPack")
+            ),
+            out
+        );
+    }
+
+    #[test]
+    fn explicit_relative_output_dir_resolves_under_current_dir() {
+        assert_eq!(
+            resolve_output_dir_with_base(
+                Path::new("target/tmp/rust-libc-0.2"),
+                Path::new("/root/git/TakoPack")
+            ),
+            Path::new("/root/git/TakoPack/target/tmp/rust-libc-0.2")
+        );
+    }
+
+    #[test]
+    fn explicit_package_dir_is_not_replaced_by_generated_basename() {
+        let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
+
+        assert_eq!(
+            package_final_output_dir_with_base(
+                Some(Path::new("custom/final-libc-dir")),
+                &output_names,
+                Path::new("/repo")
+            ),
+            Path::new("/repo/custom/final-libc-dir")
+        );
+
+        assert_eq!(
+            package_final_output_dir_with_base(None, &output_names, Path::new("/repo")),
+            Path::new("/repo/rust-libc-0.2")
         );
     }
 }

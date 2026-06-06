@@ -18,8 +18,8 @@ pub struct RecursivePackageArgs {
     /// TOML file providing package-specific options.
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Base output directory for all packages (timestamp as default).
-    #[arg(short = 'o', long)]
+    /// Output root directory. Each package is generated under this root.
+    #[arg(short = 'o', long, value_name = "OUT_ROOT")]
     pub output: Option<PathBuf>,
 }
 

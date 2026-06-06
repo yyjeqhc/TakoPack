@@ -24,7 +24,7 @@ fn real_main() -> Result<i32> {
                 CargoOpt::Update => invalidate_crates_io_cache().map(|_| 0),
                 CargoOpt::Package {
                     init,
-                    extract,
+                    mut extract,
                     finish,
                 } => {
                     use std::fs;
@@ -37,7 +37,11 @@ fn real_main() -> Result<i32> {
                     let version = process.crate_info().version();
 
                     let output_names = takopack::util::rust_crate_output_names(crate_name, version);
-                    let final_output = std::path::PathBuf::from(&output_names.directory);
+                    let final_output = takopack::util::package_final_output_dir(
+                        extract.directory.as_deref(),
+                        &output_names,
+                    )?;
+                    extract.directory = Some(final_output.clone());
 
                     process.extract(extract)?;
                     process.apply_overrides()?;
