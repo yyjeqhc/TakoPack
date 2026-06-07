@@ -885,12 +885,9 @@ pub fn all_dependencies_and_features_filtered(
     manifest: &Manifest,
     include_dev_dependencies: bool,
 ) -> Result<CrateDepInfo> {
-    use cargo::core::dependency::DepKind;
-
     let mut deps_by_name: BTreeMap<&str, Vec<&Dependency>> = BTreeMap::new();
     for dep in manifest.dependencies() {
-        // we treat build-dependencies also as dependencies in takopack
-        if include_dev_dependencies || dep.kind() != DepKind::Development {
+        if dependency_is_runtime_candidate(dep, include_dev_dependencies) {
             let s = dep.name_in_toml().as_str();
             deps_by_name.entry(s).or_default().push(dep);
         }
@@ -921,6 +918,19 @@ pub fn all_dependencies_and_features_filtered(
                         takopack_warn!(
                             "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                  dev-dependency \"{}\"",
+                            manifest.package_id(),
+                            feature,
+                            dep_name
+                        );
+                    }
+                    None if dependency_is_filtered_runtime_dependency(
+                        manifest,
+                        dep_name.as_str(),
+                        include_dev_dependencies,
+                    ) =>
+                    {
+                        takopack_warn!(
+                            "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
                             manifest.package_id(),
                             feature,
                             dep_name
@@ -957,6 +967,17 @@ pub fn all_dependencies_and_features_filtered(
                                 takopack_warn!(
                                     "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                      dev-dependency \"{}\"",
+                                    manifest.package_id(),
+                                    feature,
+                                    dep_name
+                                );
+                            } else if dependency_is_filtered_runtime_dependency(
+                                manifest,
+                                dep_name.as_str(),
+                                include_dev_dependencies,
+                            ) {
+                                takopack_warn!(
+                                    "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
                                     manifest.package_id(),
                                     feature,
                                     dep_name
@@ -1000,6 +1021,67 @@ pub fn all_dependencies_and_features_filtered(
     }
 
     Ok(features_with_deps)
+}
+
+pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencies: bool) -> bool {
+    use cargo::core::dependency::DepKind;
+
+    let kind_allowed = match dep.kind() {
+        DepKind::Normal => true,
+        DepKind::Development => include_dev_dependencies,
+        DepKind::Build => false,
+    };
+    if !kind_allowed {
+        return false;
+    }
+
+    if is_special_rustc_workspace_crate(dep.package_name().as_str()) {
+        takopack_warn!(
+            "Skipping special/internal Rust workspace dependency from runtime Requires: {}",
+            dep.package_name()
+        );
+        return false;
+    }
+
+    if dependency_is_windows_only(dep) {
+        takopack_warn!(
+            "Skipping Windows-only target dependency from Linux/openRuyi runtime Requires: {} {:?}",
+            dep.package_name(),
+            dep.platform().map(|platform| platform.to_string())
+        );
+        return false;
+    }
+
+    true
+}
+
+pub fn dependency_is_windows_only(dep: &Dependency) -> bool {
+    let Some(platform) = dep.platform() else {
+        return false;
+    };
+    let platform = platform.to_string().to_ascii_lowercase();
+    platform.contains("windows")
+        || platform.contains("win32")
+        || platform.contains("windows-msvc")
+        || platform.contains("windows-gnu")
+}
+
+pub fn is_special_rustc_workspace_crate(crate_name: &str) -> bool {
+    matches!(
+        crate_name.replace('_', "-").as_str(),
+        "rustc-std-workspace-core" | "rustc-std-workspace-alloc" | "rustc-std-workspace-std"
+    )
+}
+
+fn dependency_is_filtered_runtime_dependency(
+    manifest: &Manifest,
+    dep_name: &str,
+    include_dev_dependencies: bool,
+) -> bool {
+    manifest.dependencies().iter().any(|dep| {
+        dep.name_in_toml().as_str() == dep_name
+            && !dependency_is_runtime_candidate(dep, include_dev_dependencies)
+    })
 }
 
 fn dependency_is_dev_dependency(manifest: &Manifest, dep_name: &str) -> bool {
@@ -1054,4 +1136,94 @@ fn transitive_deps_impl<'a>(
         );
     }
     Ok((all_features, all_deps))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{all_dependencies_and_features, dependency_is_runtime_candidate};
+    use cargo::core::{dependency::DepKind, EitherManifest, SourceId};
+    use cargo::util::toml::read_manifest;
+    use cargo::GlobalContext;
+    use std::fs;
+
+    fn manifest_from_toml(toml: &str) -> cargo::core::Manifest {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
+        let cargo_toml = temp.path().join("Cargo.toml");
+        fs::write(&cargo_toml, toml).unwrap();
+        let source_id = SourceId::for_path(temp.path()).unwrap();
+        match read_manifest(&cargo_toml, source_id, &GlobalContext::default().unwrap()).unwrap() {
+            EitherManifest::Real(manifest) => manifest,
+            _ => panic!("expected real manifest"),
+        }
+    }
+
+    fn dep_names(deps: &[cargo::core::Dependency]) -> Vec<String> {
+        let mut names = deps
+            .iter()
+            .map(|dep| dep.package_name().as_str().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn feature_graph_excludes_dev_build_windows_and_special_runtime_deps_by_default() {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+normal = "1"
+optional-normal = { version = "1", optional = true }
+rustc-std-workspace-core = "1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-win = "3"
+
+[features]
+use-optional = ["dep:optional-normal"]
+"#,
+        );
+
+        let features = all_dependencies_and_features(&manifest).unwrap();
+        let base_names = dep_names(&features.get("").unwrap().1);
+        assert_eq!(vec!["normal"], base_names);
+
+        let optional_names = dep_names(&features.get("use-optional").unwrap().1);
+        assert_eq!(vec!["optional-normal"], optional_names);
+    }
+
+    #[test]
+    fn runtime_candidate_filter_can_include_dev_when_explicitly_requested() {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[dev-dependencies]
+proptest = "1"
+"#,
+        );
+        let dev_dep = manifest
+            .dependencies()
+            .iter()
+            .find(|dep| dep.kind() == DepKind::Development)
+            .unwrap();
+
+        assert!(!dependency_is_runtime_candidate(dev_dep, false));
+        assert!(dependency_is_runtime_candidate(dev_dep, true));
+    }
 }

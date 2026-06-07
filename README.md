@@ -400,3 +400,20 @@ takopack cargo repo-plan <CARGO_TOML> \
 These commands are the main CLI path for openRuyi-style Rust crate repository validation and packaging planning. They use the same compat branch policy as spec generation: `serde 1.x` becomes `crate(serde-1)`, `clap 4.x` becomes `crate(clap-4)`, and `base64 0.22.x` remains `crate(base64-0.22)`.
 
 The Python tools under `experiments/rust_repo_check/tools/` remain an experimental PoC and fixture baseline. Keep them useful for regression scenarios, but prefer the native `takopack cargo repo-index`, `repo-check`, and `repo-plan` commands for day-to-day planning.
+
+## Rust crate dependency metadata policy
+
+TakoPack is responsible for translating Cargo metadata into RPM crate capability metadata in generated specs. `rust-rpm-macros` installs and configures the build environment, but it is not the dependency resolver for generated crate provider `Requires:` lines.
+
+Generated Rust crate specs should not use `%cargo_buildrequires` as the primary source of crate dependency metadata. The intended path is Cargo.toml-first extraction in TakoPack, rendered as `crate(name-compat[/feature])` `Provides:` and `Requires:`.
+
+Runtime crate provider `Requires:` are intentionally conservative:
+
+- normal `[dependencies]` may become runtime `Requires:`;
+- `[build-dependencies]` do not become runtime `Requires:` by default;
+- `[dev-dependencies]` do not become runtime `Requires:` by default;
+- optional dependencies do not enter the main package unconditionally, and should be pulled through the feature subpackage that enables them;
+- target-specific Windows dependencies are filtered from ordinary Linux/openRuyi runtime `Requires:` by default;
+- `rustc-std-workspace-core`, `rustc-std-workspace-alloc`, and `rustc-std-workspace-std` require manual policy and are not emitted as ordinary runtime `Requires:` by default.
+
+Future work may add explicit target selection and opt-in dev/test dependency metadata, but default provider metadata should avoid dev/test/bench, build-only, and Windows-only dependencies.

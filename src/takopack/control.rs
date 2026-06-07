@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::{self, Write};
 
-use cargo::{
-    core::{dependency::DepKind, Dependency},
-    util::OptVersionReq,
-};
+use cargo::{core::Dependency, util::OptVersionReq};
 use semver::Version;
 use textwrap::fill;
 
 use crate::config::{self, Config, PackageKey};
+use crate::crates::dependency_is_runtime_candidate;
 use crate::errors::*;
 use crate::takopack::spec::{
     self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
@@ -326,7 +324,7 @@ fn crate_requirements_from_cargo_deps(
     let current_crate_base = spec::normalize_crate_name(current_crate_name);
 
     for dep in deps {
-        if dep.kind() != DepKind::Normal {
+        if !dependency_is_runtime_candidate(dep, false) {
             continue;
         }
 
@@ -1386,6 +1384,29 @@ mod tests {
     fn cargo_build_dependency_does_not_enter_runtime_crate_requires() {
         let mut dep = test_dep("cc", "1", true, &[]);
         dep.set_kind(DepKind::Build);
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn cargo_dev_dependency_does_not_enter_runtime_crate_requires() {
+        let mut dep = test_dep("proptest", "1", true, &[]);
+        dep.set_kind(DepKind::Development);
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn windows_only_target_dependency_does_not_enter_linux_runtime_crate_requires() {
+        let mut dep = test_dep("windows-win", "3", true, &[]);
+        dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn rustc_workspace_dependency_does_not_enter_runtime_crate_requires() {
+        let dep = test_dep("rustc-std-workspace-core", "1", true, &[]);
 
         assert!(rendered_cargo_requirements(&[dep]).is_empty());
     }
