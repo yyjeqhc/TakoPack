@@ -101,6 +101,8 @@ pub struct MigrationApplyReport {
     pub dry_run: bool,
     pub providers_regenerated: usize,
     pub old_dirs_removed: usize,
+    pub scoped_requires_rewritten: usize,
+    pub unresolved_new_requires: Vec<UnresolvedNewRequire>,
     pub consumer_files_touched: usize,
     pub consumer_rewrite_occurrences: usize,
     pub old_prefix_remaining_count: usize,
@@ -115,6 +117,14 @@ pub struct MigrationVerifyReport {
     pub repo_plan_summary: crate::repo_check::RepoPlanSummary,
     pub repo_check_summary: crate::repo_check::RepoCheckSummary,
     pub buildreqs_summary: crate::repo_check::BuildReqsSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedNewRequire {
+    pub file: String,
+    pub line: usize,
+    pub capability: String,
+    pub reason: String,
 }
 
 pub fn run_migrate_plan(options: MigratePlanOptions) -> Result<i32> {
@@ -156,6 +166,8 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
             dry_run: true,
             providers_regenerated: 0,
             old_dirs_removed: 0,
+            scoped_requires_rewritten: 0,
+            unresolved_new_requires: Vec::new(),
             consumer_files_touched: 0,
             consumer_rewrite_occurrences: 0,
             old_prefix_remaining_count: 0,
@@ -168,11 +180,20 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
     }
 
     ensure_apply_is_allowed(&plan, options.allow_prerelease)?;
+    let original_index = build_repo_index_with_options(&package_root, RepoIndexOptions::default())?;
+    let original_capabilities: BTreeSet<_> = original_index.capabilities.keys().cloned().collect();
+    let selected_new_prefixes: BTreeSet<_> = plan
+        .providers
+        .iter()
+        .map(|provider| provider.new_capability_prefix.clone())
+        .collect();
     fs::create_dir_all(&options.staging)
         .with_context(|| format!("failed to create {}", options.staging.display()))?;
 
     let mut providers_regenerated = 0usize;
     let mut old_dirs_removed = 0usize;
+    let mut scoped_requires_rewritten = 0usize;
+    let mut unresolved_new_requires = Vec::new();
     for provider in &plan.providers {
         let new_dir = package_root.join(&provider.new_package);
         let old_dir = package_root.join(&provider.old_package);
@@ -188,6 +209,10 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
             let staged_dir = generate_provider(provider, &options.staging)?;
             copy_dir_replace(&staged_dir, &new_dir)?;
         }
+        let scoped_result =
+            scope_provider_requires(&new_dir, &original_capabilities, &selected_new_prefixes)?;
+        scoped_requires_rewritten += scoped_result.rewritten;
+        unresolved_new_requires.extend(scoped_result.unresolved);
         providers_regenerated += 1;
 
         if !options.keep_old && old_dir.exists() {
@@ -211,6 +236,12 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
     if options.skip_package_generation {
         notes.push("provider generation skipped; copied/replaced local skeletons".to_string());
     }
+    if !unresolved_new_requires.is_empty() {
+        notes.push(format!(
+            "{} generated provider Requires were not found in the original repo and had no scoped dotted fallback",
+            unresolved_new_requires.len()
+        ));
+    }
 
     let report = MigrationApplyReport {
         plan: display_path(&options.plan),
@@ -218,6 +249,8 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
         dry_run: false,
         providers_regenerated,
         old_dirs_removed,
+        scoped_requires_rewritten,
+        unresolved_new_requires,
         consumer_files_touched: rewrite_result.files_touched,
         consumer_rewrite_occurrences: rewrite_result.occurrences,
         old_prefix_remaining_count: remaining,
@@ -226,7 +259,11 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
         notes,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(0)
+    if report.unresolved_new_requires.is_empty() {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
 }
 
 pub fn build_migration_plan(
@@ -611,6 +648,141 @@ struct RewriteResult {
     occurrences: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ScopedRequiresResult {
+    rewritten: usize,
+    unresolved: Vec<UnresolvedNewRequire>,
+}
+
+fn scope_provider_requires(
+    provider_dir: &Path,
+    repo_capabilities: &BTreeSet<String>,
+    selected_new_prefixes: &BTreeSet<String>,
+) -> Result<ScopedRequiresResult> {
+    let crate_capability = Regex::new(r"crate\([^)]+\)")?;
+    let mut rewritten = 0usize;
+    let mut unresolved = Vec::new();
+
+    for entry in WalkDir::new(provider_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry.path().extension().map_or(true, |ext| ext != "spec")
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let original = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut changed = false;
+        let mut updated_lines = Vec::new();
+
+        for (line_index, line) in original.lines().enumerate() {
+            if !line.trim_start().starts_with("Requires:") {
+                updated_lines.push(line.to_string());
+                continue;
+            }
+
+            let mut line_unresolved = Vec::new();
+            let updated = crate_capability
+                .replace_all(line, |captures: &regex::Captures<'_>| {
+                    let capability = captures.get(0).expect("full match").as_str();
+                    if should_keep_generated_require(
+                        capability,
+                        repo_capabilities,
+                        selected_new_prefixes,
+                    ) {
+                        return capability.to_string();
+                    }
+
+                    if let Some(fallback) = dotted_major_fallback_capability(capability) {
+                        if repo_capabilities.contains(&fallback) {
+                            rewritten += 1;
+                            changed = true;
+                            return fallback;
+                        }
+                    }
+
+                    line_unresolved.push(UnresolvedNewRequire {
+                        file: path.display().to_string(),
+                        line: line_index + 1,
+                        capability: capability.to_string(),
+                        reason: "capability is outside this migration batch and no existing dotted fallback was found".to_string(),
+                    });
+                    capability.to_string()
+                })
+                .into_owned();
+
+            unresolved.extend(line_unresolved);
+            updated_lines.push(updated);
+        }
+
+        if changed {
+            let mut updated = updated_lines.join("\n");
+            if original.ends_with('\n') {
+                updated.push('\n');
+            }
+            fs::write(path, updated)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+    }
+
+    Ok(ScopedRequiresResult {
+        rewritten,
+        unresolved,
+    })
+}
+
+fn should_keep_generated_require(
+    capability: &str,
+    repo_capabilities: &BTreeSet<String>,
+    selected_new_prefixes: &BTreeSet<String>,
+) -> bool {
+    if !is_literal_crate_capability(capability) {
+        return true;
+    }
+    if selected_new_prefixes
+        .iter()
+        .any(|prefix| capability_matches_prefix(capability, prefix))
+    {
+        return true;
+    }
+    repo_capabilities.contains(capability)
+}
+
+fn is_literal_crate_capability(capability: &str) -> bool {
+    capability
+        .strip_prefix("crate(")
+        .and_then(|value| value.strip_suffix(')'))
+        .is_some_and(|inner| !inner.contains('%') && !inner.contains('{') && !inner.contains('}'))
+}
+
+fn capability_matches_prefix(capability: &str, prefix: &str) -> bool {
+    capability
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| suffix == ")" || suffix.starts_with('/'))
+}
+
+fn dotted_major_fallback_capability(capability: &str) -> Option<String> {
+    let inner = capability.strip_prefix("crate(")?.strip_suffix(')')?;
+    let (package, feature) = inner.split_once('/').unwrap_or((inner, ""));
+    let (name, branch) = package.rsplit_once('-')?;
+    if branch.contains('.') {
+        return None;
+    }
+    let major = branch.parse::<u64>().ok()?;
+    if major == 0 {
+        return None;
+    }
+
+    let fallback_package = format!("{name}-{major}.0");
+    if feature.is_empty() {
+        Some(format!("crate({fallback_package})"))
+    } else {
+        Some(format!("crate({fallback_package}/{feature})"))
+    }
+}
+
 fn count_old_prefixes(package_root: &Path, rewrites: &[ConsumerRewrite]) -> Result<usize> {
     let mut count = 0usize;
     let patterns: Vec<_> = rewrites
@@ -924,5 +1096,124 @@ mod tests {
             "crate(ansi-to-tui-8.0"
         );
         assert_eq!(plan.consumer_rewrites[0].from, "crate(ansi-to-tui-8.0");
+    }
+
+    #[test]
+    fn dotted_major_fallback_only_applies_to_positive_integer_major() {
+        assert_eq!(
+            dotted_major_fallback_capability("crate(memchr-2/std)").as_deref(),
+            Some("crate(memchr-2.0/std)")
+        );
+        assert_eq!(
+            dotted_major_fallback_capability("crate(rustversion-1/default)").as_deref(),
+            Some("crate(rustversion-1.0/default)")
+        );
+        assert_eq!(
+            dotted_major_fallback_capability("crate(base64-0.22/default)"),
+            None
+        );
+        assert_eq!(dotted_major_fallback_capability("crate(foo-0/std)"), None);
+        assert_eq!(
+            dotted_major_fallback_capability("crate(im-rc-15/default)").as_deref(),
+            Some("crate(im-rc-15.0/default)")
+        );
+    }
+
+    #[test]
+    fn capability_prefix_match_is_exact_or_feature_only() {
+        assert!(capability_matches_prefix("crate(foo-1)", "crate(foo-1"));
+        assert!(capability_matches_prefix(
+            "crate(foo-1/default)",
+            "crate(foo-1"
+        ));
+        assert!(!capability_matches_prefix("crate(foo-10)", "crate(foo-1"));
+        assert!(!capability_matches_prefix("crate(foo-1.0)", "crate(foo-1"));
+    }
+
+    #[test]
+    fn scoped_requires_rewrite_falls_back_only_in_requires_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-aho-corasick-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        let spec_path = provider_dir.join("rust-aho-corasick.spec");
+        fs::write(
+            &spec_path,
+            "\
+Name: rust-aho-corasick-1
+Provides: crate(memchr-2/std) = 2.0.0
+Requires: crate(memchr-2/std) >= 2.0.0
+Requires: crate(aho-corasick-1/default) = 1.0.0
+Requires: crate(%{pkgname}) = %{version}
+",
+        )
+        .unwrap();
+
+        let repo_capabilities = BTreeSet::from(["crate(memchr-2.0/std)".to_string()]);
+        let selected_new_prefixes = BTreeSet::from(["crate(aho-corasick-1".to_string()]);
+        let result =
+            scope_provider_requires(&provider_dir, &repo_capabilities, &selected_new_prefixes)
+                .unwrap();
+
+        assert_eq!(result.rewritten, 1);
+        assert!(result.unresolved.is_empty());
+        let updated = fs::read_to_string(spec_path).unwrap();
+        assert!(updated.contains("Provides: crate(memchr-2/std) = 2.0.0"));
+        assert!(updated.contains("Requires: crate(memchr-2.0/std) >= 2.0.0"));
+        assert!(updated.contains("Requires: crate(aho-corasick-1/default) = 1.0.0"));
+        assert!(updated.contains("Requires: crate(%{pkgname}) = %{version}"));
+    }
+
+    #[test]
+    fn scoped_requires_keeps_dependencies_selected_in_same_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-aho-corasick-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        let spec_path = provider_dir.join("rust-aho-corasick.spec");
+        fs::write(
+            &spec_path,
+            "Requires: crate(memchr-2/std) >= 2.0.0\nRequires: crate(base64-0.22/default)\n",
+        )
+        .unwrap();
+
+        let repo_capabilities = BTreeSet::from([
+            "crate(memchr-2.0/std)".to_string(),
+            "crate(base64-0.22/default)".to_string(),
+        ]);
+        let selected_new_prefixes = BTreeSet::from([
+            "crate(aho-corasick-1".to_string(),
+            "crate(memchr-2".to_string(),
+        ]);
+        let result =
+            scope_provider_requires(&provider_dir, &repo_capabilities, &selected_new_prefixes)
+                .unwrap();
+
+        assert_eq!(result.rewritten, 0);
+        assert!(result.unresolved.is_empty());
+        let updated = fs::read_to_string(spec_path).unwrap();
+        assert!(updated.contains("Requires: crate(memchr-2/std)"));
+        assert!(updated.contains("Requires: crate(base64-0.22/default)"));
+        assert!(!updated.contains("base64-0.22.0"));
+    }
+
+    #[test]
+    fn scoped_requires_records_unresolved_new_requires() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "Requires: crate(missingdep-1/default) >= 1.0.0\n",
+        )
+        .unwrap();
+
+        let result =
+            scope_provider_requires(&provider_dir, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+
+        assert_eq!(result.rewritten, 0);
+        assert_eq!(result.unresolved.len(), 1);
+        assert_eq!(
+            result.unresolved[0].capability,
+            "crate(missingdep-1/default)"
+        );
     }
 }
