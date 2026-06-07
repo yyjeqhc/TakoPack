@@ -7,6 +7,7 @@ use takopack::errors::Result;
 use takopack::package::*;
 use takopack::recursive_package::RecursivePackager;
 use takopack::repo_check::{BuildReqsOptions, RepoCheckOptions, RepoIndexOptions};
+use takopack::repo_migrate::{MigrateApplyOptions, MigratePlanOptions};
 use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
@@ -214,6 +215,38 @@ fn real_main() -> Result<i32> {
                     )?;
                     Ok(0)
                 }
+                CargoOpt::MigratePlan {
+                    ruyispec,
+                    index,
+                    scope,
+                    batch_size,
+                    output,
+                } => takopack::repo_migrate::run_migrate_plan(MigratePlanOptions {
+                    ruyispec,
+                    index,
+                    scope,
+                    batch_size,
+                    output,
+                }),
+                CargoOpt::MigrateApply {
+                    plan,
+                    package_root,
+                    staging,
+                    yes,
+                    verify_app,
+                    skip_package_generation,
+                    keep_old,
+                    allow_prerelease,
+                } => takopack::repo_migrate::run_migrate_apply(MigrateApplyOptions {
+                    plan,
+                    package_root,
+                    staging,
+                    yes,
+                    verify_apps: verify_app,
+                    skip_package_generation,
+                    keep_old,
+                    allow_prerelease,
+                }),
                 CargoOpt::Track {
                     crate_name,
                     version,
