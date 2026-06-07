@@ -237,6 +237,7 @@ fn real_main() -> Result<i32> {
                     skip_package_generation,
                     keep_old,
                     allow_prerelease,
+                    apply_safe_subset,
                 } => takopack::repo_migrate::run_migrate_apply(MigrateApplyOptions {
                     plan,
                     package_root,
@@ -246,6 +247,7 @@ fn real_main() -> Result<i32> {
                     skip_package_generation,
                     keep_old,
                     allow_prerelease,
+                    apply_safe_subset,
                 }),
                 CargoOpt::Track {
                     crate_name,

@@ -285,6 +285,10 @@ pub enum CargoOpt {
         /// Allow applying pre-release provider actions from a plan
         #[arg(long)]
         allow_prerelease: bool,
+
+        /// Apply only providers that pass preflight; unsafe providers are skipped
+        #[arg(long)]
+        apply_safe_subset: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

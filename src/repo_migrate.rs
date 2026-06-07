@@ -45,6 +45,7 @@ pub struct MigrateApplyOptions {
     pub skip_package_generation: bool,
     pub keep_old: bool,
     pub allow_prerelease: bool,
+    pub apply_safe_subset: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,8 +100,12 @@ pub struct MigrationApplyReport {
     pub plan: String,
     pub package_root: String,
     pub dry_run: bool,
+    pub preflight: bool,
     pub providers_regenerated: usize,
     pub old_dirs_removed: usize,
+    pub safe_providers: Vec<ProviderApplyStatus>,
+    pub unsafe_providers: Vec<ProviderApplyStatus>,
+    pub skipped_unsafe_providers: Vec<ProviderRef>,
     pub scoped_requires_rewritten: usize,
     pub unresolved_new_requires: Vec<UnresolvedNewRequire>,
     pub consumer_files_touched: usize,
@@ -109,6 +114,20 @@ pub struct MigrationApplyReport {
     pub verify: Vec<MigrationVerifyReport>,
     pub git_diff_stat: String,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderApplyStatus {
+    pub old_package: String,
+    pub new_package: String,
+    pub scoped_requires_rewritten: usize,
+    pub unresolved_new_requires: Vec<UnresolvedNewRequire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRef {
+    pub old_package: String,
+    pub new_package: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +170,12 @@ pub fn run_migrate_plan(options: MigratePlanOptions) -> Result<i32> {
 }
 
 pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
+    let (exit_code, report) = execute_migrate_apply(options)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(exit_code)
+}
+
+fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, MigrationApplyReport)> {
     let content = fs::read_to_string(&options.plan)
         .with_context(|| format!("failed to read {}", options.plan.display()))?;
     let plan: MigrationPlan = serde_json::from_str(&content)
@@ -164,8 +189,12 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
             plan: display_path(&options.plan),
             package_root: package_root.display().to_string(),
             dry_run: true,
+            preflight: false,
             providers_regenerated: 0,
             old_dirs_removed: 0,
+            safe_providers: Vec::new(),
+            unsafe_providers: Vec::new(),
+            skipped_unsafe_providers: Vec::new(),
             scoped_requires_rewritten: 0,
             unresolved_new_requires: Vec::new(),
             consumer_files_touched: 0,
@@ -175,44 +204,76 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
             git_diff_stat: String::new(),
             notes,
         };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(0);
+        return Ok((0, report));
     }
 
     ensure_apply_is_allowed(&plan, options.allow_prerelease)?;
     let original_index = build_repo_index_with_options(&package_root, RepoIndexOptions::default())?;
     let original_capabilities: BTreeSet<_> = original_index.capabilities.keys().cloned().collect();
-    let selected_new_prefixes: BTreeSet<_> = plan
-        .providers
-        .iter()
-        .map(|provider| provider.new_capability_prefix.clone())
-        .collect();
     fs::create_dir_all(&options.staging)
         .with_context(|| format!("failed to create {}", options.staging.display()))?;
 
+    let preflight = if options.apply_safe_subset {
+        preflight_safe_subset(&plan, &options, &package_root, &original_capabilities)?
+    } else {
+        preflight_providers(
+            &plan,
+            &options,
+            &package_root,
+            &original_capabilities,
+            &plan.providers,
+        )?
+    };
+
+    let scoped_requires_rewritten = preflight.scoped_requires_rewritten();
+    let unresolved_new_requires = preflight.unresolved_new_requires();
+    let safe_providers = preflight.safe_statuses();
+    let unsafe_providers = preflight.unsafe_statuses();
+    let skipped_unsafe_providers = preflight.skipped_refs();
+
+    if !unresolved_new_requires.is_empty() && !options.apply_safe_subset {
+        notes.push(format!(
+            "preflight found {} unresolved generated provider Requires; package_root was not modified",
+            unresolved_new_requires.len()
+        ));
+        let report = MigrationApplyReport {
+            plan: display_path(&options.plan),
+            package_root: package_root.display().to_string(),
+            dry_run: false,
+            preflight: true,
+            providers_regenerated: 0,
+            old_dirs_removed: 0,
+            safe_providers,
+            unsafe_providers,
+            skipped_unsafe_providers,
+            scoped_requires_rewritten,
+            unresolved_new_requires,
+            consumer_files_touched: 0,
+            consumer_rewrite_occurrences: 0,
+            old_prefix_remaining_count: 0,
+            verify: Vec::new(),
+            git_diff_stat: String::new(),
+            notes,
+        };
+        return Ok((1, report));
+    }
+
+    if options.apply_safe_subset && !skipped_unsafe_providers.is_empty() {
+        notes.push(format!(
+            "apply-safe-subset skipped {} unsafe providers",
+            skipped_unsafe_providers.len()
+        ));
+    }
+    if options.skip_package_generation {
+        notes.push("provider generation skipped; copied/replaced local skeletons".to_string());
+    }
+
     let mut providers_regenerated = 0usize;
     let mut old_dirs_removed = 0usize;
-    let mut scoped_requires_rewritten = 0usize;
-    let mut unresolved_new_requires = Vec::new();
-    for provider in &plan.providers {
-        let new_dir = package_root.join(&provider.new_package);
-        let old_dir = package_root.join(&provider.old_package);
-
-        if new_dir.exists() {
-            fs::remove_dir_all(&new_dir)
-                .with_context(|| format!("failed to remove {}", new_dir.display()))?;
-        }
-
-        if options.skip_package_generation {
-            copy_provider_skeleton(provider, &old_dir, &new_dir)?;
-        } else {
-            let staged_dir = generate_provider(provider, &options.staging)?;
-            copy_dir_replace(&staged_dir, &new_dir)?;
-        }
-        let scoped_result =
-            scope_provider_requires(&new_dir, &original_capabilities, &selected_new_prefixes)?;
-        scoped_requires_rewritten += scoped_result.rewritten;
-        unresolved_new_requires.extend(scoped_result.unresolved);
+    for provider_result in &preflight.safe {
+        let new_dir = package_root.join(&provider_result.provider.new_package);
+        let old_dir = package_root.join(&provider_result.provider.old_package);
+        copy_dir_replace(&provider_result.scoped_dir, &new_dir)?;
         providers_regenerated += 1;
 
         if !options.keep_old && old_dir.exists() {
@@ -222,8 +283,10 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
         }
     }
 
-    let rewrite_result = rewrite_consumers(&package_root, &plan.consumer_rewrites)?;
-    let remaining = count_old_prefixes(&package_root, &plan.consumer_rewrites)?;
+    let safe_rewrites =
+        rewrites_for_providers(&plan.consumer_rewrites, &preflight.safe_provider_names());
+    let rewrite_result = rewrite_consumers(&package_root, &safe_rewrites)?;
+    let remaining = count_old_prefixes(&package_root, &safe_rewrites)?;
     let index = build_repo_index_with_options(&package_root, RepoIndexOptions::default())?;
     let verify = verify_apps(&options.verify_apps, &index)?;
     let git_diff_stat = git_diff_stat(&package_root).unwrap_or_default();
@@ -233,22 +296,17 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
             "{remaining} selected old capability prefix references remain"
         ));
     }
-    if options.skip_package_generation {
-        notes.push("provider generation skipped; copied/replaced local skeletons".to_string());
-    }
-    if !unresolved_new_requires.is_empty() {
-        notes.push(format!(
-            "{} generated provider Requires were not found in the original repo and had no scoped dotted fallback",
-            unresolved_new_requires.len()
-        ));
-    }
 
     let report = MigrationApplyReport {
         plan: display_path(&options.plan),
         package_root: package_root.display().to_string(),
         dry_run: false,
+        preflight: true,
         providers_regenerated,
         old_dirs_removed,
+        safe_providers,
+        unsafe_providers,
+        skipped_unsafe_providers,
         scoped_requires_rewritten,
         unresolved_new_requires,
         consumer_files_touched: rewrite_result.files_touched,
@@ -258,12 +316,7 @@ pub fn run_migrate_apply(options: MigrateApplyOptions) -> Result<i32> {
         git_diff_stat,
         notes,
     };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    if report.unresolved_new_requires.is_empty() {
-        Ok(0)
-    } else {
-        Ok(1)
-    }
+    Ok((0, report))
 }
 
 pub fn build_migration_plan(
@@ -652,6 +705,205 @@ struct RewriteResult {
 struct ScopedRequiresResult {
     rewritten: usize,
     unresolved: Vec<UnresolvedNewRequire>,
+}
+
+#[derive(Debug, Clone)]
+struct PreflightProviderResult {
+    provider: MigrationProvider,
+    scoped_dir: PathBuf,
+    scoped_requires_rewritten: usize,
+    unresolved_new_requires: Vec<UnresolvedNewRequire>,
+}
+
+#[derive(Debug, Clone)]
+struct PreflightResult {
+    safe: Vec<PreflightProviderResult>,
+    unsafe_providers: Vec<PreflightProviderResult>,
+}
+
+impl PreflightResult {
+    fn scoped_requires_rewritten(&self) -> usize {
+        self.safe
+            .iter()
+            .chain(self.unsafe_providers.iter())
+            .map(|provider| provider.scoped_requires_rewritten)
+            .sum()
+    }
+
+    fn unresolved_new_requires(&self) -> Vec<UnresolvedNewRequire> {
+        self.unsafe_providers
+            .iter()
+            .flat_map(|provider| provider.unresolved_new_requires.clone())
+            .collect()
+    }
+
+    fn safe_statuses(&self) -> Vec<ProviderApplyStatus> {
+        self.safe.iter().map(provider_apply_status).collect()
+    }
+
+    fn unsafe_statuses(&self) -> Vec<ProviderApplyStatus> {
+        self.unsafe_providers
+            .iter()
+            .map(provider_apply_status)
+            .collect()
+    }
+
+    fn skipped_refs(&self) -> Vec<ProviderRef> {
+        self.unsafe_providers
+            .iter()
+            .map(|provider| provider_ref(&provider.provider))
+            .collect()
+    }
+
+    fn safe_provider_names(&self) -> BTreeSet<String> {
+        self.safe
+            .iter()
+            .map(|provider| provider.provider.old_package.clone())
+            .collect()
+    }
+}
+
+fn provider_apply_status(provider: &PreflightProviderResult) -> ProviderApplyStatus {
+    ProviderApplyStatus {
+        old_package: provider.provider.old_package.clone(),
+        new_package: provider.provider.new_package.clone(),
+        scoped_requires_rewritten: provider.scoped_requires_rewritten,
+        unresolved_new_requires: provider.unresolved_new_requires.clone(),
+    }
+}
+
+fn provider_ref(provider: &MigrationProvider) -> ProviderRef {
+    ProviderRef {
+        old_package: provider.old_package.clone(),
+        new_package: provider.new_package.clone(),
+    }
+}
+
+fn preflight_safe_subset(
+    plan: &MigrationPlan,
+    options: &MigrateApplyOptions,
+    package_root: &Path,
+    original_capabilities: &BTreeSet<String>,
+) -> Result<PreflightResult> {
+    let mut candidates = plan.providers.clone();
+    let mut last_result = PreflightResult {
+        safe: Vec::new(),
+        unsafe_providers: Vec::new(),
+    };
+
+    loop {
+        let result = preflight_providers(
+            plan,
+            options,
+            package_root,
+            original_capabilities,
+            &candidates,
+        )?;
+        let unsafe_names: BTreeSet<_> = result
+            .unsafe_providers
+            .iter()
+            .map(|provider| provider.provider.old_package.clone())
+            .collect();
+        if unsafe_names.is_empty() {
+            let mut final_result = result;
+            final_result
+                .unsafe_providers
+                .extend(last_result.unsafe_providers);
+            return Ok(final_result);
+        }
+
+        let next_candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|provider| !unsafe_names.contains(&provider.old_package))
+            .collect();
+        last_result.unsafe_providers.extend(result.unsafe_providers);
+
+        if next_candidates.is_empty() {
+            return Ok(PreflightResult {
+                safe: Vec::new(),
+                unsafe_providers: last_result.unsafe_providers,
+            });
+        }
+        candidates = next_candidates;
+    }
+}
+
+fn preflight_providers(
+    _plan: &MigrationPlan,
+    options: &MigrateApplyOptions,
+    package_root: &Path,
+    original_capabilities: &BTreeSet<String>,
+    providers: &[MigrationProvider],
+) -> Result<PreflightResult> {
+    let raw_root = options.staging.join("__preflight_raw");
+    let scoped_root = options.staging.join("__preflight_scoped");
+    if raw_root.exists() {
+        fs::remove_dir_all(&raw_root)
+            .with_context(|| format!("failed to remove {}", raw_root.display()))?;
+    }
+    if scoped_root.exists() {
+        fs::remove_dir_all(&scoped_root)
+            .with_context(|| format!("failed to remove {}", scoped_root.display()))?;
+    }
+    fs::create_dir_all(&raw_root)
+        .with_context(|| format!("failed to create {}", raw_root.display()))?;
+    fs::create_dir_all(&scoped_root)
+        .with_context(|| format!("failed to create {}", scoped_root.display()))?;
+
+    let selected_new_prefixes: BTreeSet<_> = providers
+        .iter()
+        .map(|provider| provider.new_capability_prefix.clone())
+        .collect();
+    let mut safe = Vec::new();
+    let mut unsafe_providers = Vec::new();
+
+    for provider in providers {
+        let old_dir = package_root.join(&provider.old_package);
+        let raw_dir = if options.skip_package_generation {
+            let raw_dir = raw_root.join(&provider.new_package);
+            copy_provider_skeleton(provider, &old_dir, &raw_dir)?;
+            raw_dir
+        } else {
+            generate_provider(provider, &raw_root)?
+        };
+        let scoped_dir = scoped_root.join(&provider.new_package);
+        copy_dir_replace(&raw_dir, &scoped_dir)?;
+        let scoped_result =
+            scope_provider_requires(&scoped_dir, original_capabilities, &selected_new_prefixes)?;
+        let result = PreflightProviderResult {
+            provider: provider.clone(),
+            scoped_dir,
+            scoped_requires_rewritten: scoped_result.rewritten,
+            unresolved_new_requires: scoped_result.unresolved,
+        };
+        if result.unresolved_new_requires.is_empty() {
+            safe.push(result);
+        } else {
+            unsafe_providers.push(result);
+        }
+    }
+
+    Ok(PreflightResult {
+        safe,
+        unsafe_providers,
+    })
+}
+
+fn rewrites_for_providers(
+    rewrites: &[ConsumerRewrite],
+    safe_old_packages: &BTreeSet<String>,
+) -> Vec<ConsumerRewrite> {
+    rewrites
+        .iter()
+        .filter(|rewrite| {
+            safe_old_packages.iter().any(|old_package| {
+                rust_package_capability_prefix(old_package)
+                    .as_deref()
+                    .is_some_and(|prefix| prefix == rewrite.from)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn scope_provider_requires(
@@ -1215,5 +1467,232 @@ Requires: crate(%{pkgname}) = %{version}
             result.unresolved[0].capability,
             "crate(missingdep-1/default)"
         );
+    }
+
+    fn write_provider_spec(
+        package_root: &Path,
+        package: &str,
+        crate_name: &str,
+        pkgname: &str,
+        version: &str,
+        extra_lines: &str,
+    ) {
+        let dir = package_root.join(package);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{package}.spec")),
+            format!(
+                "\
+%global crate_name {crate_name}
+%global full_version {version}
+%global pkgname {pkgname}
+Name: {package}
+Version: {version}
+Provides: crate(%{{pkgname}})
+{extra_lines}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn migration_provider(
+        package_root: &Path,
+        old: &str,
+        new: &str,
+        crate_name: &str,
+    ) -> MigrationProvider {
+        let version = "1.0.0".to_string();
+        MigrationProvider {
+            old_package: old.to_string(),
+            new_package: new.to_string(),
+            crate_name: crate_name.to_string(),
+            crate_name_hyphen: crate_name.replace('_', "-"),
+            version,
+            old_capability_prefix: rust_package_capability_prefix(old).unwrap(),
+            new_capability_prefix: rust_package_capability_prefix(new).unwrap(),
+            old_dir: package_root.join(old).display().to_string(),
+            new_dir: package_root.join(new).display().to_string(),
+            reason: "legacy-compat-name".to_string(),
+        }
+    }
+
+    fn migration_plan(package_root: &Path, providers: Vec<MigrationProvider>) -> MigrationPlan {
+        let consumer_rewrites = providers
+            .iter()
+            .map(|provider| ConsumerRewrite {
+                from: provider.old_capability_prefix.clone(),
+                to: provider.new_capability_prefix.clone(),
+            })
+            .collect::<Vec<_>>();
+        MigrationPlan {
+            package_root: package_root.display().to_string(),
+            scope: MigrateScope::Legacy,
+            summary: MigrationPlanSummary {
+                providers: providers.len(),
+                rewrites: consumer_rewrites.len(),
+                skipped: 0,
+            },
+            providers,
+            consumer_rewrites,
+            skipped: Vec::new(),
+        }
+    }
+
+    fn write_plan(path: &Path, plan: &MigrationPlan) {
+        fs::write(path, serde_json::to_string_pretty(plan).unwrap()).unwrap();
+    }
+
+    fn apply_options(
+        plan: &Path,
+        package_root: &Path,
+        staging: &Path,
+        apply_safe_subset: bool,
+    ) -> MigrateApplyOptions {
+        MigrateApplyOptions {
+            plan: plan.to_path_buf(),
+            package_root: package_root.to_path_buf(),
+            staging: staging.to_path_buf(),
+            yes: true,
+            verify_apps: Vec::new(),
+            skip_package_generation: true,
+            keep_old: false,
+            allow_prerelease: false,
+            apply_safe_subset,
+        }
+    }
+
+    #[test]
+    fn migrate_apply_preflight_blocks_unsafe_provider_without_modifying_package_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        let staging = temp.path().join("staging");
+        write_provider_spec(
+            &package_root,
+            "rust-foo-1.0",
+            "foo",
+            "foo-1.0",
+            "1.0.0",
+            "Requires: crate(missing-1/default) >= 1.0.0",
+        );
+        let plan = migration_plan(
+            &package_root,
+            vec![migration_provider(
+                &package_root,
+                "rust-foo-1.0",
+                "rust-foo-1",
+                "foo",
+            )],
+        );
+        let plan_path = temp.path().join("plan.json");
+        write_plan(&plan_path, &plan);
+
+        let (exit_code, report) =
+            execute_migrate_apply(apply_options(&plan_path, &package_root, &staging, false))
+                .unwrap();
+
+        assert_eq!(exit_code, 1);
+        assert!(report.preflight);
+        assert_eq!(report.providers_regenerated, 0);
+        assert_eq!(report.unresolved_new_requires.len(), 1);
+        assert_eq!(report.unsafe_providers[0].old_package, "rust-foo-1.0");
+        assert!(package_root.join("rust-foo-1.0").exists());
+        assert!(!package_root.join("rust-foo-1").exists());
+    }
+
+    #[test]
+    fn migrate_apply_safe_subset_applies_only_safe_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        let staging = temp.path().join("staging");
+        write_provider_spec(
+            &package_root,
+            "rust-foo-1.0",
+            "foo",
+            "foo-1.0",
+            "1.0.0",
+            "Requires: crate(missing-1/default) >= 1.0.0",
+        );
+        write_provider_spec(&package_root, "rust-bar-1.0", "bar", "bar-1.0", "1.0.0", "");
+        let consumer_dir = package_root.join("consumer");
+        fs::create_dir_all(&consumer_dir).unwrap();
+        let consumer_spec = consumer_dir.join("consumer.spec");
+        fs::write(
+            &consumer_spec,
+            "Name: consumer\nVersion: 1.0\nRequires: crate(foo-1.0/default) >= 1.0.0\nRequires: crate(bar-1.0/default) >= 1.0.0\n",
+        )
+        .unwrap();
+        let plan = migration_plan(
+            &package_root,
+            vec![
+                migration_provider(&package_root, "rust-foo-1.0", "rust-foo-1", "foo"),
+                migration_provider(&package_root, "rust-bar-1.0", "rust-bar-1", "bar"),
+            ],
+        );
+        let plan_path = temp.path().join("plan.json");
+        write_plan(&plan_path, &plan);
+
+        let (exit_code, report) =
+            execute_migrate_apply(apply_options(&plan_path, &package_root, &staging, true))
+                .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(report.providers_regenerated, 1);
+        assert_eq!(report.skipped_unsafe_providers.len(), 1);
+        assert_eq!(
+            report.skipped_unsafe_providers[0].old_package,
+            "rust-foo-1.0"
+        );
+        assert!(package_root.join("rust-foo-1.0").exists());
+        assert!(!package_root.join("rust-foo-1").exists());
+        assert!(!package_root.join("rust-bar-1.0").exists());
+        assert!(package_root.join("rust-bar-1").exists());
+        let consumer = fs::read_to_string(consumer_spec).unwrap();
+        assert!(consumer.contains("crate(foo-1.0/default)"));
+        assert!(consumer.contains("crate(bar-1/default)"));
+    }
+
+    #[test]
+    fn migrate_apply_preflight_uses_scoped_dotted_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        let staging = temp.path().join("staging");
+        write_provider_spec(
+            &package_root,
+            "rust-foo-1.0",
+            "foo",
+            "foo-1.0",
+            "1.0.0",
+            "Requires: crate(memchr-2/std) >= 2.0.0",
+        );
+        write_provider_spec(
+            &package_root,
+            "rust-memchr-2.0",
+            "memchr",
+            "memchr-2.0",
+            "2.7.5",
+            "Provides: crate(memchr-2.0/std)",
+        );
+        let plan = migration_plan(
+            &package_root,
+            vec![migration_provider(
+                &package_root,
+                "rust-foo-1.0",
+                "rust-foo-1",
+                "foo",
+            )],
+        );
+        let plan_path = temp.path().join("plan.json");
+        write_plan(&plan_path, &plan);
+
+        let (exit_code, report) =
+            execute_migrate_apply(apply_options(&plan_path, &package_root, &staging, false))
+                .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(report.unresolved_new_requires.is_empty());
+        assert_eq!(report.scoped_requires_rewritten, 1);
+        let new_spec =
+            fs::read_to_string(package_root.join("rust-foo-1/rust-foo-1.0.spec")).unwrap();
+        assert!(new_spec.contains("Requires: crate(memchr-2.0/std) >= 2.0.0"));
     }
 }
