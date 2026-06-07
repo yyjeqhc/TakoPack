@@ -102,12 +102,15 @@ pub struct MigrationApplyReport {
     pub dry_run: bool,
     pub preflight: bool,
     pub providers_regenerated: usize,
+    pub old_spec_normalized_providers: usize,
     pub old_dirs_removed: usize,
     pub safe_providers: Vec<ProviderApplyStatus>,
     pub unsafe_providers: Vec<ProviderApplyStatus>,
     pub skipped_unsafe_providers: Vec<ProviderRef>,
     pub scoped_requires_rewritten: usize,
     pub unresolved_new_requires: Vec<UnresolvedNewRequire>,
+    pub optional_feature_warning_count: usize,
+    pub optional_feature_unresolved_warnings: Vec<OptionalFeatureUnresolvedWarning>,
     pub consumer_files_touched: usize,
     pub consumer_rewrite_occurrences: usize,
     pub old_prefix_remaining_count: usize,
@@ -120,8 +123,10 @@ pub struct MigrationApplyReport {
 pub struct ProviderApplyStatus {
     pub old_package: String,
     pub new_package: String,
+    pub source: ProviderSource,
     pub scoped_requires_rewritten: usize,
     pub unresolved_new_requires: Vec<UnresolvedNewRequire>,
+    pub optional_feature_unresolved_warnings: Vec<OptionalFeatureUnresolvedWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +149,35 @@ pub struct UnresolvedNewRequire {
     pub line: usize,
     pub capability: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSource {
+    Generated,
+    OldSpecNormalized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionalFeatureUnresolvedWarning {
+    pub old_package: String,
+    pub new_package: String,
+    pub file: String,
+    pub line: usize,
+    pub capability: String,
+    pub reason: String,
+    pub subpackage: String,
+    pub feature: String,
+    pub classification: OptionalFeatureWarningClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalFeatureWarningClass {
+    BOptionalFeatureEdge,
+    CTestDevBenchFilter,
+    DEmbeddedSpecialManual,
+    EUnclear,
 }
 
 pub fn run_migrate_plan(options: MigratePlanOptions) -> Result<i32> {
@@ -191,12 +225,15 @@ fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, Migration
             dry_run: true,
             preflight: false,
             providers_regenerated: 0,
+            old_spec_normalized_providers: 0,
             old_dirs_removed: 0,
             safe_providers: Vec::new(),
             unsafe_providers: Vec::new(),
             skipped_unsafe_providers: Vec::new(),
             scoped_requires_rewritten: 0,
             unresolved_new_requires: Vec::new(),
+            optional_feature_warning_count: 0,
+            optional_feature_unresolved_warnings: Vec::new(),
             consumer_files_touched: 0,
             consumer_rewrite_occurrences: 0,
             old_prefix_remaining_count: 0,
@@ -227,6 +264,8 @@ fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, Migration
 
     let scoped_requires_rewritten = preflight.scoped_requires_rewritten();
     let unresolved_new_requires = preflight.unresolved_new_requires();
+    let optional_feature_unresolved_warnings = preflight.optional_feature_unresolved_warnings();
+    let optional_feature_warning_count = optional_feature_unresolved_warnings.len();
     let safe_providers = preflight.safe_statuses();
     let unsafe_providers = preflight.unsafe_statuses();
     let skipped_unsafe_providers = preflight.skipped_refs();
@@ -242,12 +281,15 @@ fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, Migration
             dry_run: false,
             preflight: true,
             providers_regenerated: 0,
+            old_spec_normalized_providers: 0,
             old_dirs_removed: 0,
             safe_providers,
             unsafe_providers,
             skipped_unsafe_providers,
             scoped_requires_rewritten,
             unresolved_new_requires,
+            optional_feature_warning_count,
+            optional_feature_unresolved_warnings,
             consumer_files_touched: 0,
             consumer_rewrite_occurrences: 0,
             old_prefix_remaining_count: 0,
@@ -264,17 +306,27 @@ fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, Migration
             skipped_unsafe_providers.len()
         ));
     }
+    if optional_feature_warning_count > 0 {
+        notes.push(format!(
+            "preflight recorded {optional_feature_warning_count} unresolved optional feature Requires warnings"
+        ));
+    }
     if options.skip_package_generation {
         notes.push("provider generation skipped; copied/replaced local skeletons".to_string());
     }
 
     let mut providers_regenerated = 0usize;
+    let mut old_spec_normalized_providers = 0usize;
     let mut old_dirs_removed = 0usize;
     for provider_result in &preflight.safe {
         let new_dir = package_root.join(&provider_result.provider.new_package);
         let old_dir = package_root.join(&provider_result.provider.old_package);
         copy_dir_replace(&provider_result.scoped_dir, &new_dir)?;
         providers_regenerated += 1;
+        match provider_result.source {
+            ProviderSource::Generated => {}
+            ProviderSource::OldSpecNormalized => old_spec_normalized_providers += 1,
+        }
 
         if !options.keep_old && old_dir.exists() {
             fs::remove_dir_all(&old_dir)
@@ -303,12 +355,15 @@ fn execute_migrate_apply(options: MigrateApplyOptions) -> Result<(i32, Migration
         dry_run: false,
         preflight: true,
         providers_regenerated,
+        old_spec_normalized_providers,
         old_dirs_removed,
         safe_providers,
         unsafe_providers,
         skipped_unsafe_providers,
         scoped_requires_rewritten,
         unresolved_new_requires,
+        optional_feature_warning_count,
+        optional_feature_unresolved_warnings,
         consumer_files_touched: rewrite_result.files_touched,
         consumer_rewrite_occurrences: rewrite_result.occurrences,
         old_prefix_remaining_count: remaining,
@@ -642,17 +697,51 @@ fn copy_provider_skeleton(
     }
     copy_dir_replace(old_dir, new_dir)?;
     rewrite_tree_literals(new_dir, &provider.old_package, &provider.new_package)?;
+    rewrite_tree_path_names(new_dir, &provider.old_package, &provider.new_package)?;
     if let (Some(old_pkgname), Some(new_pkgname)) = (
         provider.old_package.strip_prefix("rust-"),
         provider.new_package.strip_prefix("rust-"),
     ) {
         rewrite_tree_literals(new_dir, old_pkgname, new_pkgname)?;
+        rewrite_tree_path_names(new_dir, old_pkgname, new_pkgname)?;
     }
     rewrite_tree_literals(
         new_dir,
         &provider.old_capability_prefix,
         &provider.new_capability_prefix,
     )?;
+    Ok(())
+}
+
+fn rewrite_tree_path_names(root: &Path, from: &str, to: &str) -> Result<()> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).min_depth(1) {
+        paths.push(entry?.path().to_path_buf());
+    }
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in paths {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.contains(from) {
+            continue;
+        }
+        let target = path.with_file_name(file_name.replace(from, to));
+        if target.exists() {
+            bail!(
+                "cannot rename {} to {}; target exists",
+                path.display(),
+                target.display()
+            );
+        }
+        fs::rename(&path, &target).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -705,14 +794,17 @@ struct RewriteResult {
 struct ScopedRequiresResult {
     rewritten: usize,
     unresolved: Vec<UnresolvedNewRequire>,
+    optional_feature_warnings: Vec<OptionalFeatureUnresolvedWarning>,
 }
 
 #[derive(Debug, Clone)]
 struct PreflightProviderResult {
     provider: MigrationProvider,
     scoped_dir: PathBuf,
+    source: ProviderSource,
     scoped_requires_rewritten: usize,
     unresolved_new_requires: Vec<UnresolvedNewRequire>,
+    optional_feature_unresolved_warnings: Vec<OptionalFeatureUnresolvedWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +826,14 @@ impl PreflightResult {
         self.unsafe_providers
             .iter()
             .flat_map(|provider| provider.unresolved_new_requires.clone())
+            .collect()
+    }
+
+    fn optional_feature_unresolved_warnings(&self) -> Vec<OptionalFeatureUnresolvedWarning> {
+        self.safe
+            .iter()
+            .chain(self.unsafe_providers.iter())
+            .flat_map(|provider| provider.optional_feature_unresolved_warnings.clone())
             .collect()
     }
 
@@ -767,8 +867,10 @@ fn provider_apply_status(provider: &PreflightProviderResult) -> ProviderApplySta
     ProviderApplyStatus {
         old_package: provider.provider.old_package.clone(),
         new_package: provider.provider.new_package.clone(),
+        source: provider.source.clone(),
         scoped_requires_rewritten: provider.scoped_requires_rewritten,
         unresolved_new_requires: provider.unresolved_new_requires.clone(),
+        optional_feature_unresolved_warnings: provider.optional_feature_unresolved_warnings.clone(),
     }
 }
 
@@ -829,7 +931,7 @@ fn preflight_safe_subset(
 }
 
 fn preflight_providers(
-    _plan: &MigrationPlan,
+    plan: &MigrationPlan,
     options: &MigrateApplyOptions,
     package_root: &Path,
     original_capabilities: &BTreeSet<String>,
@@ -859,22 +961,31 @@ fn preflight_providers(
 
     for provider in providers {
         let old_dir = package_root.join(&provider.old_package);
-        let raw_dir = if options.skip_package_generation {
-            let raw_dir = raw_root.join(&provider.new_package);
-            copy_provider_skeleton(provider, &old_dir, &raw_dir)?;
-            raw_dir
-        } else {
-            generate_provider(provider, &raw_root)?
+        let policy = preflight_provider_policy(plan, options, package_root, provider)?;
+        let raw_dir = match policy.source {
+            ProviderSource::OldSpecNormalized => {
+                let raw_dir = raw_root.join(&provider.new_package);
+                copy_provider_skeleton(provider, &old_dir, &raw_dir)?;
+                raw_dir
+            }
+            ProviderSource::Generated => generate_provider(provider, &raw_root)?,
         };
         let scoped_dir = scoped_root.join(&provider.new_package);
         copy_dir_replace(&raw_dir, &scoped_dir)?;
-        let scoped_result =
-            scope_provider_requires(&scoped_dir, original_capabilities, &selected_new_prefixes)?;
+        let scoped_result = scope_provider_requires(
+            &provider,
+            &scoped_dir,
+            original_capabilities,
+            &selected_new_prefixes,
+            policy.allow_optional_feature_warnings,
+        )?;
         let result = PreflightProviderResult {
             provider: provider.clone(),
             scoped_dir,
+            source: policy.source,
             scoped_requires_rewritten: scoped_result.rewritten,
             unresolved_new_requires: scoped_result.unresolved,
+            optional_feature_unresolved_warnings: scoped_result.optional_feature_warnings,
         };
         if result.unresolved_new_requires.is_empty() {
             safe.push(result);
@@ -887,6 +998,98 @@ fn preflight_providers(
         safe,
         unsafe_providers,
     })
+}
+
+#[derive(Debug, Clone)]
+struct PreflightProviderPolicy {
+    source: ProviderSource,
+    allow_optional_feature_warnings: bool,
+}
+
+fn preflight_provider_policy(
+    plan: &MigrationPlan,
+    options: &MigrateApplyOptions,
+    package_root: &Path,
+    provider: &MigrationProvider,
+) -> Result<PreflightProviderPolicy> {
+    let legacy_existing_normalize =
+        is_legacy_existing_provider_normalize(plan, package_root, provider)?;
+    let source = if options.skip_package_generation || legacy_existing_normalize {
+        ProviderSource::OldSpecNormalized
+    } else {
+        ProviderSource::Generated
+    };
+    Ok(PreflightProviderPolicy {
+        source,
+        allow_optional_feature_warnings: legacy_existing_normalize,
+    })
+}
+
+fn is_legacy_existing_provider_normalize(
+    plan: &MigrationPlan,
+    package_root: &Path,
+    provider: &MigrationProvider,
+) -> Result<bool> {
+    if plan.scope != MigrateScope::Legacy || provider.reason != "legacy-compat-name" {
+        return Ok(false);
+    }
+    if !legacy_normalize_name_pair(&provider.old_package, &provider.new_package) {
+        return Ok(false);
+    }
+    let old_dir = package_root.join(&provider.old_package);
+    if !old_dir.is_dir() {
+        return Ok(false);
+    }
+    let Some(old_version) = provider_spec_version(&old_dir)? else {
+        return Ok(false);
+    };
+    Ok(old_version == provider.version)
+}
+
+fn legacy_normalize_name_pair(old_package: &str, new_package: &str) -> bool {
+    let Some(old_name) = old_package.strip_prefix("rust-") else {
+        return false;
+    };
+    let Some(new_name) = new_package.strip_prefix("rust-") else {
+        return false;
+    };
+    let Some((base, branch)) = old_name.rsplit_once('-') else {
+        return false;
+    };
+    let Some(major) = branch.strip_suffix(".0") else {
+        return false;
+    };
+    !major.is_empty()
+        && major.chars().all(|ch| ch.is_ascii_digit())
+        && new_name == format!("{base}-{major}")
+}
+
+fn provider_spec_version(provider_dir: &Path) -> Result<Option<String>> {
+    let mut specs = Vec::new();
+    for entry in fs::read_dir(provider_dir)
+        .with_context(|| format!("failed to read {}", provider_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "spec") {
+            specs.push(path);
+        }
+    }
+    specs.sort();
+    for spec in specs {
+        let content = fs::read_to_string(&spec)
+            .with_context(|| format!("failed to read {}", spec.display()))?;
+        for line in content.lines() {
+            if let Some(version) = line
+                .trim_start()
+                .strip_prefix("Version:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(Some(version.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn rewrites_for_providers(
@@ -907,13 +1110,16 @@ fn rewrites_for_providers(
 }
 
 fn scope_provider_requires(
+    provider: &MigrationProvider,
     provider_dir: &Path,
     repo_capabilities: &BTreeSet<String>,
     selected_new_prefixes: &BTreeSet<String>,
+    allow_optional_feature_warnings: bool,
 ) -> Result<ScopedRequiresResult> {
     let crate_capability = Regex::new(r"crate\([^)]+\)")?;
     let mut rewritten = 0usize;
     let mut unresolved = Vec::new();
+    let mut optional_feature_warnings = Vec::new();
 
     for entry in WalkDir::new(provider_dir) {
         let entry = entry?;
@@ -928,14 +1134,20 @@ fn scope_provider_requires(
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut changed = false;
         let mut updated_lines = Vec::new();
+        let mut section = SpecSection::Main;
 
         for (line_index, line) in original.lines().enumerate() {
+            if let Some(next_section) = parse_spec_section(line) {
+                section = next_section;
+            }
+
             if !line.trim_start().starts_with("Requires:") {
                 updated_lines.push(line.to_string());
                 continue;
             }
 
             let mut line_unresolved = Vec::new();
+            let mut line_optional_warnings = Vec::new();
             let updated = crate_capability
                 .replace_all(line, |captures: &regex::Captures<'_>| {
                     let capability = captures.get(0).expect("full match").as_str();
@@ -955,17 +1167,34 @@ fn scope_provider_requires(
                         }
                     }
 
-                    line_unresolved.push(UnresolvedNewRequire {
+                    let unresolved_require = UnresolvedNewRequire {
                         file: path.display().to_string(),
                         line: line_index + 1,
                         capability: capability.to_string(),
                         reason: "capability is outside this migration batch and no existing dotted fallback was found".to_string(),
-                    });
+                    };
+                    if allow_optional_feature_warnings && section.is_optional_non_default_feature()
+                    {
+                        line_optional_warnings.push(OptionalFeatureUnresolvedWarning {
+                            old_package: provider.old_package.clone(),
+                            new_package: provider.new_package.clone(),
+                            file: unresolved_require.file.clone(),
+                            line: unresolved_require.line,
+                            capability: unresolved_require.capability.clone(),
+                            reason: unresolved_require.reason.clone(),
+                            subpackage: section.subpackage_name().to_string(),
+                            feature: section.feature_name().unwrap_or_default().to_string(),
+                            classification: classify_optional_feature_warning(capability),
+                        });
+                    } else {
+                        line_unresolved.push(unresolved_require);
+                    }
                     capability.to_string()
                 })
                 .into_owned();
 
             unresolved.extend(line_unresolved);
+            optional_feature_warnings.extend(line_optional_warnings);
             updated_lines.push(updated);
         }
 
@@ -982,7 +1211,102 @@ fn scope_provider_requires(
     Ok(ScopedRequiresResult {
         rewritten,
         unresolved,
+        optional_feature_warnings,
     })
+}
+
+#[derive(Debug, Clone)]
+enum SpecSection {
+    Main,
+    Subpackage {
+        name: String,
+        feature: Option<String>,
+    },
+}
+
+impl SpecSection {
+    fn subpackage_name(&self) -> &str {
+        match self {
+            SpecSection::Main => "main",
+            SpecSection::Subpackage { name, .. } => name,
+        }
+    }
+
+    fn feature_name(&self) -> Option<&str> {
+        match self {
+            SpecSection::Main => None,
+            SpecSection::Subpackage { feature, .. } => feature.as_deref(),
+        }
+    }
+
+    fn is_optional_non_default_feature(&self) -> bool {
+        matches!(
+            self,
+            SpecSection::Subpackage {
+                feature: Some(feature),
+                ..
+            } if feature != "default"
+        )
+    }
+}
+
+fn parse_spec_section(line: &str) -> Option<SpecSection> {
+    let trimmed = line.trim_start();
+    let subpackage = trimmed
+        .strip_prefix("%package")?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let Some(name) = subpackage
+        .windows(2)
+        .find_map(|window| (window[0] == "-n").then_some(window[1]))
+    else {
+        return Some(SpecSection::Subpackage {
+            name: "unknown".to_string(),
+            feature: None,
+        });
+    };
+    let feature = name
+        .strip_prefix("%{name}+")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    Some(SpecSection::Subpackage {
+        name: name.to_string(),
+        feature,
+    })
+}
+
+fn classify_optional_feature_warning(capability: &str) -> OptionalFeatureWarningClass {
+    let Some(inner) = capability
+        .strip_prefix("crate(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return OptionalFeatureWarningClass::EUnclear;
+    };
+    let package = inner.split_once('/').map_or(inner, |(package, _)| package);
+    if is_test_dev_bench_filter_package(package) {
+        return OptionalFeatureWarningClass::CTestDevBenchFilter;
+    }
+    if is_embedded_special_manual_package(package) {
+        return OptionalFeatureWarningClass::DEmbeddedSpecialManual;
+    }
+    OptionalFeatureWarningClass::BOptionalFeatureEdge
+}
+
+fn is_test_dev_bench_filter_package(package: &str) -> bool {
+    package.starts_with("quickcheck-")
+        || package.starts_with("proptest-")
+        || package.starts_with("loom-")
+        || package.starts_with("async-std-")
+        || package.starts_with("serde-test-")
+}
+
+fn is_embedded_special_manual_package(package: &str) -> bool {
+    package.starts_with("defmt-")
+        || package.starts_with("defmt-macros-")
+        || package.starts_with("critical-section-")
+        || package.starts_with("compiler-builtins-")
+        || package.starts_with("portable-atomic-")
+        || package.starts_with("rustc-rayon-")
 }
 
 fn should_keep_generated_require(
@@ -1382,6 +1706,15 @@ mod tests {
         assert!(!capability_matches_prefix("crate(foo-1.0)", "crate(foo-1"));
     }
 
+    fn scoped_test_provider() -> MigrationProvider {
+        migration_provider(
+            Path::new("/repo/SPECS"),
+            "rust-foo-1.0",
+            "rust-foo-1",
+            "foo",
+        )
+    }
+
     #[test]
     fn scoped_requires_rewrite_falls_back_only_in_requires_lines() {
         let temp = tempfile::tempdir().unwrap();
@@ -1402,9 +1735,14 @@ Requires: crate(%{pkgname}) = %{version}
 
         let repo_capabilities = BTreeSet::from(["crate(memchr-2.0/std)".to_string()]);
         let selected_new_prefixes = BTreeSet::from(["crate(aho-corasick-1".to_string()]);
-        let result =
-            scope_provider_requires(&provider_dir, &repo_capabilities, &selected_new_prefixes)
-                .unwrap();
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &repo_capabilities,
+            &selected_new_prefixes,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(result.rewritten, 1);
         assert!(result.unresolved.is_empty());
@@ -1435,9 +1773,14 @@ Requires: crate(%{pkgname}) = %{version}
             "crate(aho-corasick-1".to_string(),
             "crate(memchr-2".to_string(),
         ]);
-        let result =
-            scope_provider_requires(&provider_dir, &repo_capabilities, &selected_new_prefixes)
-                .unwrap();
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &repo_capabilities,
+            &selected_new_prefixes,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(result.rewritten, 0);
         assert!(result.unresolved.is_empty());
@@ -1458,8 +1801,14 @@ Requires: crate(%{pkgname}) = %{version}
         )
         .unwrap();
 
-        let result =
-            scope_provider_requires(&provider_dir, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(result.rewritten, 0);
         assert_eq!(result.unresolved.len(), 1);
@@ -1467,6 +1816,183 @@ Requires: crate(%{pkgname}) = %{version}
             result.unresolved[0].capability,
             "crate(missingdep-1/default)"
         );
+    }
+
+    #[test]
+    fn relaxed_scoped_requires_keeps_main_and_default_unresolved_unsafe() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "\
+Requires: crate(missing-main-1/default) >= 1.0.0
+%package -n %{name}+default
+Requires: crate(missing-default-1/default) >= 1.0.0
+",
+        )
+        .unwrap();
+
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.unresolved.len(), 2);
+        assert!(result.optional_feature_warnings.is_empty());
+        assert_eq!(
+            result
+                .unresolved
+                .iter()
+                .map(|item| item.capability.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "crate(missing-main-1/default)",
+                "crate(missing-default-1/default)"
+            ]
+        );
+    }
+
+    #[test]
+    fn relaxed_scoped_requires_warns_for_optional_non_default_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "\
+%package -n %{name}+serde
+Requires: crate(missing-serde-1/default) >= 1.0.0
+",
+        )
+        .unwrap();
+
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert!(result.unresolved.is_empty());
+        assert_eq!(result.optional_feature_warnings.len(), 1);
+        let warning = &result.optional_feature_warnings[0];
+        assert_eq!(warning.feature, "serde");
+        assert_eq!(warning.subpackage, "%{name}+serde");
+        assert_eq!(warning.capability, "crate(missing-serde-1/default)");
+        assert_eq!(
+            warning.classification,
+            OptionalFeatureWarningClass::BOptionalFeatureEdge
+        );
+    }
+
+    #[test]
+    fn strict_scoped_requires_keeps_optional_feature_unresolved_unsafe() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "\
+%package -n %{name}+serde
+Requires: crate(missing-serde-1/default) >= 1.0.0
+",
+        )
+        .unwrap();
+
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.unresolved.len(), 1);
+        assert!(result.optional_feature_warnings.is_empty());
+        assert_eq!(
+            result.unresolved[0].capability,
+            "crate(missing-serde-1/default)"
+        );
+    }
+
+    #[test]
+    fn relaxed_scoped_requires_keeps_special_main_or_default_unsafe() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "\
+Requires: crate(defmt-1/default) >= 1.0.0
+%package -n %{name}+default
+Requires: crate(critical-section-1/default) >= 1.0.0
+",
+        )
+        .unwrap();
+
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.unresolved.len(), 2);
+        assert!(result.optional_feature_warnings.is_empty());
+        assert!(result
+            .unresolved
+            .iter()
+            .any(|item| item.capability == "crate(defmt-1/default)"));
+        assert!(result
+            .unresolved
+            .iter()
+            .any(|item| item.capability == "crate(critical-section-1/default)"));
+    }
+
+    #[test]
+    fn relaxed_scoped_requires_warns_for_optional_filter_and_special_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_dir = temp.path().join("rust-foo-1");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::write(
+            provider_dir.join("rust-foo.spec"),
+            "\
+%package -n %{name}+quickcheck
+Requires: crate(quickcheck-1) >= 1.0.0
+%package -n %{name}+defmt
+Requires: crate(defmt-1/default) >= 1.0.0
+",
+        )
+        .unwrap();
+
+        let result = scope_provider_requires(
+            &scoped_test_provider(),
+            &provider_dir,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert!(result.unresolved.is_empty());
+        assert_eq!(result.optional_feature_warnings.len(), 2);
+        let classes = result
+            .optional_feature_warnings
+            .iter()
+            .map(|warning| warning.classification)
+            .collect::<BTreeSet<_>>();
+        assert!(classes.contains(&OptionalFeatureWarningClass::CTestDevBenchFilter));
+        assert!(classes.contains(&OptionalFeatureWarningClass::DEmbeddedSpecialManual));
     }
 
     fn write_provider_spec(
@@ -1548,13 +2074,23 @@ Provides: crate(%{{pkgname}})
         staging: &Path,
         apply_safe_subset: bool,
     ) -> MigrateApplyOptions {
+        apply_options_with_skip(plan, package_root, staging, apply_safe_subset, true)
+    }
+
+    fn apply_options_with_skip(
+        plan: &Path,
+        package_root: &Path,
+        staging: &Path,
+        apply_safe_subset: bool,
+        skip_package_generation: bool,
+    ) -> MigrateApplyOptions {
         MigrateApplyOptions {
             plan: plan.to_path_buf(),
             package_root: package_root.to_path_buf(),
             staging: staging.to_path_buf(),
             yes: true,
             verify_apps: Vec::new(),
-            skip_package_generation: true,
+            skip_package_generation,
             keep_old: false,
             allow_prerelease: false,
             apply_safe_subset,
@@ -1691,8 +2227,140 @@ Provides: crate(%{{pkgname}})
         assert_eq!(exit_code, 0);
         assert!(report.unresolved_new_requires.is_empty());
         assert_eq!(report.scoped_requires_rewritten, 1);
-        let new_spec =
-            fs::read_to_string(package_root.join("rust-foo-1/rust-foo-1.0.spec")).unwrap();
+        let new_spec = fs::read_to_string(package_root.join("rust-foo-1/rust-foo-1.spec")).unwrap();
         assert!(new_spec.contains("Requires: crate(memchr-2.0/std) >= 2.0.0"));
+    }
+
+    #[test]
+    fn old_spec_normalize_rewrites_content_and_file_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        write_provider_spec(
+            &package_root,
+            "rust-foo-1.0",
+            "foo",
+            "foo-1.0",
+            "1.0.0",
+            "Requires: crate(foo-1.0/default) = %{version}",
+        );
+        let old_dir = package_root.join("rust-foo-1.0");
+        let new_dir = temp.path().join("rust-foo-1");
+        let provider = migration_provider(&package_root, "rust-foo-1.0", "rust-foo-1", "foo");
+
+        copy_provider_skeleton(&provider, &old_dir, &new_dir).unwrap();
+
+        assert!(!new_dir.join("rust-foo-1.0.spec").exists());
+        let spec_path = new_dir.join("rust-foo-1.spec");
+        assert!(spec_path.exists());
+        let spec = fs::read_to_string(spec_path).unwrap();
+        assert!(spec.contains("%global pkgname foo-1"));
+        assert!(spec.contains("Name: rust-foo-1"));
+        assert!(spec.contains("Provides: crate(%{pkgname})"));
+        assert!(spec.contains("Requires: crate(foo-1/default) = %{version}"));
+        assert!(!spec.contains("foo-1.0"));
+        assert!(!spec.contains("rust-foo-1.0"));
+    }
+
+    #[test]
+    fn legacy_existing_provider_uses_old_spec_normalize_without_cli_skip() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        let staging = temp.path().join("staging");
+        write_provider_spec(
+            &package_root,
+            "rust-foo-1.0",
+            "foo",
+            "foo-1.0",
+            "1.0.0",
+            "\
+%package -n %{name}+borsh
+Requires: crate(missing-borsh-1) >= 1.0.0
+",
+        );
+        let plan = migration_plan(
+            &package_root,
+            vec![migration_provider(
+                &package_root,
+                "rust-foo-1.0",
+                "rust-foo-1",
+                "foo",
+            )],
+        );
+        let plan_path = temp.path().join("plan.json");
+        write_plan(&plan_path, &plan);
+
+        let (exit_code, report) = execute_migrate_apply(apply_options_with_skip(
+            &plan_path,
+            &package_root,
+            &staging,
+            true,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(report.providers_regenerated, 1);
+        assert_eq!(report.old_spec_normalized_providers, 1);
+        assert!(report.skipped_unsafe_providers.is_empty());
+        assert!(report.unresolved_new_requires.is_empty());
+        assert_eq!(report.optional_feature_warning_count, 1);
+        assert_eq!(
+            report.safe_providers[0].source,
+            ProviderSource::OldSpecNormalized
+        );
+        assert!(!package_root.join("rust-foo-1.0").exists());
+        assert!(package_root.join("rust-foo-1/rust-foo-1.spec").exists());
+    }
+
+    #[test]
+    fn non_legacy_provider_policy_stays_generated_and_strict() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        write_provider_spec(&package_root, "rust-foo-1.0", "foo", "foo-1.0", "1.0.0", "");
+        let provider = migration_provider(&package_root, "rust-foo-1.0", "rust-foo-1", "foo");
+        let mut plan = migration_plan(&package_root, vec![provider.clone()]);
+        plan.scope = MigrateScope::Exact;
+        let options = MigrateApplyOptions {
+            plan: temp.path().join("plan.json"),
+            package_root: package_root.clone(),
+            staging: temp.path().join("staging"),
+            yes: true,
+            verify_apps: Vec::new(),
+            skip_package_generation: false,
+            keep_old: false,
+            allow_prerelease: false,
+            apply_safe_subset: true,
+        };
+
+        let policy = preflight_provider_policy(&plan, &options, &package_root, &provider).unwrap();
+
+        assert_eq!(policy.source, ProviderSource::Generated);
+        assert!(!policy.allow_optional_feature_warnings);
+    }
+
+    #[test]
+    fn version_changing_legacy_provider_policy_stays_generated_and_strict() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("SPECS");
+        write_provider_spec(&package_root, "rust-foo-1.0", "foo", "foo-1.0", "1.0.0", "");
+        let mut provider = migration_provider(&package_root, "rust-foo-1.0", "rust-foo-1", "foo");
+        provider.version = "1.0.1".to_string();
+        let plan = migration_plan(&package_root, vec![provider.clone()]);
+        let options = MigrateApplyOptions {
+            plan: temp.path().join("plan.json"),
+            package_root: package_root.clone(),
+            staging: temp.path().join("staging"),
+            yes: true,
+            verify_apps: Vec::new(),
+            skip_package_generation: false,
+            keep_old: false,
+            allow_prerelease: false,
+            apply_safe_subset: true,
+        };
+
+        let policy = preflight_provider_policy(&plan, &options, &package_root, &provider).unwrap();
+
+        assert_eq!(policy.source, ProviderSource::Generated);
+        assert!(!policy.allow_optional_feature_warnings);
     }
 }
