@@ -320,6 +320,8 @@ fn crate_requirements_from_cargo_deps(
     deps: &[Dependency],
     current_crate_name: &str,
 ) -> Vec<CrateRequirement> {
+    use cargo::core::dependency::DepKind;
+
     let mut requirements = std::collections::BTreeMap::new();
     let current_crate_base = spec::normalize_crate_name(current_crate_name);
 
@@ -345,14 +347,21 @@ fn crate_requirements_from_cargo_deps(
             .unwrap_or(RequirementVersion::None);
 
         let mut features = std::collections::BTreeSet::new();
-        if dep.uses_default_features() {
-            features.insert(Some("default".to_string()));
-        }
-        for feature in dep.features() {
-            features.insert(Some(feature.as_str().to_string()));
-        }
-        if features.is_empty() {
+        if dep.kind() == DepKind::Build && !dep.is_optional() {
             features.insert(None);
+            for feature in dep.features() {
+                features.insert(Some(feature.as_str().to_string()));
+            }
+        } else {
+            if dep.uses_default_features() {
+                features.insert(Some("default".to_string()));
+            }
+            for feature in dep.features() {
+                features.insert(Some(feature.as_str().to_string()));
+            }
+            if features.is_empty() {
+                features.insert(None);
+            }
         }
 
         for feature in features {
@@ -1270,8 +1279,12 @@ mod tests {
     use super::{
         crate_requirements_from_cargo_deps, parse_package_name_simple, BuildDeps, CrateDep, Source,
     };
+    use crate::crates::{all_dependencies_and_features, transitive_deps};
     use crate::takopack::spec;
-    use cargo::core::{dependency::DepKind, Dependency, SourceId};
+    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
+    use cargo::util::toml::read_manifest;
+    use cargo::GlobalContext;
+    use std::fs;
 
     fn test_dep(
         name: &str,
@@ -1286,11 +1299,38 @@ mod tests {
         dep
     }
 
+    fn manifest_from_toml(toml: &str) -> cargo::core::Manifest {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
+        let cargo_toml = temp.path().join("Cargo.toml");
+        fs::write(&cargo_toml, toml).unwrap();
+        let source_id = SourceId::for_path(temp.path()).unwrap();
+        match read_manifest(&cargo_toml, source_id, &GlobalContext::default().unwrap()).unwrap() {
+            EitherManifest::Real(manifest) => manifest,
+            _ => panic!("expected real manifest"),
+        }
+    }
+
     fn rendered_cargo_requirements(deps: &[Dependency]) -> Vec<String> {
-        crate_requirements_from_cargo_deps(deps, "current_crate")
+        rendered_cargo_requirements_for_crate(deps, "current_crate")
+    }
+
+    fn rendered_cargo_requirements_for_crate(
+        deps: &[Dependency],
+        current_crate_name: &str,
+    ) -> Vec<String> {
+        crate_requirements_from_cargo_deps(deps, current_crate_name)
             .into_iter()
             .map(|requirement| spec::render_crate_requires(&requirement))
             .collect()
+    }
+
+    fn rendered_feature_requirements(toml: &str, feature: &str) -> Vec<String> {
+        let manifest = manifest_from_toml(toml);
+        let features_with_deps = all_dependencies_and_features(&manifest).unwrap();
+        let (_, deps) = transitive_deps(&features_with_deps, feature).unwrap();
+        rendered_cargo_requirements_for_crate(&deps, manifest.name().as_str())
     }
 
     #[test]
@@ -1381,11 +1421,14 @@ mod tests {
     }
 
     #[test]
-    fn cargo_build_dependency_does_not_enter_runtime_crate_requires() {
+    fn non_optional_cargo_build_dependency_requires_base_crate_capability() {
         let mut dep = test_dep("cc", "1", true, &[]);
         dep.set_kind(DepKind::Build);
 
-        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+        assert_eq!(
+            vec!["Requires:       crate(cc-1) >= 1.0.0"],
+            rendered_cargo_requirements(&[dep])
+        );
     }
 
     #[test]
@@ -1394,6 +1437,42 @@ mod tests {
         dep.set_kind(DepKind::Development);
 
         assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn onig_sys_style_build_dependencies_are_rendered_without_optional_leakage() {
+        let toml = r#"
+[package]
+name = "onig_sys"
+version = "69.9.3"
+edition = "2021"
+
+[build-dependencies]
+bindgen = { version = "0.72", optional = true, features = ["runtime"] }
+pkg-config = "^0.3.16"
+cc = "1.0"
+
+[dev-dependencies]
+proptest = "1"
+
+[features]
+default = ["generate"]
+generate = ["bindgen"]
+"#;
+
+        let base = rendered_feature_requirements(toml, "");
+        assert!(base.contains(&"Requires:       crate(cc-1) >= 1.0.0".to_string()));
+        assert!(base.contains(&"Requires:       crate(pkg-config-0.3) >= 0.3.16".to_string()));
+        assert!(base.iter().all(|line| !line.contains("bindgen")));
+        assert!(base.iter().all(|line| !line.contains("proptest")));
+
+        let generate = rendered_feature_requirements(toml, "generate");
+        assert!(generate.contains(&"Requires:       crate(cc-1) >= 1.0.0".to_string()));
+        assert!(generate.contains(&"Requires:       crate(pkg-config-0.3) >= 0.3.16".to_string()));
+        assert!(generate
+            .iter()
+            .any(|line| line == "Requires:       crate(bindgen-0.72/runtime) >= 0.72.0"));
+        assert!(generate.iter().all(|line| !line.contains("proptest")));
     }
 
     #[test]

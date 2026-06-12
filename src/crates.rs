@@ -1029,7 +1029,7 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
     let kind_allowed = match dep.kind() {
         DepKind::Normal => true,
         DepKind::Development => include_dev_dependencies,
-        DepKind::Build => false,
+        DepKind::Build => true,
     };
     if !kind_allowed {
         return false;
@@ -1043,9 +1043,9 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
         return false;
     }
 
-    if dependency_is_windows_only(dep) {
+    if !dependency_matches_openruyi_linux_target(dep) {
         takopack_warn!(
-            "Skipping Windows-only target dependency from Linux/openRuyi runtime Requires: {} {:?}",
+            "Skipping target-specific dependency not enabled for x86_64-unknown-linux-gnu Requires: {} {:?}",
             dep.package_name(),
             dep.platform().map(|platform| platform.to_string())
         );
@@ -1053,6 +1053,39 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
     }
 
     true
+}
+
+pub fn dependency_matches_openruyi_linux_target(dep: &Dependency) -> bool {
+    let Some(platform) = dep.platform() else {
+        return true;
+    };
+
+    let target_cfgs = [
+        "debug_assertions",
+        "panic = \"unwind\"",
+        "target_abi = \"\"",
+        "target_arch = \"x86_64\"",
+        "target_endian = \"little\"",
+        "target_env = \"gnu\"",
+        "target_family = \"unix\"",
+        "target_feature = \"fxsr\"",
+        "target_feature = \"sse\"",
+        "target_feature = \"sse2\"",
+        "target_has_atomic = \"16\"",
+        "target_has_atomic = \"32\"",
+        "target_has_atomic = \"64\"",
+        "target_has_atomic = \"8\"",
+        "target_has_atomic = \"ptr\"",
+        "target_os = \"linux\"",
+        "target_pointer_width = \"64\"",
+        "target_vendor = \"unknown\"",
+        "unix",
+    ]
+    .into_iter()
+    .map(|cfg| cfg.parse().expect("built-in Linux cfg should parse"))
+    .collect::<Vec<_>>();
+
+    platform.matches("x86_64-unknown-linux-gnu", &target_cfgs)
 }
 
 pub fn dependency_is_windows_only(dep: &Dependency) -> bool {
@@ -1140,8 +1173,11 @@ fn transitive_deps_impl<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{all_dependencies_and_features, dependency_is_runtime_candidate};
-    use cargo::core::{dependency::DepKind, EitherManifest, SourceId};
+    use super::{
+        all_dependencies_and_features, dependency_is_runtime_candidate,
+        dependency_matches_openruyi_linux_target,
+    };
+    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
     use cargo::util::toml::read_manifest;
     use cargo::GlobalContext;
     use std::fs;
@@ -1168,8 +1204,13 @@ mod tests {
         names
     }
 
+    fn test_dep(name: &str, version: &str) -> Dependency {
+        let source_id = SourceId::for_path(&std::env::current_dir().unwrap()).unwrap();
+        Dependency::parse(name, Some(version), source_id).unwrap()
+    }
+
     #[test]
-    fn feature_graph_excludes_dev_build_windows_and_special_runtime_deps_by_default() {
+    fn feature_graph_includes_build_deps_but_excludes_dev_windows_and_special_deps_by_default() {
         let manifest = manifest_from_toml(
             r#"
 [package]
@@ -1184,6 +1225,13 @@ rustc-std-workspace-core = "1"
 
 [build-dependencies]
 cc = "1"
+optional-build = { version = "1", optional = true }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+macos-build = "1"
+
+[target.'cfg(unix)'.build-dependencies]
+unix-build = "1"
 
 [dev-dependencies]
 proptest = "1"
@@ -1193,19 +1241,64 @@ windows-win = "3"
 
 [features]
 use-optional = ["dep:optional-normal"]
+use-build = ["dep:optional-build"]
 "#,
         );
 
         let features = all_dependencies_and_features(&manifest).unwrap();
         let base_names = dep_names(&features.get("").unwrap().1);
-        assert_eq!(vec!["normal"], base_names);
+        assert_eq!(vec!["cc", "normal", "unix-build"], base_names);
 
         let optional_names = dep_names(&features.get("use-optional").unwrap().1);
         assert_eq!(vec!["optional-normal"], optional_names);
+
+        let optional_build_names = dep_names(&features.get("use-build").unwrap().1);
+        assert_eq!(vec!["optional-build"], optional_build_names);
     }
 
     #[test]
-    fn runtime_candidate_filter_can_include_dev_when_explicitly_requested() {
+    fn build_dependencies_are_provider_metadata_candidates_by_default() {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+cc = "1"
+"#,
+        );
+        let build_dep = manifest
+            .dependencies()
+            .iter()
+            .find(|dep| dep.kind() == DepKind::Build)
+            .unwrap();
+
+        assert!(dependency_is_runtime_candidate(build_dep, false));
+    }
+
+    #[test]
+    fn target_filter_matches_linux_cfg_expressions() {
+        let mut unix_dep = test_dep("unix-build", "1");
+        unix_dep.set_platform(Some("cfg(unix)".parse().unwrap()));
+
+        let mut macos_dep = test_dep("macos-build", "1");
+        macos_dep.set_platform(Some(r#"cfg(target_os = "macos")"#.parse().unwrap()));
+
+        let mut windows_dep = test_dep("windows-build", "1");
+        windows_dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
+        assert!(dependency_matches_openruyi_linux_target(&unix_dep));
+        assert!(!dependency_matches_openruyi_linux_target(&macos_dep));
+        assert!(!dependency_matches_openruyi_linux_target(&windows_dep));
+        assert!(dependency_is_runtime_candidate(&unix_dep, false));
+        assert!(!dependency_is_runtime_candidate(&macos_dep, false));
+        assert!(!dependency_is_runtime_candidate(&windows_dep, false));
+    }
+
+    #[test]
+    fn dev_dependencies_are_filtered_unless_explicitly_requested() {
         let manifest = manifest_from_toml(
             r#"
 [package]

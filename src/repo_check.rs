@@ -1428,7 +1428,7 @@ fn parse_buildreq_dependency(
         warnings.push(warning);
     }
 
-    let required_version = parse_version(&version);
+    let required_version = parse_requirement_floor(&version);
     Some(BuildReqRequest {
         section: section.to_string(),
         repo_pkgname: repo_pkgname_for_dependency(&package_name, &required_version),
@@ -2090,7 +2090,7 @@ fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
         if let Some(warning) = unsupported_requirement_warning(&package_name, &version) {
             warnings.push(warning);
         }
-        let required_version = parse_version(&version);
+        let required_version = parse_requirement_floor(&version);
         requests.push(DepRequest {
             repo_pkgname: repo_pkgname_for_dependency(&package_name, &required_version),
             alias,
@@ -2106,6 +2106,7 @@ fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
 }
 
 fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Option<RepoWarning> {
+    let requirement = requirement.trim();
     if requirement.is_empty() {
         return Some(RepoWarning {
             warning_type: "unsupported-requirement".to_string(),
@@ -2120,14 +2121,7 @@ fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Optio
                 .to_string(),
         });
     }
-    if requirement.contains(',')
-        || requirement.contains('*')
-        || requirement.starts_with('<')
-        || requirement.starts_with('>')
-        || requirement.starts_with('=')
-        || requirement.starts_with('~')
-        || requirement.starts_with('^')
-    {
+    if simple_requirement_floor_token(requirement).is_none() {
         Some(RepoWarning {
             warning_type: "unsupported-requirement".to_string(),
             rpm_name: String::new(),
@@ -2523,6 +2517,34 @@ fn parse_version(version: &str) -> Vec<u64> {
     parts
 }
 
+fn parse_requirement_floor(requirement: &str) -> Vec<u64> {
+    simple_requirement_floor_token(requirement)
+        .map(parse_version)
+        .unwrap_or_default()
+}
+
+fn simple_requirement_floor_token(requirement: &str) -> Option<&str> {
+    let requirement = requirement.trim();
+    if requirement.is_empty()
+        || requirement.contains(',')
+        || requirement.contains('*')
+        || requirement.starts_with('<')
+        || requirement.starts_with('=')
+        || requirement.starts_with('~')
+        || (requirement.starts_with('>') && !requirement.starts_with(">="))
+    {
+        return None;
+    }
+
+    if let Some(version) = requirement.strip_prefix('^') {
+        return Some(version.trim());
+    }
+    if let Some(version) = requirement.strip_prefix(">=") {
+        return Some(version.trim());
+    }
+    Some(requirement)
+}
+
 fn compat_branch(version: &[u64]) -> Option<String> {
     if version.is_empty() {
         return None;
@@ -2756,6 +2778,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_requirement_floor_accepts_simple_cargo_lower_bounds() {
+        assert_eq!(parse_requirement_floor("1.2.3"), vec![1, 2, 3]);
+        assert_eq!(parse_requirement_floor("^0.3.16"), vec![0, 3, 16]);
+        assert_eq!(parse_requirement_floor(">=1.2.3"), vec![1, 2, 3]);
+        assert!(parse_requirement_floor(">=1.2, <1.6").is_empty());
+        assert!(parse_requirement_floor("=1.5.0").is_empty());
+    }
+
+    #[test]
     fn compat_branch_matches_cargo_compat_policy() {
         assert_eq!(compat_branch(&[1, 2, 3]), Some("1".to_string()));
         assert_eq!(compat_branch(&[0, 22, 1]), Some("0.22".to_string()));
@@ -2846,6 +2877,26 @@ mod tests {
     fn unsupported_requirement_warning_allows_simple_requirements() {
         assert!(unsupported_requirement_warning("foo", "1").is_none());
         assert!(unsupported_requirement_warning("foo", "0.22").is_none());
+        assert!(unsupported_requirement_warning("foo", "^0.3.16").is_none());
+        assert!(unsupported_requirement_warning("foo", ">=1.2.3").is_none());
+    }
+
+    #[test]
+    fn buildreqs_normalizes_caret_dependency_to_compat_capability() {
+        let request = parse_buildreq_dependency(
+            "build-dependencies",
+            "pkg-config".to_string(),
+            toml::Value::String("^0.3.16".to_string()),
+        )
+        .expect("dependency should parse");
+        assert_eq!(request.repo_pkgname, "pkg-config-0.3");
+        assert!(request.warnings.is_empty());
+
+        let records = buildrequires_for_request(&request);
+        assert!(records.iter().any(|record| {
+            record.capability == "crate(pkg-config-0.3)"
+                && record.requirement.as_deref() == Some(">=0.3.16")
+        }));
     }
 
     #[test]

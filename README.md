@@ -407,13 +407,14 @@ TakoPack is responsible for translating Cargo metadata into RPM crate capability
 
 Generated Rust crate specs should not use `%cargo_buildrequires` as the primary source of crate dependency metadata. The intended path is Cargo.toml-first extraction in TakoPack, rendered as `crate(name-compat[/feature])` `Provides:` and `Requires:`.
 
-Runtime crate provider `Requires:` are intentionally conservative:
+Rust crate provider `Requires:` are intentionally conservative:
 
 - normal `[dependencies]` may become runtime `Requires:`;
-- `[build-dependencies]` do not become runtime `Requires:` by default;
+- non-optional `[build-dependencies]` become provider `Requires:` so dependent crates can resolve build scripts during Cargo metadata/build;
+- optional `[build-dependencies]` do not enter the main package unconditionally, and should be pulled through the feature subpackage that enables them;
 - `[dev-dependencies]` do not become runtime `Requires:` by default;
 - optional dependencies do not enter the main package unconditionally, and should be pulled through the feature subpackage that enables them;
 - target-specific Windows dependencies are filtered from ordinary Linux/openRuyi runtime `Requires:` by default;
 - `rustc-std-workspace-core`, `rustc-std-workspace-alloc`, and `rustc-std-workspace-std` require manual policy and are not emitted as ordinary runtime `Requires:` by default.
 
-Future work may add explicit target selection and opt-in dev/test dependency metadata, but default provider metadata should avoid dev/test/bench, build-only, and Windows-only dependencies.
+Future work may add explicit target selection and opt-in dev/test dependency metadata, but default provider metadata should avoid dev/test/bench and Windows-only dependencies.
