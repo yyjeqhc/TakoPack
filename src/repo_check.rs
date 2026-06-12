@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -141,6 +142,7 @@ pub struct RepoPlanSummary {
 
 #[derive(Debug, Clone)]
 pub struct RepoPlanOptions {
+    pub kind: BuildReqsKind,
     pub check_transitive: bool,
     pub json: bool,
     pub include_global_warnings: bool,
@@ -204,6 +206,7 @@ pub struct RepoHealthSummary {
 pub enum BuildReqsKind {
     Crate,
     App,
+    Pyproject,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +336,7 @@ pub struct CheckRecord {
 
 #[derive(Debug, Clone)]
 pub struct RepoCheckOptions {
+    pub kind: BuildReqsKind,
     pub check_transitive: bool,
     pub json: bool,
 }
@@ -344,11 +348,12 @@ pub struct RepoIndexOptions {
 
 #[derive(Debug, Clone)]
 struct DepRequest {
+    section: String,
     alias: String,
     package_name: String,
     repo_pkgname: String,
-    required_version: Vec<u64>,
-    default_features: bool,
+    version_requirement: String,
+    version_req: Option<VersionReq>,
     features: Vec<String>,
     warnings: Vec<RepoWarning>,
 }
@@ -945,7 +950,8 @@ pub fn run_repo_check(
         .with_context(|| format!("failed to read {}", index_path.display()))?;
     let index: RepoIndex = serde_json::from_str(&index_content)
         .with_context(|| format!("failed to parse {}", index_path.display()))?;
-    let result = check_cargo_toml(cargo_toml, &index, options.check_transitive)?;
+    let result =
+        check_cargo_toml_with_kind(cargo_toml, &index, options.kind, options.check_transitive)?;
 
     if options.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1420,7 +1426,7 @@ fn parse_buildreq_dependency(
     };
 
     let mut warnings = Vec::new();
-    if let Some(mut warning) = unsupported_requirement_warning(&package_name, &version) {
+    if let Some(mut warning) = unsupported_buildreq_requirement_warning(&package_name, &version) {
         warning.subpackage = section.to_string();
         warning.message =
             "buildreqs only derives lower bounds from simple Cargo requirements in this experimental version"
@@ -1530,6 +1536,7 @@ pub fn build_repo_plan(
         cargo_toml,
         index,
         &RepoPlanOptions {
+            kind: BuildReqsKind::App,
             check_transitive,
             json: false,
             include_global_warnings: false,
@@ -1542,7 +1549,8 @@ pub fn build_repo_plan_with_options(
     index: &RepoIndex,
     options: &RepoPlanOptions,
 ) -> Result<RepoPlanResult> {
-    let check = check_cargo_toml(cargo_toml, index, options.check_transitive)?;
+    let check =
+        check_cargo_toml_with_kind(cargo_toml, index, options.kind, options.check_transitive)?;
     let warnings = if options.include_global_warnings {
         check.warnings.clone()
     } else {
@@ -1980,7 +1988,16 @@ pub fn check_cargo_toml(
     index: &RepoIndex,
     check_transitive: bool,
 ) -> Result<RepoCheckResult> {
-    let requests = load_cargo_dependencies(cargo_toml)?;
+    check_cargo_toml_with_kind(cargo_toml, index, BuildReqsKind::App, check_transitive)
+}
+
+pub fn check_cargo_toml_with_kind(
+    cargo_toml: &Path,
+    index: &RepoIndex,
+    kind: BuildReqsKind,
+    check_transitive: bool,
+) -> Result<RepoCheckResult> {
+    let requests = load_cargo_dependencies(cargo_toml, kind)?;
     let mut direct_ok = Vec::new();
     let mut direct_missing = Vec::new();
     let mut direct_conflicts = Vec::new();
@@ -2040,29 +2057,144 @@ pub fn check_cargo_toml(
     })
 }
 
-fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
+fn load_cargo_dependencies(cargo_toml: &Path, kind: BuildReqsKind) -> Result<Vec<DepRequest>> {
     let content = fs::read_to_string(cargo_toml)
         .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
     let manifest: Value = toml::from_str(&content)
         .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
-    let dependencies = manifest
-        .get("dependencies")
+    let root_package = manifest
+        .get("package")
         .and_then(Value::as_table)
+        .and_then(|table| table.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let selected_package_features = selected_package_features(&manifest);
+
+    let mut sections = vec!["dependencies"];
+    if kind_include_build_dependencies(kind) {
+        sections.push("build-dependencies");
+    }
+    // TODO: Add an explicit --include-dev/test-plan mode for Rust application
+    // test closures. The default repo-check/repo-plan policy remains packaging
+    // oriented and intentionally excludes dev-dependencies.
+
+    let mut requests = Vec::new();
+    for section in sections {
+        let dependencies = manifest
+            .get(section)
+            .and_then(Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+
+        for (alias, value) in dependencies {
+            let Some(mut request) = parse_cargo_dependency(
+                section,
+                alias,
+                value,
+                &root_package,
+                &selected_package_features,
+                kind,
+            ) else {
+                continue;
+            };
+
+            if let Some(mut warning) =
+                unsupported_requirement_warning(&request.package_name, &request.version_requirement)
+            {
+                warning.subpackage = request.section.clone();
+                request.warnings.push(warning);
+            }
+            requests.push(request);
+        }
+    }
+
+    Ok(requests)
+}
+
+fn parse_cargo_dependency(
+    section: &str,
+    alias: String,
+    value: Value,
+    root_package: &Option<String>,
+    selected_package_features: &BTreeMap<String, BTreeSet<String>>,
+    kind: BuildReqsKind,
+) -> Option<DepRequest> {
+    let dep = ParsedDependency::from_value(alias, value)?;
+    let package_key = normalize_feature_name(&dep.package_name);
+    let selected_features = selected_package_features
+        .get(&package_key)
         .cloned()
         .unwrap_or_default();
 
-    let mut requests = Vec::new();
-    for (alias, value) in dependencies {
-        let mut warnings = Vec::new();
-        let (package_name, version, default_features, features) = match value {
-            Value::String(version) => (alias.clone(), version, true, Vec::new()),
+    if dep.optional && !selected_features.contains("dep") {
+        return None;
+    }
+    if dep.has_path && kind_ignore_path_dependencies(kind) {
+        return None;
+    }
+    if kind_ignore_root_dependency(kind)
+        && root_package.as_deref().is_some_and(|root| {
+            normalize_crate_name(root) == normalize_crate_name(&dep.package_name)
+        })
+    {
+        return None;
+    }
+
+    let mut features = BTreeSet::new();
+    if dep.default_features {
+        features.insert("default".to_string());
+    }
+    features.extend(dep.features);
+    features.extend(
+        selected_features
+            .into_iter()
+            .filter(|feature| feature != "dep"),
+    );
+
+    let version_req = parse_cargo_version_req(&dep.version_requirement);
+    let required_floor = parse_requirement_floor(&dep.version_requirement);
+    Some(DepRequest {
+        section: section.to_string(),
+        repo_pkgname: repo_pkgname_for_dependency(&dep.package_name, &required_floor),
+        alias: dep.alias,
+        package_name: dep.package_name,
+        version_requirement: dep.version_requirement,
+        version_req,
+        features: features.into_iter().collect(),
+        warnings: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedDependency {
+    alias: String,
+    package_name: String,
+    version_requirement: String,
+    default_features: bool,
+    features: Vec<String>,
+    optional: bool,
+    has_path: bool,
+}
+
+impl ParsedDependency {
+    fn from_value(alias: String, value: Value) -> Option<Self> {
+        match value {
+            Value::String(version) => Some(Self {
+                package_name: alias.clone(),
+                version_requirement: version,
+                alias,
+                default_features: true,
+                features: Vec::new(),
+                optional: false,
+                has_path: false,
+            }),
             Value::Table(table) => {
                 let package_name = table
                     .get("package")
                     .and_then(Value::as_str)
                     .unwrap_or(&alias)
                     .to_string();
-                let version = table
+                let version_requirement = table
                     .get("version")
                     .and_then(Value::as_str)
                     .unwrap_or("")
@@ -2082,27 +2214,109 @@ fn load_cargo_dependencies(cargo_toml: &Path) -> Result<Vec<DepRequest>> {
                             .collect()
                     })
                     .unwrap_or_default();
-                (package_name, version, default_features, features)
+                Some(Self {
+                    alias,
+                    package_name,
+                    version_requirement,
+                    default_features,
+                    features,
+                    optional: table
+                        .get("optional")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    has_path: table.get("path").is_some(),
+                })
             }
-            _ => continue,
-        };
-
-        if let Some(warning) = unsupported_requirement_warning(&package_name, &version) {
-            warnings.push(warning);
+            _ => None,
         }
-        let required_version = parse_requirement_floor(&version);
-        requests.push(DepRequest {
-            repo_pkgname: repo_pkgname_for_dependency(&package_name, &required_version),
-            alias,
-            package_name,
-            required_version,
-            default_features,
-            features,
-            warnings,
-        });
+    }
+}
+
+fn kind_include_build_dependencies(kind: BuildReqsKind) -> bool {
+    matches!(kind, BuildReqsKind::Crate)
+}
+
+fn kind_ignore_path_dependencies(kind: BuildReqsKind) -> bool {
+    matches!(kind, BuildReqsKind::Pyproject | BuildReqsKind::App)
+}
+
+fn kind_ignore_root_dependency(kind: BuildReqsKind) -> bool {
+    matches!(kind, BuildReqsKind::Pyproject | BuildReqsKind::App)
+}
+
+fn selected_package_features(manifest: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    let mut selected_manifest_features = BTreeSet::new();
+    let Some(features) = manifest.get("features").and_then(Value::as_table) else {
+        return BTreeMap::new();
+    };
+
+    if features.contains_key("default") {
+        select_manifest_feature("default", features, &mut selected_manifest_features);
     }
 
-    Ok(requests)
+    let mut selected_packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for feature in selected_manifest_features {
+        let Some(items) = features.get(&feature).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items.iter().filter_map(Value::as_str) {
+            select_package_feature(item, features, &mut selected_packages);
+        }
+    }
+    selected_packages
+}
+
+fn select_manifest_feature(
+    feature: &str,
+    features: &toml::map::Map<String, Value>,
+    selected: &mut BTreeSet<String>,
+) {
+    let feature = normalize_feature_name(feature);
+    if !selected.insert(feature.clone()) {
+        return;
+    }
+    let Some(items) = features.get(&feature).and_then(Value::as_array) else {
+        return;
+    };
+    for item in items.iter().filter_map(Value::as_str) {
+        if item.starts_with("dep:") || item.contains('/') {
+            continue;
+        }
+        let nested = normalize_feature_name(item);
+        if features.contains_key(&nested) {
+            select_manifest_feature(&nested, features, selected);
+        }
+    }
+}
+
+fn select_package_feature(
+    item: &str,
+    features: &toml::map::Map<String, Value>,
+    selected: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    let explicit_dep = item.starts_with("dep:");
+    let item = item.strip_prefix("dep:").unwrap_or(item);
+    if let Some((package, feature)) = item.split_once('/') {
+        selected
+            .entry(normalize_feature_name(package))
+            .or_default()
+            .insert(normalize_feature_name(feature));
+    } else if !explicit_dep && features.contains_key(&normalize_feature_name(item)) {
+        return;
+    } else {
+        selected
+            .entry(normalize_feature_name(item))
+            .or_default()
+            .insert("dep".to_string());
+    }
+}
+
+fn parse_cargo_version_req(requirement: &str) -> Option<VersionReq> {
+    let requirement = requirement.trim();
+    if requirement.is_empty() {
+        return None;
+    }
+    VersionReq::parse(requirement).ok()
 }
 
 fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Option<RepoWarning> {
@@ -2121,7 +2335,7 @@ fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Optio
                 .to_string(),
         });
     }
-    if simple_requirement_floor_token(requirement).is_none() {
+    if parse_cargo_version_req(requirement).is_none() {
         Some(RepoWarning {
             warning_type: "unsupported-requirement".to_string(),
             rpm_name: String::new(),
@@ -2138,6 +2352,29 @@ fn unsupported_requirement_warning(cargo_name: &str, requirement: &str) -> Optio
     }
 }
 
+fn unsupported_buildreq_requirement_warning(
+    cargo_name: &str,
+    requirement: &str,
+) -> Option<RepoWarning> {
+    let requirement = requirement.trim();
+    if requirement.is_empty() || simple_requirement_floor_token(requirement).is_none() {
+        return Some(RepoWarning {
+            warning_type: "unsupported-requirement".to_string(),
+            rpm_name: String::new(),
+            subpackage: "direct".to_string(),
+            cap: cargo_name.to_string(),
+            normalized_version: None,
+            requirement: Some(requirement.to_string()),
+            line: None,
+            expected: None,
+            message:
+                "buildreqs only derives lower bounds from simple Cargo requirements in this experimental version"
+                    .to_string(),
+        });
+    }
+    None
+}
+
 fn analyze_dependency(
     request: &DepRequest,
     index: &RepoIndex,
@@ -2149,37 +2386,62 @@ fn analyze_dependency(
     let mut direct = Vec::new();
     let mut transitive = Vec::new();
     let mut human = vec![format!(
-        "  {} (version >= {})",
+        "  {} (requirement {})",
         request.alias,
-        format_version(&request.required_version)
+        request
+            .version_requirement
+            .trim()
+            .is_empty()
+            .then_some("any")
+            .unwrap_or(request.version_requirement.trim())
     )];
-    let pkgname = &request.repo_pkgname;
 
-    let mut selected_features = Vec::new();
-    if request.default_features {
-        selected_features.push("default".to_string());
+    let main = analyze_direct_dependency_main(request, index, &capabilities, &candidates);
+    let pkgname = main
+        .capability
+        .as_str()
+        .strip_prefix("crate(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split('/').next())
+        .unwrap_or(&request.repo_pkgname)
+        .to_string();
+
+    if main.status == "missing" {
+        human.push(format!("    {} -> no provider found", main.capability));
+    } else if main.status == "conflict" {
+        let provider = main.provider.as_ref().unwrap();
+        human.push(format!(
+            "    {} -> provider {} {} does not satisfy requirement {}",
+            main.capability,
+            provider.rpm_name,
+            provider.version,
+            main.requirement.as_deref().unwrap_or("any")
+        ));
+    } else {
+        let provider = main.provider.clone().unwrap();
+        human.push(format!(
+            "    {} -> {} {}",
+            main.capability, provider.rpm_name, provider.version
+        ));
     }
-    selected_features.extend(request.features.clone());
 
-    let mut checked_caps = vec![package_capability(pkgname, None)];
-    checked_caps.extend(
-        selected_features
-            .iter()
-            .map(|feature| package_capability(pkgname, Some(feature))),
-    );
+    if check_transitive && main.status == "ok" {
+        let provider = main.provider.clone().unwrap();
+        walk_transitive(
+            &request.alias,
+            provider,
+            &capabilities,
+            &packages_by_provider,
+            vec![request.alias.clone(), main.capability.clone()],
+            &mut BTreeSet::new(),
+            &mut transitive,
+        );
+    }
+    direct.push(main);
 
-    for cap in checked_caps {
-        let floor = if cap == package_capability(pkgname, None) {
-            request.required_version.clone()
-        } else {
-            Vec::new()
-        };
-        let diagnostic = if cap == package_capability(pkgname, None) {
-            rejected_candidate_message(&request.repo_pkgname, &candidates)
-        } else {
-            None
-        };
-        let result = analyze_requirement(&request.alias, &cap, &floor, &capabilities, diagnostic);
+    for feature in &request.features {
+        let cap = package_capability(&pkgname, Some(feature));
+        let result = analyze_requirement(&request.alias, &cap, &[], &capabilities, None);
         if result.status == "missing" {
             human.push(format!("    {} -> no provider found", cap));
             direct.push(result);
@@ -2188,11 +2450,8 @@ fn analyze_dependency(
         if result.status == "conflict" {
             let provider = result.provider.as_ref().unwrap();
             human.push(format!(
-                "    {} -> provider {} {} does not satisfy requirement >= {}",
-                cap,
-                provider.rpm_name,
-                provider.version,
-                format_version(&floor)
+                "    {} -> provider {} {} does not satisfy requirement",
+                cap, provider.rpm_name, provider.version
             ));
             direct.push(result);
             continue;
@@ -2204,21 +2463,123 @@ fn analyze_dependency(
             cap, provider.rpm_name, provider.version
         ));
         direct.push(result);
-
-        if check_transitive {
-            walk_transitive(
-                &request.alias,
-                provider,
-                &capabilities,
-                &packages_by_provider,
-                vec![request.alias.clone(), cap],
-                &mut BTreeSet::new(),
-                &mut transitive,
-            );
-        }
     }
 
     (direct, transitive, human)
+}
+
+fn analyze_direct_dependency_main(
+    request: &DepRequest,
+    index: &RepoIndex,
+    capabilities: &BTreeMap<String, Vec<CapabilityProvider>>,
+    candidates: &[&IndexedPackage],
+) -> CheckRecord {
+    let candidate_caps = direct_main_capability_candidates(request, index);
+    let diagnostic = rejected_candidate_message(&request.repo_pkgname, candidates);
+    let requirement = requirement_text_for_request(request);
+    let chain = vec![request.alias.clone()];
+
+    let mut all_providers = Vec::new();
+    let mut satisfying = Vec::new();
+    for cap in &candidate_caps {
+        for provider in capabilities.get(cap).into_iter().flatten() {
+            all_providers.push((cap.clone(), provider.clone()));
+            if provider_satisfies_request(provider, request.version_req.as_ref()) {
+                satisfying.push((cap.clone(), provider.clone()));
+            }
+        }
+    }
+
+    if let Some((cap, provider)) = select_highest_provider(satisfying) {
+        return CheckRecord {
+            dependency: request.alias.clone(),
+            capability: cap.clone(),
+            status: "ok".to_string(),
+            requirement,
+            provider: Some(provider),
+            chain: [chain, vec![cap]].concat(),
+            message: None,
+        };
+    }
+
+    if let Some((cap, provider)) = select_highest_provider(all_providers) {
+        return CheckRecord {
+            dependency: request.alias.clone(),
+            capability: cap.clone(),
+            status: "conflict".to_string(),
+            requirement: requirement.clone(),
+            provider: Some(provider.clone()),
+            chain: [chain, vec![cap]].concat(),
+            message: Some(format!(
+                "selected/provider {} version {} does not satisfy requirement {}",
+                provider.rpm_name,
+                provider.version,
+                requirement.as_deref().unwrap_or("any")
+            )),
+        };
+    }
+
+    let cap = candidate_caps
+        .first()
+        .cloned()
+        .unwrap_or_else(|| package_capability(&request.repo_pkgname, None));
+    CheckRecord {
+        dependency: request.alias.clone(),
+        capability: cap.clone(),
+        status: "missing".to_string(),
+        requirement,
+        provider: None,
+        chain: [chain, vec![cap]].concat(),
+        message: Some(diagnostic.unwrap_or_else(|| "no provider found".to_string())),
+    }
+}
+
+fn direct_main_capability_candidates(request: &DepRequest, index: &RepoIndex) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    candidates.insert(package_capability(&request.repo_pkgname, None));
+
+    for package in crate_name_candidates(index, &request.package_name) {
+        if let Some(capability) = main_package_capability(package) {
+            candidates.insert(capability);
+        } else if !package.pkgname.is_empty() {
+            candidates.insert(package_capability(&package.pkgname, None));
+        }
+    }
+
+    candidates.into_iter().collect()
+}
+
+fn provider_satisfies_request(
+    provider: &CapabilityProvider,
+    requirement: Option<&VersionReq>,
+) -> bool {
+    let Some(requirement) = requirement else {
+        return true;
+    };
+    provider
+        .version
+        .as_str()
+        .parse::<Version>()
+        .ok()
+        .or_else(|| semver_version_from_numeric_parts(&provider.version))
+        .is_some_and(|version| requirement.matches(&version))
+}
+
+fn semver_version_from_numeric_parts(version: &str) -> Option<Version> {
+    let mut parts = parse_version(version);
+    if parts.is_empty() {
+        return None;
+    }
+    parts.resize(3, 0);
+    Some(Version::new(parts[0], parts[1], parts[2]))
+}
+
+fn select_highest_provider(
+    providers: Vec<(String, CapabilityProvider)>,
+) -> Option<(String, CapabilityProvider)> {
+    providers
+        .into_iter()
+        .max_by(|(_, a), (_, b)| parse_version(&a.version).cmp(&parse_version(&b.version)))
 }
 
 fn sorted_capabilities(index: &RepoIndex) -> BTreeMap<String, Vec<CapabilityProvider>> {
@@ -2610,6 +2971,15 @@ fn requirement_text_for_floor(version: &[u64]) -> Option<String> {
     }
 }
 
+fn requirement_text_for_request(request: &DepRequest) -> Option<String> {
+    let requirement = request.version_requirement.trim();
+    if requirement.is_empty() {
+        None
+    } else {
+        Some(requirement.to_string())
+    }
+}
+
 fn build_requirement_text(op: Option<&str>, version: Option<&str>) -> Option<String> {
     match (op, version) {
         (Some(op), Some(version)) => Some(format!("{op} {version}")),
@@ -2625,7 +2995,10 @@ fn package_capability(pkgname: &str, feature: Option<&String>) -> String {
 }
 
 fn normalize_feature_name(feature: &str) -> String {
-    feature.replace('_', "-").to_ascii_lowercase()
+    feature
+        .trim_start_matches('_')
+        .replace('_', "-")
+        .to_ascii_lowercase()
 }
 
 fn normalize_crate_name(value: &str) -> String {
@@ -2758,6 +3131,82 @@ mod tests {
         }
     }
 
+    fn repo_index_with_caps(caps: &[(&str, &str, &str)]) -> RepoIndex {
+        let mut capabilities: BTreeMap<String, Vec<CapabilityProvider>> = BTreeMap::new();
+        let mut packages = BTreeMap::<String, IndexedPackage>::new();
+
+        for (cap, rpm_name, version) in caps {
+            let provider = provider(rpm_name, version);
+            capabilities
+                .entry((*cap).to_string())
+                .or_default()
+                .push(provider.clone());
+
+            let (crate_name, pkgname) = crate_identity_from_capability(cap);
+            let package =
+                packages
+                    .entry((*rpm_name).to_string())
+                    .or_insert_with(|| IndexedPackage {
+                        rpm_name: (*rpm_name).to_string(),
+                        version: (*version).to_string(),
+                        crate_name,
+                        pkgname,
+                        spec_path: String::new(),
+                        provides: Vec::new(),
+                        requires: Vec::new(),
+                    });
+            package.provides.push(ProvideRecord {
+                cap: (*cap).to_string(),
+                version: (*version).to_string(),
+                subpackage: provider.subpackage.clone(),
+            });
+        }
+
+        RepoIndex {
+            packages: packages.into_values().collect(),
+            capabilities,
+            warnings: Vec::new(),
+            skipped: Vec::new(),
+            summary: RepoIndexSummary::default(),
+        }
+    }
+
+    fn crate_identity_from_capability(capability: &str) -> (String, String) {
+        let name = crate_capability_name(capability)
+            .and_then(|name| name.split('/').next())
+            .unwrap_or_default();
+        let pkgname = name.to_string();
+        let crate_name = name
+            .rsplit_once('-')
+            .filter(|(_, suffix)| !parse_version(suffix).is_empty())
+            .map(|(base, _)| base.to_string())
+            .unwrap_or_else(|| name.to_string());
+        (crate_name, pkgname)
+    }
+
+    fn check_manifest(manifest: &str, index: &RepoIndex, kind: BuildReqsKind) -> RepoCheckResult {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        std::fs::write(&cargo_toml, manifest).expect("manifest should be written");
+        check_cargo_toml_with_kind(&cargo_toml, index, kind, false).expect("repo-check should run")
+    }
+
+    fn missing_caps(result: &RepoCheckResult) -> Vec<String> {
+        result
+            .missing
+            .iter()
+            .map(|record| record.capability.clone())
+            .collect()
+    }
+
+    fn ok_record<'a>(result: &'a RepoCheckResult, capability: &str) -> &'a CheckRecord {
+        result
+            .ok
+            .iter()
+            .find(|record| record.capability == capability)
+            .expect("capability should be ok")
+    }
+
     fn policy_package(rpm_name: &str, crate_name: &str, version: &str) -> IndexedPackage {
         IndexedPackage {
             rpm_name: rpm_name.to_string(),
@@ -2864,10 +3313,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_requirement_warning_flags_complex_requirements() {
-        for requirement in [">=1.2, <1.6", "=1.5.0", "~1.5"] {
+    fn unsupported_requirement_warning_flags_invalid_requirements() {
+        for requirement in ["", "not-a-version"] {
             let warning = unsupported_requirement_warning("foo", requirement)
-                .expect("complex requirement should warn");
+                .expect("invalid requirement should warn");
+            assert_eq!(warning.warning_type, "unsupported-requirement");
+            assert_eq!(warning.requirement.as_deref(), Some(requirement));
+        }
+    }
+
+    #[test]
+    fn buildreqs_warning_remains_conservative_for_complex_requirements() {
+        for requirement in [">=1.2, <1.6", "=1.5.0", "~1.5"] {
+            let warning = unsupported_buildreq_requirement_warning("foo", requirement)
+                .expect("buildreqs complex requirement should warn");
             assert_eq!(warning.warning_type, "unsupported-requirement");
             assert_eq!(warning.requirement.as_deref(), Some(requirement));
         }
@@ -2879,6 +3338,9 @@ mod tests {
         assert!(unsupported_requirement_warning("foo", "0.22").is_none());
         assert!(unsupported_requirement_warning("foo", "^0.3.16").is_none());
         assert!(unsupported_requirement_warning("foo", ">=1.2.3").is_none());
+        assert!(unsupported_requirement_warning("foo", ">=1.2, <1.6").is_none());
+        assert!(unsupported_requirement_warning("foo", "=1.5.0").is_none());
+        assert!(unsupported_requirement_warning("foo", "~1.5").is_none());
     }
 
     #[test]
@@ -2987,6 +3449,257 @@ mod tests {
             Some("4.6.1"),
         );
         assert_eq!(resolution.status, "ok");
+    }
+
+    #[test]
+    fn repo_check_maps_exact_requirement_to_policy_provider() {
+        let index = repo_index_with_caps(&[
+            ("crate(hf-hub-0.4)", "rust-hf-hub-0.4", "0.4.1"),
+            ("crate(hf-hub-0.4/ureq)", "rust-hf-hub-0.4", "0.4.1"),
+            ("crate(hf-hub-0.4/rustls-tls)", "rust-hf-hub-0.4", "0.4.1"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "outlines-core"
+version = "0.2.14"
+
+[dependencies.hf-hub]
+version = "=0.4.1"
+features = ["ureq", "rustls-tls"]
+default-features = false
+"#,
+            &index,
+            BuildReqsKind::App,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        let record = ok_record(&result, "crate(hf-hub-0.4)");
+        assert_eq!(
+            record.provider.as_ref().unwrap().rpm_name,
+            "rust-hf-hub-0.4"
+        );
+        assert_eq!(record.requirement.as_deref(), Some("=0.4.1"));
+    }
+
+    #[test]
+    fn repo_check_range_requirement_prefers_highest_existing_provider() {
+        let index = repo_index_with_caps(&[
+            ("crate(errno-0.2)", "rust-errno-0.2", "0.2.8"),
+            ("crate(errno-0.2/default)", "rust-errno-0.2", "0.2.8"),
+            ("crate(errno-0.3)", "rust-errno-0.3", "0.3.14"),
+            ("crate(errno-0.3/default)", "rust-errno-0.3", "0.3.14"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "signal-hook-registry"
+version = "1.4.8"
+
+[dependencies]
+errno = ">=0.2, <0.4"
+"#,
+            &index,
+            BuildReqsKind::Crate,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        let record = ok_record(&result, "crate(errno-0.3)");
+        assert_eq!(record.provider.as_ref().unwrap().rpm_name, "rust-errno-0.3");
+    }
+
+    #[test]
+    fn repo_check_pyproject_ignores_libcst_derive_path_dependency() {
+        let index = repo_index_with_caps(&[
+            ("crate(paste-1)", "rust-paste-1", "1.0.15"),
+            ("crate(paste-1/default)", "rust-paste-1", "1.0.15"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "libcst"
+version = "1.8.6"
+
+[dependencies]
+paste = "1.0.15"
+libcst_derive = { path = "../libcst_derive", version = "1.8.6" }
+"#,
+            &index,
+            BuildReqsKind::Pyproject,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(!result
+            .ok
+            .iter()
+            .any(|record| record.dependency == "libcst_derive"));
+    }
+
+    #[test]
+    fn repo_check_pyproject_ignores_sudachi_path_dependency() {
+        let index = repo_index_with_caps(&[
+            ("crate(scopeguard-1)", "rust-scopeguard-1", "1.2.0"),
+            ("crate(scopeguard-1/default)", "rust-scopeguard-1", "1.2.0"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "sudachipy"
+version = "0.6.10"
+
+[dependencies]
+scopeguard = "1"
+
+[dependencies.sudachi]
+path = "./sudachi-lib"
+"#,
+            &index,
+            BuildReqsKind::Pyproject,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(!result
+            .ok
+            .iter()
+            .any(|record| record.dependency == "sudachi"));
+    }
+
+    #[test]
+    fn repo_check_pyproject_ignores_safetensors_root_path_dependency() {
+        let index = repo_index_with_caps(&[
+            ("crate(serde-json-1)", "rust-serde-json-1", "1.0.150"),
+            (
+                "crate(serde-json-1/default)",
+                "rust-serde-json-1",
+                "1.0.150",
+            ),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "safetensors-python"
+version = "0.7.0"
+
+[dependencies]
+serde_json = "1.0"
+
+[dependencies.safetensors]
+path = "../../safetensors"
+"#,
+            &index,
+            BuildReqsKind::Pyproject,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(!result
+            .ok
+            .iter()
+            .any(|record| record.dependency == "safetensors"));
+    }
+
+    #[test]
+    fn repo_check_pyproject_ignores_tokenizers_root_path_dependency() {
+        let index = repo_index_with_caps(&[
+            ("crate(rayon-1)", "rust-rayon-1", "1.11.0"),
+            ("crate(rayon-1/default)", "rust-rayon-1", "1.11.0"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "tokenizers-python"
+version = "0.22.2"
+
+[dependencies]
+rayon = "1.10"
+
+[dependencies.tokenizers]
+path = "../../tokenizers"
+"#,
+            &index,
+            BuildReqsKind::Pyproject,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(!result
+            .ok
+            .iter()
+            .any(|record| record.dependency == "tokenizers"));
+    }
+
+    #[test]
+    fn repo_check_skips_unselected_optional_dependency() {
+        let index = repo_index_with_caps(&[("crate(bytes-1)", "rust-bytes-1", "1.11.0")]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "orjson"
+version = "3.11.7"
+
+[features]
+default = []
+unwind = ["unwinding"]
+
+[dependencies]
+bytes = { version = "1", default-features = false }
+unwinding = { version = "=0.2.8", default-features = false, features = ["unwinder"], optional = true }
+
+"#,
+            &index,
+            BuildReqsKind::Pyproject,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(!result
+            .ok
+            .iter()
+            .any(|record| record.dependency == "unwinding"));
+    }
+
+    #[test]
+    fn repo_check_bindgen_cli_feature_normalizes_internal_underscores() {
+        let index = repo_index_with_caps(&[
+            ("crate(bindgen-0.72)", "rust-bindgen-0.72", "0.72.1"),
+            ("crate(bindgen-0.72/cli)", "rust-bindgen-0.72", "0.72.1"),
+            (
+                "crate(bindgen-0.72/experimental)",
+                "rust-bindgen-0.72",
+                "0.72.1",
+            ),
+            (
+                "crate(bindgen-0.72/prettyplease)",
+                "rust-bindgen-0.72",
+                "0.72.1",
+            ),
+            ("crate(shlex-1)", "rust-shlex-1", "1.3.0"),
+            ("crate(shlex-1/default)", "rust-shlex-1", "1.3.0"),
+        ]);
+        let result = check_manifest(
+            r#"
+[package]
+name = "bindgen-cli"
+version = "0.72.1"
+
+[dependencies.bindgen]
+version = "0.72.1"
+features = ["__cli", "experimental", "prettyplease"]
+default-features = false
+
+[dependencies]
+shlex = "1"
+"#,
+            &index,
+            BuildReqsKind::Crate,
+        );
+
+        assert!(result.missing.is_empty(), "{:?}", missing_caps(&result));
+        assert!(result
+            .ok
+            .iter()
+            .any(|record| record.capability == "crate(bindgen-0.72/cli)"));
+        assert!(!result
+            .missing
+            .iter()
+            .any(|record| record.capability == "crate(bindgen-0.72/--cli)"));
     }
 
     #[test]

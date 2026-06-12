@@ -1385,6 +1385,7 @@ fn verify_apps(cargo_tomls: &[PathBuf], index: &RepoIndex) -> Result<Vec<Migrati
             cargo_toml,
             index,
             &RepoPlanOptions {
+                kind: BuildReqsKind::App,
                 check_transitive: true,
                 json: true,
                 include_global_warnings: false,

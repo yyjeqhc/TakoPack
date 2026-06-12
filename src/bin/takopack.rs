@@ -170,12 +170,14 @@ fn real_main() -> Result<i32> {
                 CargoOpt::RepoCheck {
                     cargo_toml,
                     index,
+                    kind,
                     check_transitive,
                     json,
                 } => takopack::repo_check::run_repo_check(
                     &cargo_toml,
                     &index,
                     RepoCheckOptions {
+                        kind,
                         check_transitive,
                         json,
                     },
@@ -183,6 +185,7 @@ fn real_main() -> Result<i32> {
                 CargoOpt::RepoPlan {
                     cargo_toml,
                     index,
+                    kind,
                     check_transitive,
                     json,
                     include_global_warnings,
@@ -190,6 +193,7 @@ fn real_main() -> Result<i32> {
                     &cargo_toml,
                     &index,
                     takopack::repo_check::RepoPlanOptions {
+                        kind,
                         check_transitive,
                         json,
                         include_global_warnings,
