@@ -1476,11 +1476,49 @@ generate = ["bindgen"]
     }
 
     #[test]
-    fn windows_only_target_dependency_does_not_enter_linux_runtime_crate_requires() {
+    fn target_specific_normal_dependency_enters_provider_crate_requires() {
         let mut dep = test_dep("windows-win", "3", true, &[]);
         dep.set_platform(Some("cfg(windows)".parse().unwrap()));
 
+        assert_eq!(
+            vec!["Requires:       crate(windows-win-3/default) >= 3.0.0"],
+            rendered_cargo_requirements(&[dep])
+        );
+    }
+
+    #[test]
+    fn target_specific_dev_dependency_does_not_enter_provider_crate_requires() {
+        let mut dep = test_dep("windows-dev", "1", true, &[]);
+        dep.set_kind(DepKind::Development);
+        dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
         assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn target_specific_optional_dependency_stays_feature_scoped() {
+        let toml = r#"
+[package]
+name = "target_optional"
+version = "1.0.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, default-features = false, features = ["Win32_Foundation"] }
+
+[features]
+default = []
+windows = ["dep:windows-sys"]
+"#;
+
+        let base = rendered_feature_requirements(toml, "");
+        assert!(base.iter().all(|line| !line.contains("windows-sys")));
+
+        let windows = rendered_feature_requirements(toml, "windows");
+        assert_eq!(
+            vec!["Requires:       crate(windows-sys-0.61/win32-foundation) >= 0.61.0"],
+            windows
+        );
     }
 
     #[test]

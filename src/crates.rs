@@ -1043,9 +1043,11 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
         return false;
     }
 
-    if !dependency_matches_openruyi_linux_target(dep) {
+    if matches!(dep.kind(), DepKind::Build | DepKind::Development)
+        && !dependency_matches_openruyi_linux_target(dep)
+    {
         takopack_warn!(
-            "Skipping target-specific dependency not enabled for x86_64-unknown-linux-gnu Requires: {} {:?}",
+            "Skipping target-specific build/dev dependency not enabled for x86_64-unknown-linux-gnu Requires: {} {:?}",
             dep.package_name(),
             dep.platform().map(|platform| platform.to_string())
         );
@@ -1210,7 +1212,8 @@ mod tests {
     }
 
     #[test]
-    fn feature_graph_includes_build_deps_but_excludes_dev_windows_and_special_deps_by_default() {
+    fn feature_graph_includes_build_deps_and_target_normal_deps_but_excludes_dev_and_special_deps_by_default(
+    ) {
         let manifest = manifest_from_toml(
             r#"
 [package]
@@ -1239,6 +1242,12 @@ proptest = "1"
 [target.'cfg(windows)'.dependencies]
 windows-win = "3"
 
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "0.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-dev = "1"
+
 [features]
 use-optional = ["dep:optional-normal"]
 use-build = ["dep:optional-build"]
@@ -1247,7 +1256,10 @@ use-build = ["dep:optional-build"]
 
         let features = all_dependencies_and_features(&manifest).unwrap();
         let base_names = dep_names(&features.get("").unwrap().1);
-        assert_eq!(vec!["cc", "normal", "unix-build"], base_names);
+        assert_eq!(
+            vec!["cc", "libredox", "normal", "unix-build", "windows-win"],
+            base_names
+        );
 
         let optional_names = dep_names(&features.get("use-optional").unwrap().1);
         assert_eq!(vec!["optional-normal"], optional_names);
@@ -1293,8 +1305,8 @@ cc = "1"
         assert!(!dependency_matches_openruyi_linux_target(&macos_dep));
         assert!(!dependency_matches_openruyi_linux_target(&windows_dep));
         assert!(dependency_is_runtime_candidate(&unix_dep, false));
-        assert!(!dependency_is_runtime_candidate(&macos_dep, false));
-        assert!(!dependency_is_runtime_candidate(&windows_dep, false));
+        assert!(dependency_is_runtime_candidate(&macos_dep, false));
+        assert!(dependency_is_runtime_candidate(&windows_dep, false));
     }
 
     #[test]
