@@ -4,7 +4,6 @@ use crate::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     recursive_package::RecursivePackageArgs,
     repo_check::BuildReqsKind,
-    repo_migrate::MigrateScope,
 };
 
 const CLI_STYLE: Styles = Styles::styled()
@@ -235,68 +234,6 @@ pub enum CargoOpt {
         /// Output audit report JSON path
         #[arg(long, value_name = "REPORT_JSON")]
         output: std::path::PathBuf,
-    },
-    /// Plan Rust crate repository policy migrations without modifying files
-    #[command(name = "migrate-plan")]
-    MigratePlan {
-        /// Use ruyispec.local_path from takopack.toml and scan its SPECS/ directory
-        #[arg(long)]
-        ruyispec: bool,
-
-        /// Optional repo-index JSON to reuse
-        #[arg(long, value_name = "INDEX_JSON")]
-        index: Option<std::path::PathBuf>,
-
-        /// Migration scope to plan
-        #[arg(long, value_enum, default_value = "legacy")]
-        scope: MigrateScope,
-
-        /// Maximum provider slots in this batch
-        #[arg(long, default_value_t = 20)]
-        batch_size: usize,
-
-        /// Output migration plan JSON path
-        #[arg(long, value_name = "PLAN_JSON")]
-        output: std::path::PathBuf,
-    },
-    /// Apply a Rust crate repository migration plan; requires --yes to modify files
-    #[command(name = "migrate-apply")]
-    MigrateApply {
-        /// Migration plan JSON produced by migrate-plan
-        #[arg(long, value_name = "PLAN_JSON")]
-        plan: std::path::PathBuf,
-
-        /// Package root directory, usually ruyispec/SPECS
-        #[arg(long, value_name = "SPECS_DIR")]
-        package_root: std::path::PathBuf,
-
-        /// Staging directory for regenerated providers
-        #[arg(long, value_name = "DIR")]
-        staging: std::path::PathBuf,
-
-        /// Actually modify files. Without this flag, migrate-apply is a dry-run.
-        #[arg(long)]
-        yes: bool,
-
-        /// Cargo.toml to verify after applying; may be repeated
-        #[arg(long, value_name = "CARGO_TOML")]
-        verify_app: Vec<std::path::PathBuf>,
-
-        /// Skip crates.io generation and copy/rewrite old provider skeletons instead
-        #[arg(long)]
-        skip_package_generation: bool,
-
-        /// Keep old provider directories for debugging
-        #[arg(long)]
-        keep_old: bool,
-
-        /// Allow applying pre-release provider actions from a plan
-        #[arg(long)]
-        allow_prerelease: bool,
-
-        /// Apply only providers that pass preflight; unsafe providers are skipped
-        #[arg(long)]
-        apply_safe_subset: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]
