@@ -31,6 +31,10 @@ use walkdir::WalkDir;
 use crate::config::load_takopack_toml;
 use crate::errors::Result;
 
+const TAKOPACK_METADATA_DIR: &str = ".takopack";
+const REGISTRY_MARKER: &str = "managed-by-takopack";
+const REGISTRY_MARKER_CONTENT: &str = "TakoPack cargo registry\n";
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -53,11 +57,16 @@ pub fn run_registry_sync(dry_run: bool, jobs: usize) -> Result<i32> {
     }
     println!();
 
+    ensure_registry_managed(&registry_dir, dry_run)?;
+
     // 1. Scan providers
     let scan = scan_providers(&ruyispec_dir)?;
     for warning in &scan.warnings {
-        takopack_warn!("{}", warning);
+        takopack_warn!("{}", warning.message);
     }
+    let scan_warning_count = scan.warnings.len();
+    let parse_warnings = scan.warning_count(ScanWarningKind::ParseFailed);
+    let missing_cargo_toml_warnings = scan.warning_count(ScanWarningKind::MissingCargoToml);
 
     let current = scan.providers;
     log::info!("scanned {} provider(s)", current.len());
@@ -70,7 +79,7 @@ pub fn run_registry_sync(dry_run: bool, jobs: usize) -> Result<i32> {
     log::debug!("plan: {:?}", plan.summary());
 
     // 4. Execute (or just report in dry-run mode)
-    let mut warnings: usize = scan.warnings.len();
+    let mut warnings: usize = scan_warning_count;
     let mut sync_errors: usize = 0;
 
     let mut sync_jobs = Vec::new();
@@ -170,6 +179,9 @@ pub fn run_registry_sync(dry_run: bool, jobs: usize) -> Result<i32> {
     println!("  remove={}", plan.remove.len());
     println!("  skip={}", plan.skip.len());
     println!("  warnings={}", warnings);
+    println!("  parse_warnings={}", parse_warnings);
+    println!("  missing_cargo_toml={}", missing_cargo_toml_warnings);
+    println!("  sync_errors={}", sync_errors);
 
     if sync_errors > 0 {
         Ok(1)
@@ -238,6 +250,78 @@ fn default_registry_dir() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Registry safety marker
+// ---------------------------------------------------------------------------
+
+fn ensure_registry_managed(registry_dir: &Path, dry_run: bool) -> Result<()> {
+    let marker = registry_marker_path(registry_dir);
+
+    if marker.is_file() {
+        return Ok(());
+    }
+
+    if !registry_dir.exists() {
+        if dry_run {
+            println!("  registry marker: would initialize {}", marker.display());
+        } else {
+            write_registry_marker(registry_dir)?;
+        }
+        return Ok(());
+    }
+
+    if !registry_dir.is_dir() {
+        takopack_bail!(
+            "registry path exists but is not a directory: {}",
+            registry_dir.display()
+        );
+    }
+
+    if registry_is_empty_or_metadata_only(registry_dir)? {
+        if dry_run {
+            println!("  registry marker: would create {}", marker.display());
+        } else {
+            write_registry_marker(registry_dir)?;
+        }
+        return Ok(());
+    }
+
+    takopack_bail!(
+        "{} is non-empty and has no {}; it does not look like a TakoPack-managed registry. Use a different registry.local_path, or manually confirm by clearing the directory or creating the marker file before syncing.",
+        registry_dir.display(),
+        marker.display()
+    );
+}
+
+fn registry_marker_path(registry_dir: &Path) -> PathBuf {
+    registry_dir
+        .join(TAKOPACK_METADATA_DIR)
+        .join(REGISTRY_MARKER)
+}
+
+fn write_registry_marker(registry_dir: &Path) -> Result<()> {
+    let metadata_dir = registry_dir.join(TAKOPACK_METADATA_DIR);
+    fs::create_dir_all(&metadata_dir)
+        .with_context(|| format!("failed to create {}", metadata_dir.display()))?;
+    let marker = registry_marker_path(registry_dir);
+    fs::write(&marker, REGISTRY_MARKER_CONTENT)
+        .with_context(|| format!("failed to write {}", marker.display()))?;
+    Ok(())
+}
+
+fn registry_is_empty_or_metadata_only(registry_dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(registry_dir)
+        .with_context(|| format!("failed to read {}", registry_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", registry_dir.display()))?;
+        if entry.file_name() != TAKOPACK_METADATA_DIR {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Provider scanning
 // ---------------------------------------------------------------------------
 
@@ -265,7 +349,34 @@ struct ProviderEntry {
 #[derive(Debug, Default)]
 struct ScanResult {
     providers: BTreeMap<String, ProviderEntry>,
-    warnings: Vec<String>,
+    warnings: Vec<ScanWarning>,
+}
+
+impl ScanResult {
+    fn warning_count(&self, kind: ScanWarningKind) -> usize {
+        self.warnings
+            .iter()
+            .filter(|warning| warning.kind == kind)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanWarningKind {
+    MissingCargoToml,
+    ParseFailed,
+}
+
+#[derive(Debug, Clone)]
+struct ScanWarning {
+    kind: ScanWarningKind,
+    message: String,
+}
+
+impl ScanWarning {
+    fn new(kind: ScanWarningKind, message: String) -> Self {
+        Self { kind, message }
+    }
 }
 
 /// Scan `{ruyispec}/SPECS/rust-*/*.spec` and return a map keyed by `spec_key`.
@@ -281,6 +392,9 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<ScanResult> {
         let spec_path = entry.context("glob error")?;
         let content = fs::read_to_string(&spec_path)
             .with_context(|| format!("failed to read {}", spec_path.display()))?;
+        if !is_rustcrates_spec(&content) {
+            continue;
+        }
 
         // Directory-based RPM name
         let spec_dir = spec_path
@@ -315,23 +429,32 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<ScanResult> {
         let (crate_name, version) = match (crate_name, version) {
             (Some(crate_name), Some(version)) => (crate_name, version),
             (None, Some(_)) => {
-                warnings.push(format!(
-                    "warning: {} failed to parse crate_name from {}",
-                    rpm_name, spec_file
+                warnings.push(ScanWarning::new(
+                    ScanWarningKind::ParseFailed,
+                    format!(
+                        "warning: {} failed to parse crate_name from {}",
+                        rpm_name, spec_file
+                    ),
                 ));
                 continue;
             }
             (Some(_), None) => {
-                warnings.push(format!(
-                    "warning: {} failed to parse full_version from {}",
-                    rpm_name, spec_file
+                warnings.push(ScanWarning::new(
+                    ScanWarningKind::ParseFailed,
+                    format!(
+                        "warning: {} failed to parse full_version from {}",
+                        rpm_name, spec_file
+                    ),
                 ));
                 continue;
             }
             (None, None) => {
-                warnings.push(format!(
-                    "warning: {} failed to parse crate_name/full_version from {}",
-                    rpm_name, spec_file
+                warnings.push(ScanWarning::new(
+                    ScanWarningKind::ParseFailed,
+                    format!(
+                        "warning: {} failed to parse crate_name/full_version from {}",
+                        rpm_name, spec_file
+                    ),
                 ));
                 continue;
             }
@@ -359,9 +482,12 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<ScanResult> {
                 .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
             Some(sha256_hex(&cargo_bytes))
         } else {
-            warnings.push(format!(
-                "warning: {} has no Cargo.toml override; using crates.io Cargo.toml",
-                rpm_name
+            warnings.push(ScanWarning::new(
+                ScanWarningKind::MissingCargoToml,
+                format!(
+                    "warning: {} has no Cargo.toml override; using crates.io Cargo.toml",
+                    rpm_name
+                ),
             ));
             None
         };
@@ -385,6 +511,17 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<ScanResult> {
     Ok(ScanResult {
         providers,
         warnings,
+    })
+}
+
+fn is_rustcrates_spec(content: &str) -> bool {
+    content.lines().any(|line| {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            return false;
+        };
+
+        key.trim().eq_ignore_ascii_case("BuildSystem")
+            && value.trim().eq_ignore_ascii_case("rustcrates")
     })
 }
 
@@ -428,6 +565,12 @@ fn load_index(registry_dir: &Path) -> Result<RegistryIndex> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let index: RegistryIndex = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    if index.schema_version != 1 {
+        takopack_bail!(
+            "unsupported registry index schema_version {}; expected 1",
+            index.schema_version
+        );
+    }
     Ok(index)
 }
 
@@ -464,7 +607,7 @@ fn write_index(registry_dir: &Path, index: &RegistryIndex) -> Result<()> {
     let tmp_path = dir.join("index.json.tmp");
 
     let json = serde_json::to_string_pretty(index)?;
-    fs::write(&tmp_path, json.as_bytes())
+    fs::write(&tmp_path, format!("{json}\n").as_bytes())
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
     fs::rename(&tmp_path, &final_path).with_context(|| {
         format!(
@@ -796,9 +939,10 @@ fn download_crate_tarball(url: &str) -> Result<Vec<u8>> {
 
 /// Extract a gzipped tarball into `dest`, stripping the common top-level
 /// directory prefix (which is typically `{crate_name}-{version}/`).
-fn extract_tarball(tarball: &[u8], dest: &Path, _expected_prefix: &str) -> Result<()> {
+fn extract_tarball(tarball: &[u8], dest: &Path, expected_prefix: &str) -> Result<()> {
     let gz = GzDecoder::new(tarball);
     let mut archive = tar::Archive::new(gz);
+    let mut extracted_files = 0usize;
 
     for file in archive.entries().context("failed to read tar entries")? {
         let mut file = file.context("corrupt tar entry")?;
@@ -807,7 +951,7 @@ fn extract_tarball(tarball: &[u8], dest: &Path, _expected_prefix: &str) -> Resul
         // Strip the top-level directory.  Most crates.io tarballs contain
         // `{name}-{version}/…` as the prefix.  We strip exactly one leading
         // component so the result lands directly in `dest`.
-        let stripped = safe_crate_entry_path(&raw_path)?;
+        let stripped = safe_crate_entry_path(&raw_path, expected_prefix)?;
 
         let Some(stripped) = stripped else {
             // Top-level directory entry itself — skip it.
@@ -829,15 +973,37 @@ fn extract_tarball(tarball: &[u8], dest: &Path, _expected_prefix: &str) -> Resul
                 .with_context(|| format!("create {}", out_path.display()))?;
             io::copy(&mut file, &mut out_file)
                 .with_context(|| format!("write {}", out_path.display()))?;
+            extracted_files += 1;
         }
+    }
+
+    if extracted_files == 0 {
+        takopack_bail!(
+            "crate archive for {} did not contain any files",
+            expected_prefix
+        );
     }
 
     Ok(())
 }
 
-fn safe_crate_entry_path(raw_path: &Path) -> Result<Option<PathBuf>> {
+fn safe_crate_entry_path(raw_path: &Path, expected_prefix: &str) -> Result<Option<PathBuf>> {
     let mut components = raw_path.components();
-    components.next();
+    match components.next() {
+        Some(std::path::Component::Normal(prefix)) if prefix == expected_prefix => {}
+        Some(std::path::Component::Normal(prefix)) => {
+            takopack_bail!(
+                "crate archive entry {} has unexpected top-level directory {}; expected {}",
+                raw_path.display(),
+                prefix.to_string_lossy(),
+                expected_prefix
+            );
+        }
+        Some(_) => {
+            takopack_bail!("unsafe path in crate archive: {}", raw_path.display());
+        }
+        None => return Ok(None),
+    }
 
     let mut stripped = PathBuf::new();
     for component in components {
@@ -998,13 +1164,63 @@ mod tests {
     }
 
     #[test]
+    fn load_index_rejects_unsupported_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_dir = temp.path().join(TAKOPACK_METADATA_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join("index.json"),
+            r#"{"schema_version":2,"entries":{}}"#,
+        )
+        .unwrap();
+
+        let err = load_index(temp.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported registry index schema_version 2; expected 1"));
+    }
+
+    #[test]
+    fn registry_marker_initializes_new_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = temp.path().join("registry");
+
+        ensure_registry_managed(&registry, false).unwrap();
+
+        assert!(registry_marker_path(&registry).is_file());
+    }
+
+    #[test]
+    fn registry_marker_accepts_existing_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = temp.path().join("registry");
+        write_registry_marker(&registry).unwrap();
+
+        ensure_registry_managed(&registry, false).unwrap();
+    }
+
+    #[test]
+    fn registry_marker_rejects_nonempty_unmarked_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = temp.path().join("registry");
+        std::fs::create_dir_all(registry.join("serde-1.0.0")).unwrap();
+
+        let err = ensure_registry_managed(&registry, false).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("does not look like a TakoPack-managed registry"));
+        assert!(registry.join("serde-1.0.0").is_dir());
+    }
+
+    #[test]
     fn scan_provider_reports_parse_and_manifest_warnings() {
         let temp = tempfile::tempdir().unwrap();
         let rust_foo = temp.path().join("SPECS/rust-foo-1");
         std::fs::create_dir_all(&rust_foo).unwrap();
         std::fs::write(
             rust_foo.join("rust-foo-1.spec"),
-            "%global crate_name foo\n%global full_version 1.2.3\n",
+            "BuildSystem: rustcrates\n%global crate_name foo\n%global full_version 1.2.3\n",
         )
         .unwrap();
 
@@ -1012,27 +1228,137 @@ mod tests {
         std::fs::create_dir_all(&rust_bin).unwrap();
         std::fs::write(rust_bin.join("rust-bin.spec"), "Name: rust-bin\n").unwrap();
 
+        let rust_bad = temp.path().join("SPECS/rust-bad-1");
+        std::fs::create_dir_all(&rust_bad).unwrap();
+        std::fs::write(
+            rust_bad.join("rust-bad-1.spec"),
+            "BuildSystem: rustcrates\nName: rust-bad-1\n",
+        )
+        .unwrap();
+
         let scan = scan_providers(temp.path()).unwrap();
         assert_eq!(scan.providers.len(), 1);
         assert_eq!(scan.warnings.len(), 2);
+        assert_eq!(scan.warning_count(ScanWarningKind::MissingCargoToml), 1);
+        assert_eq!(scan.warning_count(ScanWarningKind::ParseFailed), 1);
         assert!(scan
             .warnings
             .iter()
-            .any(|warning| warning.contains("has no Cargo.toml override")));
-        assert!(scan
+            .any(|warning| warning.message.contains("has no Cargo.toml override")));
+        assert!(scan.warnings.iter().any(|warning| warning
+            .message
+            .contains("failed to parse crate_name/full_version")));
+        assert!(!scan
             .warnings
             .iter()
-            .any(|warning| warning.contains("failed to parse crate_name/full_version")));
+            .any(|warning| warning.message.contains("rust-bin")));
+    }
+
+    #[test]
+    fn is_rustcrates_spec_accepts_case_and_spacing() {
+        assert!(is_rustcrates_spec("  BuildSystem:   rustcrates  \n"));
+        assert!(is_rustcrates_spec("buildsystem: RUSTCRATES\n"));
+        assert!(!is_rustcrates_spec("BuildSystem: rust\n"));
+        assert!(!is_rustcrates_spec("%global crate_name foo\n"));
     }
 
     #[test]
     fn safe_crate_entry_path_rejects_parent_components() {
-        let err = safe_crate_entry_path(Path::new("crate-1.0.0/../Cargo.toml")).unwrap_err();
+        let err = safe_crate_entry_path(Path::new("crate-1.0.0/../Cargo.toml"), "crate-1.0.0")
+            .unwrap_err();
         assert!(err.to_string().contains("unsafe path in crate archive"));
 
-        let safe = safe_crate_entry_path(Path::new("crate-1.0.0/src/lib.rs"))
+        let safe = safe_crate_entry_path(Path::new("crate-1.0.0/src/lib.rs"), "crate-1.0.0")
             .unwrap()
             .unwrap();
         assert_eq!(safe, PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn extract_tarball_accepts_expected_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let tarball = test_tarball(&[("foo-1.2.3/src/lib.rs", b"pub fn ok() {}\n")]);
+
+        extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src/lib.rs")).unwrap(),
+            "pub fn ok() {}\n"
+        );
+    }
+
+    #[test]
+    fn extract_tarball_rejects_wrong_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let tarball = test_tarball(&[("bar-1.2.3/src/lib.rs", b"")]);
+
+        let err = extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("unexpected top-level directory bar-1.2.3; expected foo-1.2.3"));
+    }
+
+    #[test]
+    fn extract_tarball_rejects_parent_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let tarball = test_tarball(&[("foo-1.2.3/../Cargo.toml", b"")]);
+
+        let err = extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap_err();
+
+        assert!(err.to_string().contains("unsafe path in crate archive"));
+    }
+
+    #[test]
+    fn extract_tarball_rejects_archives_without_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let tarball = test_tarball(&[]);
+
+        let err = extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("crate archive for foo-1.2.3 did not contain any files"));
+    }
+
+    fn test_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tarball = Vec::new();
+
+        for (path, data) in entries {
+            let path_bytes = path.as_bytes();
+            assert!(path_bytes.len() <= 100);
+
+            let mut header = [0u8; 512];
+            header[..path_bytes.len()].copy_from_slice(path_bytes);
+            write_tar_octal(&mut header[100..108], 0o644);
+            write_tar_octal(&mut header[108..116], 0);
+            write_tar_octal(&mut header[116..124], 0);
+            write_tar_octal(&mut header[124..136], data.len() as u64);
+            write_tar_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+
+            let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+            let checksum = format!("{:06o}\0 ", checksum);
+            header[148..156].copy_from_slice(checksum.as_bytes());
+
+            tarball.extend_from_slice(&header);
+            tarball.extend_from_slice(data);
+            let padding = (512 - (data.len() % 512)) % 512;
+            tarball.extend(std::iter::repeat(0).take(padding));
+        }
+
+        tarball.extend(std::iter::repeat(0).take(1024));
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tarball).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn write_tar_octal(field: &mut [u8], value: u64) {
+        let text = format!("{:0width$o}\0", value, width = field.len() - 1);
+        field.copy_from_slice(text.as_bytes());
     }
 }
