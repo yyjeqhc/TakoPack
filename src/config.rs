@@ -385,13 +385,19 @@ impl<'a> PackageKey<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TakopackToml {
-    ruyispec: Option<RuyispecConfig>,
+pub(crate) struct TakopackToml {
+    pub ruyispec: Option<RuyispecConfig>,
+    pub registry: Option<RegistryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RuyispecConfig {
-    local_path: Option<PathBuf>,
+pub(crate) struct RuyispecConfig {
+    pub local_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RegistryConfig {
+    pub local_path: Option<PathBuf>,
 }
 
 pub fn resolve_ruyispec_dir(explicit: Option<&Path>, use_config: bool) -> Result<PathBuf> {
@@ -437,7 +443,7 @@ pub fn ruyispec_package_root(ruyispec_dir: &Path) -> PathBuf {
     }
 }
 
-fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
+pub(crate) fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
     let Some(path) = find_takopack_toml() else {
         return Ok(None);
     };

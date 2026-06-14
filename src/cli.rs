@@ -235,6 +235,13 @@ pub enum CargoOpt {
         #[arg(long, value_name = "REPORT_JSON")]
         output: std::path::PathBuf,
     },
+    /// Sync Rust crate providers from ruyispec to local Cargo directory registry
+    #[command(name = "registry-sync")]
+    RegistrySync {
+        /// Only print the sync plan without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]
     #[command(group(
