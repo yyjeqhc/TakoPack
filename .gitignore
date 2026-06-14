@@ -6,3 +6,6 @@ Cargo.lock
 track_*
 experiments*
 parser*
+*.codex/*
+rust-*
+*.txt
