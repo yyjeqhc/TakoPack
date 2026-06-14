@@ -241,6 +241,10 @@ pub enum CargoOpt {
         /// Only print the sync plan without making changes
         #[arg(long)]
         dry_run: bool,
+
+        /// Number of concurrent crate downloads/extractions
+        #[arg(short = 'j', long, default_value_t = 8, value_name = "N")]
+        jobs: usize,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

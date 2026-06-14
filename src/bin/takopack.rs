@@ -218,9 +218,9 @@ fn real_main() -> Result<i32> {
                     )?;
                     Ok(0)
                 }
-                CargoOpt::RegistrySync { dry_run } => {
+                CargoOpt::RegistrySync { dry_run, jobs } => {
                     log::info!("starting registry sync");
-                    takopack::registry_sync::run_registry_sync(dry_run)
+                    takopack::registry_sync::run_registry_sync(dry_run, jobs)
                 }
                 CargoOpt::Track {
                     crate_name,

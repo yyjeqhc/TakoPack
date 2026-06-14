@@ -12,10 +12,13 @@
 //! 4. Remove stale entries and orphan directories.
 //! 5. Write the updated index atomically.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Context;
 use flate2::read::GzDecoder;
@@ -34,20 +37,29 @@ use crate::errors::Result;
 
 /// Run the `registry-sync` subcommand.
 ///
-/// Returns an exit code (0 = success, 1 = warnings present).
-pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
+/// Returns an exit code (0 = success, 1 = sync errors present).
+pub fn run_registry_sync(dry_run: bool, jobs: usize) -> Result<i32> {
     let (ruyispec_dir, registry_dir) = resolve_paths()?;
+    let jobs = jobs.max(1);
 
     println!("Registry sync");
     println!("  ruyispec: {}", ruyispec_dir.display());
     println!("  registry: {}", registry_dir.display());
+    if !dry_run {
+        println!("  jobs: {}", jobs);
+    }
     if dry_run {
         println!("  (dry-run mode — no files will be modified)");
     }
     println!();
 
     // 1. Scan providers
-    let current = scan_providers(&ruyispec_dir)?;
+    let scan = scan_providers(&ruyispec_dir)?;
+    for warning in &scan.warnings {
+        takopack_warn!("{}", warning);
+    }
+
+    let current = scan.providers;
     log::info!("scanned {} provider(s)", current.len());
 
     // 2. Load existing index
@@ -58,7 +70,10 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
     log::debug!("plan: {:?}", plan.summary());
 
     // 4. Execute (or just report in dry-run mode)
-    let mut warnings: usize = 0;
+    let mut warnings: usize = scan.warnings.len();
+    let mut sync_errors: usize = 0;
+
+    let mut sync_jobs = Vec::new();
 
     // --- adds ---
     for spec_key in &plan.add {
@@ -66,11 +81,7 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
         if dry_run {
             println!("  [add] {} → {}", spec_key, entry.registry_path);
         } else {
-            log::info!("adding {}", entry.registry_path);
-            if let Err(e) = sync_crate(entry, &ruyispec_dir, &registry_dir) {
-                takopack_warn!("failed to add {}: {:#}", entry.registry_path, e);
-                warnings += 1;
-            }
+            sync_jobs.push(SyncJob::new(SyncKind::Add, entry.clone()));
         }
     }
 
@@ -80,10 +91,35 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
         if dry_run {
             println!("  [update] {} → {}", spec_key, entry.registry_path);
         } else {
-            log::info!("updating {}", entry.registry_path);
-            if let Err(e) = sync_crate(entry, &ruyispec_dir, &registry_dir) {
-                takopack_warn!("failed to update {}: {:#}", entry.registry_path, e);
+            sync_jobs.push(SyncJob::new(SyncKind::Update, entry.clone()));
+        }
+    }
+
+    if !dry_run {
+        let (parallel_jobs, serial_jobs) = split_conflicting_jobs(sync_jobs);
+
+        for failure in sync_entries_parallel(parallel_jobs, &ruyispec_dir, &registry_dir, jobs) {
+            takopack_warn!(
+                "failed to {} {}: {}",
+                failure.kind.verb(),
+                failure.registry_path,
+                failure.error
+            );
+            warnings += 1;
+            sync_errors += 1;
+        }
+
+        for job in serial_jobs {
+            log::info!("{} {}", job.kind.gerund(), job.entry.registry_path);
+            if let Err(e) = sync_crate(&job.entry, &ruyispec_dir, &registry_dir) {
+                takopack_warn!(
+                    "failed to {} {}: {:#}",
+                    job.kind.verb(),
+                    job.entry.registry_path,
+                    e
+                );
                 warnings += 1;
+                sync_errors += 1;
             }
         }
     }
@@ -100,6 +136,7 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
                 if let Err(e) = fs::remove_dir_all(&dir) {
                     takopack_warn!("failed to remove {}: {}", dir.display(), e);
                     warnings += 1;
+                    sync_errors += 1;
                 }
             }
         }
@@ -112,13 +149,17 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
 
     // 5. Clean orphan directories
     if !dry_run {
-        warnings += clean_orphans(&registry_dir, &current);
+        let orphan_errors = clean_orphans(&registry_dir, &current);
+        warnings += orphan_errors;
+        sync_errors += orphan_errors;
     }
 
     // 6. Write new index
-    if !dry_run {
+    if !dry_run && sync_errors == 0 {
         let new_index = build_index(&current);
         write_index(&registry_dir, &new_index)?;
+    } else if !dry_run {
+        takopack_warn!("registry index was not updated because sync errors occurred");
     }
 
     // 7. Summary
@@ -130,7 +171,7 @@ pub fn run_registry_sync(dry_run: bool) -> Result<i32> {
     println!("  skip={}", plan.skip.len());
     println!("  warnings={}", warnings);
 
-    if warnings > 0 {
+    if sync_errors > 0 {
         Ok(1)
     } else {
         Ok(0)
@@ -150,15 +191,12 @@ fn resolve_paths() -> Result<(PathBuf, PathBuf)> {
     })?;
 
     // Ruyispec
-    let ruyispec_local = config
-        .ruyispec
-        .and_then(|r| r.local_path)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} does not define [ruyispec].local_path",
-                config_path.display()
-            )
-        })?;
+    let ruyispec_local = config.ruyispec.and_then(|r| r.local_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} does not define [ruyispec].local_path",
+            config_path.display()
+        )
+    })?;
     let ruyispec_dir = if ruyispec_local.is_absolute() {
         ruyispec_local
     } else {
@@ -223,20 +261,41 @@ struct ProviderEntry {
     cargo_toml_hash: Option<String>,
 }
 
+/// Result of scanning the ruyispec tree.
+#[derive(Debug, Default)]
+struct ScanResult {
+    providers: BTreeMap<String, ProviderEntry>,
+    warnings: Vec<String>,
+}
+
 /// Scan `{ruyispec}/SPECS/rust-*/*.spec` and return a map keyed by `spec_key`.
-fn scan_providers(ruyispec_dir: &Path) -> Result<BTreeMap<String, ProviderEntry>> {
+fn scan_providers(ruyispec_dir: &Path) -> Result<ScanResult> {
     let pattern = format!("{}/SPECS/rust-*/*.spec", ruyispec_dir.display());
-    let re_crate = Regex::new(r"^%global\s+crate_name\s+(\S+)")
-        .expect("regex");
-    let re_version = Regex::new(r"^%global\s+full_version\s+(\S+)")
-        .expect("regex");
+    let re_crate = Regex::new(r"^%global\s+crate_name\s+(\S+)").expect("regex");
+    let re_version = Regex::new(r"^%global\s+full_version\s+(\S+)").expect("regex");
 
     let mut providers = BTreeMap::new();
+    let mut warnings = Vec::new();
 
     for entry in glob(&pattern).context("invalid glob pattern")? {
         let spec_path = entry.context("glob error")?;
         let content = fs::read_to_string(&spec_path)
             .with_context(|| format!("failed to read {}", spec_path.display()))?;
+
+        // Directory-based RPM name
+        let spec_dir = spec_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("spec file has no parent dir"))?;
+        let rpm_name = spec_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("cannot extract dir name for {}", spec_path.display()))?
+            .to_string_lossy()
+            .to_string();
+
+        let spec_file = spec_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec_path.display().to_string());
 
         // Parse %global macros
         let mut crate_name: Option<String> = None;
@@ -253,36 +312,30 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<BTreeMap<String, ProviderEntry>
             }
         }
 
-        let crate_name = match crate_name {
-            Some(n) => n,
-            None => {
-                log::warn!(
-                    "skipping {} (no %global crate_name found)",
-                    spec_path.display()
-                );
+        let (crate_name, version) = match (crate_name, version) {
+            (Some(crate_name), Some(version)) => (crate_name, version),
+            (None, Some(_)) => {
+                warnings.push(format!(
+                    "warning: {} failed to parse crate_name from {}",
+                    rpm_name, spec_file
+                ));
+                continue;
+            }
+            (Some(_), None) => {
+                warnings.push(format!(
+                    "warning: {} failed to parse full_version from {}",
+                    rpm_name, spec_file
+                ));
+                continue;
+            }
+            (None, None) => {
+                warnings.push(format!(
+                    "warning: {} failed to parse crate_name/full_version from {}",
+                    rpm_name, spec_file
+                ));
                 continue;
             }
         };
-        let version = match version {
-            Some(v) => v,
-            None => {
-                log::warn!(
-                    "skipping {} (no %global full_version found)",
-                    spec_path.display()
-                );
-                continue;
-            }
-        };
-
-        // Directory-based RPM name
-        let spec_dir = spec_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("spec file has no parent dir"))?;
-        let rpm_name = spec_dir
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("cannot extract dir name for {}", spec_path.display()))?
-            .to_string_lossy()
-            .to_string();
 
         // Relative spec_key
         let spec_key = spec_path
@@ -306,6 +359,10 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<BTreeMap<String, ProviderEntry>
                 .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
             Some(sha256_hex(&cargo_bytes))
         } else {
+            warnings.push(format!(
+                "warning: {} has no Cargo.toml override; using crates.io Cargo.toml",
+                rpm_name
+            ));
             None
         };
 
@@ -325,7 +382,10 @@ fn scan_providers(ruyispec_dir: &Path) -> Result<BTreeMap<String, ProviderEntry>
         );
     }
 
-    Ok(providers)
+    Ok(ScanResult {
+        providers,
+        warnings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -364,8 +424,8 @@ fn load_index(registry_dir: &Path) -> Result<RegistryIndex> {
     if !path.is_file() {
         return Ok(RegistryIndex::empty());
     }
-    let data = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let data =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let index: RegistryIndex = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(index)
@@ -398,8 +458,7 @@ fn build_index(providers: &BTreeMap<String, ProviderEntry>) -> RegistryIndex {
 /// Atomically write the index: write to a temporary file then rename.
 fn write_index(registry_dir: &Path, index: &RegistryIndex) -> Result<()> {
     let dir = registry_dir.join(".takopack");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let final_path = dir.join("index.json");
     let tmp_path = dir.join("index.json.tmp");
@@ -407,8 +466,13 @@ fn write_index(registry_dir: &Path, index: &RegistryIndex) -> Result<()> {
     let json = serde_json::to_string_pretty(index)?;
     fs::write(&tmp_path, json.as_bytes())
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("failed to rename {} → {}", tmp_path.display(), final_path.display()))?;
+    fs::rename(&tmp_path, &final_path).with_context(|| {
+        format!(
+            "failed to rename {} → {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
 
     log::info!("wrote {}", final_path.display());
     Ok(())
@@ -453,8 +517,8 @@ fn reconcile(
         match old_index.entries.get(key) {
             None => add.push(key.clone()),
             Some(old) => {
-                let hashes_match =
-                    old.spec_hash == entry.spec_hash && old.cargo_toml_hash == entry.cargo_toml_hash;
+                let hashes_match = old.spec_hash == entry.spec_hash
+                    && old.cargo_toml_hash == entry.cargo_toml_hash;
                 let dir_exists = registry_dir.join(&entry.registry_path).is_dir();
 
                 if hashes_match && dir_exists {
@@ -481,25 +545,153 @@ fn reconcile(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel execution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum SyncKind {
+    Add,
+    Update,
+}
+
+impl SyncKind {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Update => "update",
+        }
+    }
+
+    fn gerund(self) -> &'static str {
+        match self {
+            Self::Add => "adding",
+            Self::Update => "updating",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncJob {
+    kind: SyncKind,
+    entry: ProviderEntry,
+}
+
+impl SyncJob {
+    fn new(kind: SyncKind, entry: ProviderEntry) -> Self {
+        Self { kind, entry }
+    }
+}
+
+#[derive(Debug)]
+struct SyncFailure {
+    kind: SyncKind,
+    registry_path: String,
+    error: String,
+}
+
+fn split_conflicting_jobs(jobs: Vec<SyncJob>) -> (Vec<SyncJob>, Vec<SyncJob>) {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for job in &jobs {
+        *counts.entry(job.entry.registry_path.clone()).or_default() += 1;
+    }
+
+    let mut parallel_jobs = Vec::new();
+    let mut serial_jobs = Vec::new();
+
+    for job in jobs {
+        if counts.get(&job.entry.registry_path).copied().unwrap_or(0) > 1 {
+            serial_jobs.push(job);
+        } else {
+            parallel_jobs.push(job);
+        }
+    }
+
+    (parallel_jobs, serial_jobs)
+}
+
+fn sync_entries_parallel(
+    jobs: Vec<SyncJob>,
+    ruyispec_dir: &Path,
+    registry_dir: &Path,
+    worker_count: usize,
+) -> Vec<SyncFailure> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+
+    let worker_count = worker_count.max(1).min(jobs.len());
+    let queue = Arc::new(Mutex::new(jobs.into_iter().collect::<VecDeque<_>>()));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let ruyispec_dir = Arc::new(ruyispec_dir.to_path_buf());
+    let registry_dir = Arc::new(registry_dir.to_path_buf());
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let failures = Arc::clone(&failures);
+        let ruyispec_dir = Arc::clone(&ruyispec_dir);
+        let registry_dir = Arc::clone(&registry_dir);
+
+        handles.push(thread::spawn(move || loop {
+            let job = {
+                let mut queue = queue.lock().expect("sync job queue should not be poisoned");
+                queue.pop_front()
+            };
+
+            let Some(job) = job else {
+                break;
+            };
+
+            log::info!("{} {}", job.kind.gerund(), job.entry.registry_path);
+            if let Err(err) = sync_crate(&job.entry, &ruyispec_dir, &registry_dir) {
+                let failure = SyncFailure {
+                    kind: job.kind,
+                    registry_path: job.entry.registry_path,
+                    error: format!("{:#}", err),
+                };
+                failures
+                    .lock()
+                    .expect("sync failure list should not be poisoned")
+                    .push(failure);
+            }
+        }));
+    }
+
+    for handle in handles {
+        if handle.join().is_err() {
+            failures
+                .lock()
+                .expect("sync failure list should not be poisoned")
+                .push(SyncFailure {
+                    kind: SyncKind::Update,
+                    registry_path: "<worker>".to_string(),
+                    error: "registry sync worker panicked".to_string(),
+                });
+        }
+    }
+
+    Arc::try_unwrap(failures)
+        .expect("all worker references should be dropped")
+        .into_inner()
+        .expect("sync failure list should not be poisoned")
+}
+
+// ---------------------------------------------------------------------------
 // Crate download / extract / patch
 // ---------------------------------------------------------------------------
 
 /// Download a crate tarball from crates.io, extract it, optionally overlay
 /// the provider `Cargo.toml`, and regenerate `.cargo-checksum.json`.
-fn sync_crate(
-    entry: &ProviderEntry,
-    ruyispec_dir: &Path,
-    registry_dir: &Path,
-) -> Result<()> {
+fn sync_crate(entry: &ProviderEntry, ruyispec_dir: &Path, registry_dir: &Path) -> Result<()> {
     let dest = registry_dir.join(&entry.registry_path);
+    fs::create_dir_all(registry_dir)
+        .with_context(|| format!("failed to create {}", registry_dir.display()))?;
 
-    // Remove any previous directory so we start clean.
-    if dest.exists() {
-        fs::remove_dir_all(&dest)
-            .with_context(|| format!("failed to remove old {}", dest.display()))?;
-    }
-    fs::create_dir_all(&dest)
-        .with_context(|| format!("failed to create {}", dest.display()))?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".takopack-sync-")
+        .tempdir_in(registry_dir)
+        .with_context(|| format!("failed to create temp dir in {}", registry_dir.display()))?;
+    let work_dir = temp_dir.path();
 
     // Download
     let url = format!(
@@ -507,17 +699,10 @@ fn sync_crate(
         entry.crate_name, entry.version
     );
     log::info!("downloading {}", url);
-    let resp = ureq::get(&url)
-        .call()
-        .with_context(|| format!("HTTP request failed for {}", url))?;
-
-    let mut body = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut body)
-        .with_context(|| format!("failed to read response body from {}", url))?;
+    let body = download_crate_tarball(&url)?;
 
     // Extract (gzipped tar)
-    extract_tarball(&body, &dest, &entry.registry_path)?;
+    extract_tarball(&body, work_dir, &entry.registry_path)?;
 
     // Overlay provider Cargo.toml if present
     let spec_dir = ruyispec_dir.join(
@@ -527,7 +712,7 @@ fn sync_crate(
     );
     let provider_cargo = spec_dir.join("Cargo.toml");
     if provider_cargo.is_file() {
-        let dest_cargo = dest.join("Cargo.toml");
+        let dest_cargo = work_dir.join("Cargo.toml");
         fs::copy(&provider_cargo, &dest_cargo).with_context(|| {
             format!(
                 "failed to copy {} → {}",
@@ -535,21 +720,78 @@ fn sync_crate(
                 dest_cargo.display()
             )
         })?;
-        log::debug!(
-            "overlaid provider Cargo.toml for {}",
-            entry.registry_path
-        );
-    } else {
-        log::warn!(
-            "{}: no provider Cargo.toml, keeping crates.io original",
-            entry.spec_key
-        );
+        log::debug!("overlaid provider Cargo.toml for {}", entry.registry_path);
     }
 
     // Regenerate .cargo-checksum.json
-    write_cargo_checksum(&dest)?;
+    write_cargo_checksum(work_dir)?;
+
+    // Replace the target only after the new crate directory is complete.
+    if dest.is_dir() {
+        fs::remove_dir_all(&dest)
+            .with_context(|| format!("failed to remove old {}", dest.display()))?;
+    } else if dest.exists() {
+        fs::remove_file(&dest)
+            .with_context(|| format!("failed to remove old {}", dest.display()))?;
+    }
+    fs::rename(work_dir, &dest).with_context(|| {
+        format!(
+            "failed to rename {} → {}",
+            work_dir.display(),
+            dest.display()
+        )
+    })?;
 
     Ok(())
+}
+
+fn download_crate_tarball(url: &str) -> Result<Vec<u8>> {
+    const ATTEMPTS: usize = 3;
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(120))
+        .timeout_write(Duration::from_secs(30))
+        .build();
+
+    let mut last_error = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let result = (|| -> Result<Vec<u8>> {
+            let resp = agent
+                .get(url)
+                .call()
+                .with_context(|| format!("HTTP request failed for {}", url))?;
+
+            let mut body = Vec::new();
+            resp.into_reader()
+                .read_to_end(&mut body)
+                .with_context(|| format!("failed to read response body from {}", url))?;
+            Ok(body)
+        })();
+
+        match result {
+            Ok(body) => return Ok(body),
+            Err(err) => {
+                last_error = format!("{:#}", err);
+                if attempt < ATTEMPTS {
+                    log::warn!(
+                        "download attempt {}/{} failed for {}: {}",
+                        attempt,
+                        ATTEMPTS,
+                        url,
+                        last_error
+                    );
+                }
+            }
+        }
+    }
+
+    takopack_bail!(
+        "failed to download {} after {} attempts: {}",
+        url,
+        ATTEMPTS,
+        last_error
+    );
 }
 
 /// Extract a gzipped tarball into `dest`, stripping the common top-level
@@ -565,15 +807,12 @@ fn extract_tarball(tarball: &[u8], dest: &Path, _expected_prefix: &str) -> Resul
         // Strip the top-level directory.  Most crates.io tarballs contain
         // `{name}-{version}/…` as the prefix.  We strip exactly one leading
         // component so the result lands directly in `dest`.
-        let stripped = raw_path
-            .components()
-            .skip(1)
-            .collect::<PathBuf>();
+        let stripped = safe_crate_entry_path(&raw_path)?;
 
-        if stripped.as_os_str().is_empty() {
+        let Some(stripped) = stripped else {
             // Top-level directory entry itself — skip it.
             continue;
-        }
+        };
 
         let out_path = dest.join(&stripped);
 
@@ -596,6 +835,28 @@ fn extract_tarball(tarball: &[u8], dest: &Path, _expected_prefix: &str) -> Resul
     Ok(())
 }
 
+fn safe_crate_entry_path(raw_path: &Path) -> Result<Option<PathBuf>> {
+    let mut components = raw_path.components();
+    components.next();
+
+    let mut stripped = PathBuf::new();
+    for component in components {
+        match component {
+            std::path::Component::Normal(part) => stripped.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                takopack_bail!("unsafe path in crate archive: {}", raw_path.display());
+            }
+        }
+    }
+
+    if stripped.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stripped))
+    }
+}
+
 /// Regenerate `.cargo-checksum.json` for a crate directory.
 ///
 /// The format is:
@@ -612,9 +873,7 @@ fn write_cargo_checksum(crate_dir: &Path) -> Result<()> {
             continue;
         }
         let abs_path = entry.path();
-        let rel = abs_path
-            .strip_prefix(crate_dir)
-            .unwrap_or(abs_path);
+        let rel = abs_path.strip_prefix(crate_dir).unwrap_or(abs_path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         // Exclude the checksum file itself.
@@ -622,8 +881,8 @@ fn write_cargo_checksum(crate_dir: &Path) -> Result<()> {
             continue;
         }
 
-        let data = fs::read(abs_path)
-            .with_context(|| format!("failed to read {}", abs_path.display()))?;
+        let data =
+            fs::read(abs_path).with_context(|| format!("failed to read {}", abs_path.display()))?;
         files.insert(rel_str, sha256_hex(&data));
     }
 
@@ -655,14 +914,8 @@ fn write_cargo_checksum(crate_dir: &Path) -> Result<()> {
 /// and not the `.takopack` metadata directory.
 ///
 /// Returns the number of warnings emitted.
-fn clean_orphans(
-    registry_dir: &Path,
-    current: &BTreeMap<String, ProviderEntry>,
-) -> usize {
-    let desired: HashSet<String> = current
-        .values()
-        .map(|e| e.registry_path.clone())
-        .collect();
+fn clean_orphans(registry_dir: &Path, current: &BTreeMap<String, ProviderEntry>) -> usize {
+    let desired: HashSet<String> = current.values().map(|e| e.registry_path.clone()).collect();
 
     let mut warnings = 0usize;
 
@@ -742,5 +995,44 @@ mod tests {
         let parsed: RegistryIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.schema_version, 1);
         assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn scan_provider_reports_parse_and_manifest_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let rust_foo = temp.path().join("SPECS/rust-foo-1");
+        std::fs::create_dir_all(&rust_foo).unwrap();
+        std::fs::write(
+            rust_foo.join("rust-foo-1.spec"),
+            "%global crate_name foo\n%global full_version 1.2.3\n",
+        )
+        .unwrap();
+
+        let rust_bin = temp.path().join("SPECS/rust-bin");
+        std::fs::create_dir_all(&rust_bin).unwrap();
+        std::fs::write(rust_bin.join("rust-bin.spec"), "Name: rust-bin\n").unwrap();
+
+        let scan = scan_providers(temp.path()).unwrap();
+        assert_eq!(scan.providers.len(), 1);
+        assert_eq!(scan.warnings.len(), 2);
+        assert!(scan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("has no Cargo.toml override")));
+        assert!(scan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("failed to parse crate_name/full_version")));
+    }
+
+    #[test]
+    fn safe_crate_entry_path_rejects_parent_components() {
+        let err = safe_crate_entry_path(Path::new("crate-1.0.0/../Cargo.toml")).unwrap_err();
+        assert!(err.to_string().contains("unsafe path in crate archive"));
+
+        let safe = safe_crate_entry_path(Path::new("crate-1.0.0/src/lib.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(safe, PathBuf::from("src/lib.rs"));
     }
 }
