@@ -18,7 +18,7 @@
 //!   plan-missing mode performs limited structured analysis for missing crates
 //!   and version conflicts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,8 +36,6 @@ use crate::crates::resolve_crates_io_version_req;
 use crate::errors::Result;
 use crate::registry_sync::materialize_crate_from_crates_io;
 use crate::util::{calculate_compat_version, rust_crate_output_names};
-
-const MAX_PLAN_ITERATIONS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -59,6 +57,8 @@ struct OverlayRegistry {
     registry_dir: PathBuf,
     superseded_dir: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
+    session_name: Option<String>,
+    session_root: Option<PathBuf>,
     session_file: Option<PathBuf>,
     state: PlanSessionState,
     stats: OverlayCopyStats,
@@ -120,8 +120,15 @@ struct UpgradeCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct PlanActionResult {
+    key: String,
+    changed: bool,
+    last_action: String,
+}
+
+#[derive(Debug, Clone)]
 enum VersionSelectionPlan {
-    Continue,
+    Continue(PlanActionResult),
     Stopped(UpgradeCandidate),
 }
 
@@ -133,6 +140,12 @@ struct PlanSessionState {
     added_crates: Vec<AddedCrateRecord>,
     #[serde(default)]
     upgraded_crates: Vec<UpgradedCrateRecord>,
+    #[serde(default)]
+    last_result: Option<String>,
+    #[serde(default)]
+    last_stop_reason: Option<String>,
+    #[serde(default)]
+    last_iterations: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
@@ -165,20 +178,37 @@ pub fn run_resolve_check(
     plan_add: &[String],
     plan_upgrade: &[String],
     allow_session_upgrades: bool,
+    max_plan_iterations: usize,
+    plan_progress_interval: usize,
+    plan_summary_only: bool,
 ) -> Result<i32> {
     if !plan_missing
         && (plan_session.is_some()
             || plan_reset
             || !plan_add.is_empty()
             || !plan_upgrade.is_empty()
-            || allow_session_upgrades)
+            || allow_session_upgrades
+            || plan_summary_only)
     {
         takopack_bail!(
-            "--plan-session, --plan-reset, --plan-add, --plan-upgrade, and --allow-session-upgrades require --plan-missing"
+            "--plan-session, --plan-reset, --plan-add, --plan-upgrade, --allow-session-upgrades, and --plan-summary-only require --plan-missing"
         );
     }
     if plan_reset && plan_session.is_none() {
         takopack_bail!("--plan-reset requires --plan-session <NAME>");
+    }
+    if plan_summary_only && plan_session.is_none() {
+        takopack_bail!("--plan-summary-only requires --plan-session <NAME>");
+    }
+    if plan_summary_only
+        && (plan_reset
+            || !plan_add.is_empty()
+            || !plan_upgrade.is_empty()
+            || allow_session_upgrades)
+    {
+        takopack_bail!(
+            "--plan-summary-only cannot be combined with --plan-reset, --plan-add, --plan-upgrade, or --allow-session-upgrades"
+        );
     }
 
     // 1. Determine manifest path and working directory.
@@ -211,8 +241,17 @@ pub fn run_resolve_check(
         if let Some(name) = plan_session {
             println!("  plan_session: {}", name);
         }
+        if max_plan_iterations == 0 {
+            println!("  max_plan_iterations: unbounded");
+        } else {
+            println!("  max_plan_iterations: {}", max_plan_iterations);
+        }
     }
     println!();
+
+    if plan_summary_only {
+        return run_plan_summary_only(plan_session.expect("validated plan session"));
+    }
 
     if plan_missing {
         return run_resolve_check_plan_missing(
@@ -228,6 +267,8 @@ pub fn run_resolve_check(
             plan_add,
             plan_upgrade,
             allow_session_upgrades,
+            max_plan_iterations,
+            plan_progress_interval,
         );
     }
 
@@ -301,6 +342,8 @@ fn run_resolve_check_plan_missing(
     plan_add: &[String],
     plan_upgrade: &[String],
     allow_session_upgrades: bool,
+    max_plan_iterations: usize,
+    plan_progress_interval: usize,
 ) -> Result<i32> {
     println!("Planning missing providers using overlay registry...");
     println!();
@@ -329,13 +372,27 @@ fn run_resolve_check_plan_missing(
     }
 
     let prepared = prepare_project_for_plan_missing(manifest, workdir, targets, is_real, no_dev)?;
-    let mut planned_keys = BTreeSet::new();
+    let mut action_keys = HashSet::new();
+    let mut iterations = 0usize;
+    let progress_interval = plan_progress_interval;
 
-    for _ in 0..MAX_PLAN_ITERATIONS {
+    loop {
+        if max_plan_iterations != 0 && iterations >= max_plan_iterations {
+            finish_plan_run(
+                &mut overlay,
+                "stopped",
+                "max iterations reached",
+                iterations,
+            )?;
+            println!("Result: stopped");
+            println!("Reason: max iterations reached");
+            return Ok(1);
+        }
+
+        iterations += 1;
         match cargo_resolve_prepared(&prepared.manifest, overlay.path(), print_buildrequires) {
             Ok(outcome) => {
-                print_plan_state(&overlay.state);
-                println!();
+                finish_plan_run(&mut overlay, "ok", "resolve ok", iterations)?;
                 println!("Result: ok");
                 print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
                 return Ok(0);
@@ -348,14 +405,29 @@ fn run_resolve_check_plan_missing(
                         &prepared.manifest,
                         &mut overlay,
                         no_dev,
-                        &mut planned_keys,
                     ) {
-                        Ok(()) => {
+                        Ok(action) => {
+                            if let Some(reason) = detect_no_progress(&mut action_keys, &action) {
+                                finish_plan_run(&mut overlay, "stopped", &reason, iterations)?;
+                                println!("Result: stopped");
+                                println!("Reason: {}", reason);
+                                return Ok(1);
+                            }
+                            print_plan_progress_if_needed(
+                                iterations,
+                                progress_interval,
+                                &overlay.state,
+                                &action.last_action,
+                            );
                             continue;
                         }
                         Err(plan_err) => {
-                            print_plan_state(&overlay.state);
-                            println!();
+                            finish_plan_run(
+                                &mut overlay,
+                                "failed",
+                                "cargo error while planning missing provider",
+                                iterations,
+                            )?;
                             println!("Result: failed");
                             eprintln!("{:#}", plan_err);
                             return Ok(1);
@@ -367,13 +439,30 @@ fn run_resolve_check_plan_missing(
                     match plan_or_conflict_version_selection_failure(
                         &failure,
                         &mut overlay,
-                        &mut planned_keys,
                         allow_session_upgrades,
                     ) {
-                        Ok(VersionSelectionPlan::Continue) => continue,
+                        Ok(VersionSelectionPlan::Continue(action)) => {
+                            if let Some(reason) = detect_no_progress(&mut action_keys, &action) {
+                                finish_plan_run(&mut overlay, "stopped", &reason, iterations)?;
+                                println!("Result: stopped");
+                                println!("Reason: {}", reason);
+                                return Ok(1);
+                            }
+                            print_plan_progress_if_needed(
+                                iterations,
+                                progress_interval,
+                                &overlay.state,
+                                &action.last_action,
+                            );
+                            continue;
+                        }
                         Ok(VersionSelectionPlan::Stopped(candidate)) => {
-                            print_plan_state(&overlay.state);
-                            println!();
+                            finish_plan_run(
+                                &mut overlay,
+                                "stopped",
+                                "upgrade candidate requires confirmation",
+                                iterations,
+                            )?;
                             println!("Result: stopped");
                             println!();
                             print_upgrade_candidates(&[candidate.clone()]);
@@ -388,8 +477,12 @@ fn run_resolve_check_plan_missing(
                             return Ok(1);
                         }
                         Err(plan_err) => {
-                            print_plan_state(&overlay.state);
-                            println!();
+                            finish_plan_run(
+                                &mut overlay,
+                                "failed",
+                                "cargo error while planning upgrade candidate",
+                                iterations,
+                            )?;
                             println!("Result: failed");
                             eprintln!("{:#}", plan_err);
                             return Ok(1);
@@ -397,8 +490,7 @@ fn run_resolve_check_plan_missing(
                     }
                 }
 
-                print_plan_state(&overlay.state);
-                println!();
+                finish_plan_run(&mut overlay, "failed", "unknown cargo failure", iterations)?;
                 println!("Result: failed");
                 println!();
                 println!("Unknown failure:");
@@ -407,15 +499,6 @@ fn run_resolve_check_plan_missing(
             }
         }
     }
-
-    print_plan_state(&overlay.state);
-    println!();
-    println!("Result: failed");
-    eprintln!(
-        "plan-missing exceeded max_plan_iterations = {}",
-        MAX_PLAN_ITERATIONS
-    );
-    Ok(1)
 }
 
 impl OverlayRegistry {
@@ -431,6 +514,9 @@ impl PlanSessionState {
             base_registry: base_registry.display().to_string(),
             added_crates: Vec::new(),
             upgraded_crates: Vec::new(),
+            last_result: None,
+            last_stop_reason: None,
+            last_iterations: None,
         }
     }
 }
@@ -535,6 +621,8 @@ fn create_overlay_registry(
         registry_dir: registry_path,
         superseded_dir: superseded_path,
         _tempdir: Some(tempdir),
+        session_name: None,
+        session_root: None,
         session_file: None,
         state: PlanSessionState::new(registry_dir),
         stats,
@@ -582,6 +670,8 @@ fn create_session_overlay_registry(
         registry_dir: registry_path,
         superseded_dir: superseded_path,
         _tempdir: None,
+        session_name: Some(session_name.to_string()),
+        session_root: Some(session_root),
         session_file: Some(session_file),
         state,
         stats,
@@ -593,6 +683,45 @@ fn plan_session_root() -> Result<PathBuf> {
         anyhow::anyhow!("cannot determine XDG_DATA_HOME / home directory for plan sessions")
     })?;
     Ok(data_dir.join("takopack").join("plan-sessions"))
+}
+
+fn run_plan_summary_only(session_name: &str) -> Result<i32> {
+    validate_plan_session_name(session_name)?;
+    let session_root = plan_session_root()?.join(session_name);
+    let session_file = session_root.join("session.json");
+    let state = load_plan_session_state(&session_file)?;
+    print_plan_summary(
+        &state,
+        Some(session_name),
+        Some(&session_root),
+        state.last_result.as_deref().unwrap_or("unknown"),
+        state.last_stop_reason.as_deref().unwrap_or("not recorded"),
+        state.last_iterations.unwrap_or(0),
+    );
+    Ok(0)
+}
+
+fn finish_plan_run(
+    overlay: &mut OverlayRegistry,
+    result: &str,
+    stop_reason: &str,
+    iterations: usize,
+) -> Result<()> {
+    overlay.state.last_result = Some(result.to_string());
+    overlay.state.last_stop_reason = Some(stop_reason.to_string());
+    overlay.state.last_iterations = Some(iterations);
+    if let Some(path) = overlay.session_file.clone() {
+        save_plan_session_state(&path, &overlay.state)?;
+    }
+    print_plan_summary(
+        &overlay.state,
+        overlay.session_name.as_deref(),
+        overlay.session_root.as_deref(),
+        result,
+        stop_reason,
+        iterations,
+    );
+    Ok(())
 }
 
 fn validate_plan_session_name(name: &str) -> Result<()> {
@@ -671,7 +800,7 @@ fn add_crate_to_overlay(
     overlay: &mut OverlayRegistry,
     crate_name: &str,
     version: &Version,
-) -> Result<()> {
+) -> Result<bool> {
     let registry_path = format!("{}-{}", crate_name, version);
     let existed = overlay.path().join(&registry_path).is_dir();
     materialize_crate_from_crates_io(crate_name, version, overlay.path()).with_context(|| {
@@ -683,9 +812,10 @@ fn add_crate_to_overlay(
 
     if !existed {
         record_added_crate(overlay, crate_name, version)?;
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn record_added_crate(
@@ -728,7 +858,7 @@ fn apply_upgrade_to_overlay(
     to_version: &Version,
     requirement: &str,
     required_by: Option<&RequiredByPackage>,
-) -> Result<()> {
+) -> Result<bool> {
     let to_version_string = to_version.to_string();
     let already_recorded = overlay
         .state
@@ -742,7 +872,7 @@ fn apply_upgrade_to_overlay(
         .collect();
 
     if old_existing.is_empty() && already_recorded {
-        return Ok(());
+        return Ok(false);
     }
     if old_existing.is_empty()
         && !overlay
@@ -765,8 +895,9 @@ fn apply_upgrade_to_overlay(
         },
     )?;
 
+    let mut changed = false;
     for provider in old_existing {
-        supersede_provider_dir(overlay, crate_name, &provider.version)?;
+        let moved = supersede_provider_dir(overlay, crate_name, &provider.version)?;
         record_upgraded_crate(
             overlay,
             crate_name,
@@ -776,20 +907,21 @@ fn apply_upgrade_to_overlay(
             requirement,
             required_by,
         )?;
+        changed = changed || moved;
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 fn supersede_provider_dir(
     overlay: &OverlayRegistry,
     crate_name: &str,
     version: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let dir_name = format!("{}-{}", crate_name, version);
     let src = overlay.path().join(&dir_name);
     if !src.exists() {
-        return Ok(());
+        return Ok(false);
     }
 
     fs::create_dir_all(&overlay.superseded_dir)
@@ -807,7 +939,7 @@ fn supersede_provider_dir(
         )
     })?;
 
-    Ok(())
+    Ok(true)
 }
 
 fn record_upgraded_crate(
@@ -945,8 +1077,7 @@ fn plan_and_materialize_missing_crate(
     root_manifest: &Path,
     overlay: &mut OverlayRegistry,
     no_dev: bool,
-    planned_keys: &mut BTreeSet<String>,
-) -> Result<()> {
+) -> Result<PlanActionResult> {
     let required_by = missing.required_by.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "missing {}, but failed to identify the package that requires it",
@@ -977,21 +1108,40 @@ fn plan_and_materialize_missing_crate(
                 missing.crate_name, requirement
             )
         })?;
-    let planned_key = format!("{}-{}", missing.crate_name, selected_version);
-    if !planned_keys.insert(planned_key.clone()) {
-        takopack_bail!(
-            "resolver still reports missing {} after adding {}; stopping to avoid a loop",
-            missing.crate_name,
-            planned_key
-        );
-    }
-
-    add_crate_to_overlay(overlay, &missing.crate_name, &selected_version)?;
-    Ok(())
+    let required_by_key = format_required_by(&required_by);
+    let key = format!(
+        "missing:{}:{}:{}:{}",
+        missing.crate_name, requirement, selected_version, required_by_key
+    );
+    let changed = add_crate_to_overlay(overlay, &missing.crate_name, &selected_version)?;
+    Ok(PlanActionResult {
+        key,
+        changed,
+        last_action: format!("add {} {}", missing.crate_name, selected_version),
+    })
 }
 
-fn print_plan_state(state: &PlanSessionState) {
-    println!("New provider candidates:");
+fn print_plan_summary(
+    state: &PlanSessionState,
+    session_name: Option<&str>,
+    session_root: Option<&Path>,
+    result: &str,
+    stop_reason: &str,
+    iterations: usize,
+) {
+    println!("Plan summary");
+    println!("  session: {}", session_name.unwrap_or("(temporary)"));
+    println!(
+        "  session path: {}",
+        session_root
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(temporary)".to_string())
+    );
+    println!("  result: {}", result);
+    println!("  iterations: {}", iterations);
+    println!();
+
+    println!("New provider candidates: {}", state.added_crates.len());
     if state.added_crates.is_empty() {
         println!("  (none)");
     } else {
@@ -1008,7 +1158,7 @@ fn print_plan_state(state: &PlanSessionState) {
     }
 
     println!();
-    println!("Upgrade candidates:");
+    println!("Upgrade candidates: {}", state.upgraded_crates.len());
     if state.upgraded_crates.is_empty() {
         println!("  (none)");
     } else {
@@ -1016,6 +1166,10 @@ fn print_plan_state(state: &PlanSessionState) {
             println!(
                 "  {} {} -> {} -> {}",
                 upgraded.crate_name, upgraded.from_version, upgraded.to_version, upgraded.rpm_name
+            );
+            println!(
+                "    command: takopack cargo pkg {} {} --directory /tmp/providers/{}",
+                upgraded.crate_name, upgraded.to_version, upgraded.rpm_name
             );
             if !upgraded.requirement.is_empty() {
                 println!("    required: {}", upgraded.requirement);
@@ -1025,6 +1179,10 @@ fn print_plan_state(state: &PlanSessionState) {
             }
         }
     }
+
+    println!();
+    println!("Stop reason:");
+    println!("  {}", stop_reason);
 }
 
 fn print_upgrade_candidates(candidates: &[UpgradeCandidate]) {
@@ -1091,6 +1249,37 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn detect_no_progress(
+    action_keys: &mut HashSet<String>,
+    action: &PlanActionResult,
+) -> Option<String> {
+    if !action.changed {
+        return Some(format!("no progress detected for {}", action.key));
+    }
+    if !action_keys.insert(action.key.clone()) {
+        return Some(format!("no progress detected for repeated {}", action.key));
+    }
+    None
+}
+
+fn print_plan_progress_if_needed(
+    iterations: usize,
+    progress_interval: usize,
+    state: &PlanSessionState,
+    last_action: &str,
+) {
+    if progress_interval == 0 || iterations % progress_interval != 0 {
+        return;
+    }
+
+    println!("Planning progress:");
+    println!("  iterations: {}", iterations);
+    println!("  new providers: {}", state.added_crates.len());
+    println!("  upgrades: {}", state.upgraded_crates.len());
+    println!("  last action: {}", last_action);
+    println!();
 }
 
 fn parse_missing_package_error(error_text: &str) -> Option<MissingPackageError> {
@@ -1186,7 +1375,6 @@ fn parse_version_selection_failure(error_text: &str) -> Option<VersionSelectionF
 fn plan_or_conflict_version_selection_failure(
     failure: &VersionSelectionFailure,
     overlay: &mut OverlayRegistry,
-    planned_keys: &mut BTreeSet<String>,
     allow_session_upgrades: bool,
 ) -> Result<VersionSelectionPlan> {
     let selected_version = resolve_crates_io_version_req(&failure.crate_name, &failure.requirement)
@@ -1217,8 +1405,32 @@ fn plan_or_conflict_version_selection_failure(
             existing: old_same_compat,
         };
         if allow_session_upgrades {
-            apply_upgrade_candidate_to_overlay(overlay, &candidate)?;
-            return Ok(VersionSelectionPlan::Continue);
+            let from_versions = candidate
+                .existing
+                .iter()
+                .map(|provider| provider.version.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            let key = format!(
+                "upgrade:{}:{}:{}:{}",
+                candidate.crate_name,
+                from_versions,
+                candidate.candidate_version,
+                candidate
+                    .required_by
+                    .as_ref()
+                    .map(format_required_by)
+                    .unwrap_or_default()
+            );
+            let changed = apply_upgrade_candidate_to_overlay(overlay, &candidate)?;
+            return Ok(VersionSelectionPlan::Continue(PlanActionResult {
+                key,
+                changed,
+                last_action: format!(
+                    "upgrade {} {} -> {}",
+                    candidate.crate_name, from_versions, candidate.candidate_version
+                ),
+            }));
         }
         return Ok(VersionSelectionPlan::Stopped(candidate));
     }
@@ -1232,24 +1444,29 @@ fn plan_or_conflict_version_selection_failure(
         );
     }
 
-    let planned_key = format!("{}-{}", failure.crate_name, selected_version);
-    if !planned_keys.insert(planned_key.clone()) {
-        takopack_bail!(
-            "resolver still reports unsatisfied {} {} after adding {}; stopping to avoid a loop",
-            failure.crate_name,
-            failure.requirement,
-            planned_key
-        );
-    }
-
-    add_crate_to_overlay(overlay, &failure.crate_name, &selected_version)?;
-    Ok(VersionSelectionPlan::Continue)
+    let key = format!(
+        "missing-compat:{}:{}:{}:{}",
+        failure.crate_name,
+        failure.requirement,
+        selected_version,
+        failure
+            .required_by
+            .as_ref()
+            .map(format_required_by)
+            .unwrap_or_default()
+    );
+    let changed = add_crate_to_overlay(overlay, &failure.crate_name, &selected_version)?;
+    Ok(VersionSelectionPlan::Continue(PlanActionResult {
+        key,
+        changed,
+        last_action: format!("add {} {}", failure.crate_name, selected_version),
+    }))
 }
 
 fn apply_upgrade_candidate_to_overlay(
     overlay: &mut OverlayRegistry,
     candidate: &UpgradeCandidate,
-) -> Result<()> {
+) -> Result<bool> {
     apply_upgrade_to_overlay(
         overlay,
         &candidate.crate_name,

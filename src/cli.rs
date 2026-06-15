@@ -284,6 +284,18 @@ pub enum CargoOpt {
         /// Automatically apply same-compat upgrade candidates inside the plan overlay
         #[arg(long)]
         allow_session_upgrades: bool,
+
+        /// Maximum plan-missing resolve iterations; 0 disables the fixed limit
+        #[arg(long, default_value_t = 2000, value_name = "N")]
+        max_plan_iterations: usize,
+
+        /// Print plan progress every N iterations; 0 disables progress output
+        #[arg(long, default_value_t = 100, value_name = "N")]
+        plan_progress_interval: usize,
+
+        /// Print the named plan session summary without resolving or modifying it
+        #[arg(long)]
+        plan_summary_only: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]
