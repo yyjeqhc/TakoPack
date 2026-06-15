@@ -226,9 +226,15 @@ fn real_main() -> Result<i32> {
                     path,
                     no_dev,
                     print_buildrequires,
+                    plan_missing,
                 } => {
                     log::info!("starting resolve check");
-                    takopack::resolve_check::run_resolve_check(&path, no_dev, print_buildrequires)
+                    takopack::resolve_check::run_resolve_check(
+                        &path,
+                        no_dev,
+                        print_buildrequires,
+                        plan_missing,
+                    )
                 }
                 CargoOpt::Track {
                     crate_name,

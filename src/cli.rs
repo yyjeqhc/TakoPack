@@ -260,6 +260,10 @@ pub enum CargoOpt {
         /// Print BuildRequires candidates from the generated Cargo.lock on success
         #[arg(long)]
         print_buildrequires: bool,
+
+        /// Temporarily fetch missing crates into an overlay registry to plan providers
+        #[arg(long)]
+        plan_missing: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

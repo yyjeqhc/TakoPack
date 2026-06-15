@@ -24,6 +24,7 @@ use anyhow::Context;
 use flate2::read::GzDecoder;
 use glob::glob;
 use regex::Regex;
+use semver::Version;
 use serde_derive::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -886,6 +887,57 @@ fn sync_crate(entry: &ProviderEntry, ruyispec_dir: &Path, registry_dir: &Path) -
     })?;
 
     Ok(())
+}
+
+/// Download a crates.io archive and materialize it as a Cargo directory-source
+/// crate under `registry_dir`.
+///
+/// This is used by resolve-check's temporary overlay planner.  It deliberately
+/// does not apply ruyispec Cargo.toml overrides.
+pub(crate) fn materialize_crate_from_crates_io(
+    crate_name: &str,
+    version: &Version,
+    registry_dir: &Path,
+) -> Result<PathBuf> {
+    fs::create_dir_all(registry_dir)
+        .with_context(|| format!("failed to create {}", registry_dir.display()))?;
+
+    let registry_path = format!("{}-{}", crate_name, version);
+    let dest = registry_dir.join(&registry_path);
+    if dest.is_dir() {
+        return Ok(dest);
+    }
+    if dest.exists() {
+        takopack_bail!(
+            "registry destination exists but is not a directory: {}",
+            dest.display()
+        );
+    }
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".takopack-plan-")
+        .tempdir_in(registry_dir)
+        .with_context(|| format!("failed to create temp dir in {}", registry_dir.display()))?;
+    let work_dir = temp_dir.path();
+
+    let url = format!(
+        "https://static.crates.io/crates/{}/{}-{}.crate",
+        crate_name, crate_name, version
+    );
+    log::info!("downloading {}", url);
+    let body = download_crate_tarball(&url)?;
+    extract_tarball(&body, work_dir, &registry_path)?;
+    write_cargo_checksum(work_dir)?;
+
+    fs::rename(work_dir, &dest).with_context(|| {
+        format!(
+            "failed to rename {} → {}",
+            work_dir.display(),
+            dest.display()
+        )
+    })?;
+
+    Ok(dest)
 }
 
 fn download_crate_tarball(url: &str) -> Result<Vec<u8>> {

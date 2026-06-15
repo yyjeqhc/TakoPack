@@ -93,6 +93,45 @@ pub fn crate_name_ver_to_dep(crate_name: &str, version: Option<&str>) -> Result<
     Dependency::parse(crate_name, version.as_deref(), source_id)
 }
 
+/// Select the highest crates.io version that satisfies a Cargo dependency
+/// requirement string.
+///
+/// Unlike `crate_name_ver_to_dep`, this treats `version_req` as dependency
+/// syntax (`"0.29"` means caret-compatible `0.29`, not exact `=0.29`).
+pub fn resolve_crates_io_version_req(crate_name: &str, version_req: &str) -> Result<Version> {
+    let context = GlobalContext::default()?;
+    let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
+    let version_req = if version_req.trim().is_empty() {
+        None
+    } else {
+        Some(version_req.trim())
+    };
+    let dep = Dependency::parse(crate_name, version_req, source_id)?;
+
+    let lock = context.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+    let mut registry =
+        PackageRegistry::new_with_source_config(&context, SourceConfigMap::new(&context)?)?;
+    registry.lock_patches();
+    let summaries = fetch_candidates(&mut registry, &dep)?;
+    drop(lock);
+
+    let pkgid = summaries
+        .into_iter()
+        .map(|summary| summary.package_id())
+        .max()
+        .ok_or_else(|| {
+            format_err!(
+                concat!(
+                    "Couldn't find any crate matching {}\n",
+                    "Try `takopack update` to update the crates.io index."
+                ),
+                show_dep(&dep)
+            )
+        })?;
+
+    Ok(pkgid.version().clone())
+}
+
 // attempt to map back a version requirement to a version that can be used as last resort
 // fallback in case all versions satisfying the requirement are yanked
 fn ver_req_to_ver(dep: &Dependency) -> Option<Version> {
