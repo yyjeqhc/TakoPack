@@ -264,6 +264,18 @@ pub enum CargoOpt {
         /// Temporarily fetch missing crates into an overlay registry to plan providers
         #[arg(long)]
         plan_missing: bool,
+
+        /// Reuse a named plan overlay registry session
+        #[arg(long, value_name = "NAME")]
+        plan_session: Option<String>,
+
+        /// Reset the named plan session before resolving
+        #[arg(long)]
+        plan_reset: bool,
+
+        /// Add a crate/version to the plan overlay before resolving, e.g. crossterm@0.29.0
+        #[arg(long, value_name = "CRATE@VERSION")]
+        plan_add: Vec<String>,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

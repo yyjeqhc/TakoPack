@@ -28,6 +28,7 @@ use cargo::ops;
 use cargo::util::GlobalContext;
 use regex::Regex;
 use semver::Version;
+use serde_derive::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::config::load_takopack_toml;
@@ -55,7 +56,10 @@ struct PreparedResolveProject {
 
 #[derive(Debug)]
 struct OverlayRegistry {
-    tempdir: tempfile::TempDir,
+    registry_dir: PathBuf,
+    _tempdir: Option<tempfile::TempDir>,
+    session_file: Option<PathBuf>,
+    state: PlanSessionState,
     stats: OverlayCopyStats,
 }
 
@@ -63,14 +67,6 @@ struct OverlayRegistry {
 struct OverlayCopyStats {
     hardlinked_files: usize,
     copied_files: usize,
-}
-
-#[derive(Debug, Clone)]
-struct PlannedCrate {
-    name: String,
-    version: Version,
-    requirement: String,
-    parent: Option<RequiredByPackage>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +86,7 @@ struct RequiredByPackage {
 struct ExistingProvider {
     provider_name: String,
     version: String,
+    compat: String,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +94,32 @@ struct VersionConflict {
     crate_name: String,
     required: String,
     existing: Vec<ExistingProvider>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedAdd {
+    crate_name: String,
+    version: Version,
+}
+
+#[derive(Debug, Clone)]
+struct VersionSelectionFailure {
+    crate_name: String,
+    requirement: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PlanSessionState {
+    schema_version: u32,
+    base_registry: String,
+    added_crates: Vec<AddedCrateRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+struct AddedCrateRecord {
+    crate_name: String,
+    version: String,
+    rpm_name: String,
 }
 
 /// Run the `resolve-check` subcommand.
@@ -107,7 +130,17 @@ pub fn run_resolve_check(
     no_dev: bool,
     print_buildrequires: bool,
     plan_missing: bool,
+    plan_session: Option<&str>,
+    plan_reset: bool,
+    plan_add: &[String],
 ) -> Result<i32> {
+    if !plan_missing && (plan_session.is_some() || plan_reset || !plan_add.is_empty()) {
+        takopack_bail!("--plan-session, --plan-reset, and --plan-add require --plan-missing");
+    }
+    if plan_reset && plan_session.is_none() {
+        takopack_bail!("--plan-reset requires --plan-session <NAME>");
+    }
+
     // 1. Determine manifest path and working directory.
     let (manifest, workdir) = resolve_manifest(path)?;
 
@@ -135,6 +168,9 @@ pub fn run_resolve_check(
     println!("  no_dev: {}", no_dev);
     if plan_missing {
         println!("  plan_missing: true");
+        if let Some(name) = plan_session {
+            println!("  plan_session: {}", name);
+        }
     }
     println!();
 
@@ -147,6 +183,9 @@ pub fn run_resolve_check(
             is_real,
             no_dev,
             print_buildrequires,
+            plan_session,
+            plan_reset,
+            plan_add,
         );
     }
 
@@ -215,26 +254,33 @@ fn run_resolve_check_plan_missing(
     is_real: bool,
     no_dev: bool,
     print_buildrequires: bool,
+    plan_session: Option<&str>,
+    plan_reset: bool,
+    plan_add: &[String],
 ) -> Result<i32> {
-    println!("Planning missing providers using temporary overlay registry...");
+    println!("Planning missing providers using overlay registry...");
     println!();
 
-    let overlay = create_overlay_registry(registry_dir)?;
+    let mut overlay = create_overlay_registry(registry_dir, plan_session, plan_reset)?;
     log::debug!(
-        "temporary overlay registry: {} (hardlinked files: {}, copied files: {})",
+        "overlay registry: {} (hardlinked files: {}, copied files: {})",
         overlay.path().display(),
         overlay.stats.hardlinked_files,
         overlay.stats.copied_files
     );
 
+    for add in plan_add {
+        let add = parse_plan_add(add)?;
+        add_crate_to_overlay(&mut overlay, &add.crate_name, &add.version)?;
+    }
+
     let prepared = prepare_project_for_plan_missing(manifest, workdir, targets, is_real, no_dev)?;
-    let mut planned = Vec::new();
     let mut planned_keys = BTreeSet::new();
 
     for _ in 0..MAX_PLAN_ITERATIONS {
         match cargo_resolve_prepared(&prepared.manifest, overlay.path(), print_buildrequires) {
             Ok(outcome) => {
-                print_added_temporary_crates(&planned);
+                print_added_overlay_crates(&overlay.state.added_crates);
                 println!();
                 println!("Result: ok");
                 print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
@@ -246,16 +292,15 @@ fn run_resolve_check_plan_missing(
                     match plan_and_materialize_missing_crate(
                         &missing,
                         &prepared.manifest,
-                        overlay.path(),
+                        &mut overlay,
                         no_dev,
                         &mut planned_keys,
                     ) {
-                        Ok(planned_crate) => {
-                            planned.push(planned_crate);
+                        Ok(()) => {
                             continue;
                         }
                         Err(plan_err) => {
-                            print_added_temporary_crates(&planned);
+                            print_added_overlay_crates(&overlay.state.added_crates);
                             println!();
                             println!("Result: failed");
                             eprintln!("{:#}", plan_err);
@@ -264,16 +309,32 @@ fn run_resolve_check_plan_missing(
                     }
                 }
 
-                if let Some(conflict) = parse_version_conflict_error(&error_text, overlay.path()) {
-                    print_added_temporary_crates(&planned);
-                    println!();
-                    println!("Result: failed");
-                    println!();
-                    print_version_conflicts(&[conflict]);
-                    return Ok(1);
+                if let Some(failure) = parse_version_selection_failure(&error_text) {
+                    match plan_or_conflict_version_selection_failure(
+                        &failure,
+                        &mut overlay,
+                        &mut planned_keys,
+                    ) {
+                        Ok(None) => continue,
+                        Ok(Some(conflict)) => {
+                            print_added_overlay_crates(&overlay.state.added_crates);
+                            println!();
+                            println!("Result: failed");
+                            println!();
+                            print_version_conflicts(&[conflict]);
+                            return Ok(1);
+                        }
+                        Err(plan_err) => {
+                            print_added_overlay_crates(&overlay.state.added_crates);
+                            println!();
+                            println!("Result: failed");
+                            eprintln!("{:#}", plan_err);
+                            return Ok(1);
+                        }
+                    }
                 }
 
-                print_added_temporary_crates(&planned);
+                print_added_overlay_crates(&overlay.state.added_crates);
                 println!();
                 println!("Result: failed");
                 println!();
@@ -284,7 +345,7 @@ fn run_resolve_check_plan_missing(
         }
     }
 
-    print_added_temporary_crates(&planned);
+    print_added_overlay_crates(&overlay.state.added_crates);
     println!();
     println!("Result: failed");
     eprintln!(
@@ -296,7 +357,17 @@ fn run_resolve_check_plan_missing(
 
 impl OverlayRegistry {
     fn path(&self) -> &Path {
-        self.tempdir.path()
+        &self.registry_dir
+    }
+}
+
+impl PlanSessionState {
+    fn new(base_registry: &Path) -> Self {
+        Self {
+            schema_version: 1,
+            base_registry: base_registry.display().to_string(),
+            added_crates: Vec::new(),
+        }
     }
 }
 
@@ -377,14 +448,193 @@ fn cargo_resolve_prepared(
     Ok(ResolveOutcome { buildrequires })
 }
 
-fn create_overlay_registry(registry_dir: &Path) -> Result<OverlayRegistry> {
+fn create_overlay_registry(
+    registry_dir: &Path,
+    plan_session: Option<&str>,
+    plan_reset: bool,
+) -> Result<OverlayRegistry> {
+    if let Some(name) = plan_session {
+        return create_session_overlay_registry(registry_dir, name, plan_reset);
+    }
+
     let tempdir = tempfile::Builder::new()
         .prefix("takopack-overlay-registry-")
         .tempdir()
         .context("failed to create temporary overlay registry")?;
+    let registry_path = tempdir.path().to_path_buf();
     let mut stats = OverlayCopyStats::default();
-    copy_registry_tree_with_hardlinks(registry_dir, tempdir.path(), &mut stats)?;
-    Ok(OverlayRegistry { tempdir, stats })
+    copy_registry_tree_with_hardlinks(registry_dir, &registry_path, &mut stats)?;
+    Ok(OverlayRegistry {
+        registry_dir: registry_path,
+        _tempdir: Some(tempdir),
+        session_file: None,
+        state: PlanSessionState::new(registry_dir),
+        stats,
+    })
+}
+
+fn create_session_overlay_registry(
+    registry_dir: &Path,
+    session_name: &str,
+    plan_reset: bool,
+) -> Result<OverlayRegistry> {
+    validate_plan_session_name(session_name)?;
+    let session_root = plan_session_root()?.join(session_name);
+    let registry_path = session_root.join("registry");
+    let session_file = session_root.join("session.json");
+    let mut stats = OverlayCopyStats::default();
+
+    if plan_reset && session_root.exists() {
+        fs::remove_dir_all(&session_root)
+            .with_context(|| format!("failed to reset plan session {}", session_root.display()))?;
+    }
+
+    let state = if session_root.exists() {
+        let state = load_plan_session_state(&session_file)?;
+        if state.base_registry != registry_dir.display().to_string() {
+            takopack_bail!(
+                "plan session '{}' was created from {}, but current registry is {}; use --plan-reset to recreate it",
+                session_name,
+                state.base_registry,
+                registry_dir.display()
+            );
+        }
+        state
+    } else {
+        fs::create_dir_all(&registry_path)
+            .with_context(|| format!("failed to create {}", registry_path.display()))?;
+        copy_registry_tree_with_hardlinks(registry_dir, &registry_path, &mut stats)?;
+        let state = PlanSessionState::new(registry_dir);
+        save_plan_session_state(&session_file, &state)?;
+        state
+    };
+
+    Ok(OverlayRegistry {
+        registry_dir: registry_path,
+        _tempdir: None,
+        session_file: Some(session_file),
+        state,
+        stats,
+    })
+}
+
+fn plan_session_root() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot determine XDG_DATA_HOME / home directory for plan sessions")
+    })?;
+    Ok(data_dir.join("takopack").join("plan-sessions"))
+}
+
+fn validate_plan_session_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        takopack_bail!(
+            "invalid plan session name '{}'; use ASCII letters, digits, '.', '_' or '-'",
+            name
+        );
+    }
+    Ok(())
+}
+
+fn load_plan_session_state(path: &Path) -> Result<PlanSessionState> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let state: PlanSessionState = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if state.schema_version != 1 {
+        takopack_bail!(
+            "unsupported plan session schema_version {} in {}",
+            state.schema_version,
+            path.display()
+        );
+    }
+    Ok(state)
+}
+
+fn save_plan_session_state(path: &Path, state: &PlanSessionState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state)?;
+    fs::write(path, json.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn parse_plan_add(value: &str) -> Result<PlannedAdd> {
+    let Some((crate_name, version)) = value.rsplit_once('@') else {
+        takopack_bail!("invalid --plan-add '{}'; expected CRATE@VERSION", value);
+    };
+    if crate_name.is_empty() || version.is_empty() {
+        takopack_bail!("invalid --plan-add '{}'; expected CRATE@VERSION", value);
+    }
+    let version = Version::parse(version)
+        .with_context(|| format!("invalid version in --plan-add '{}'", value))?;
+    Ok(PlannedAdd {
+        crate_name: crate_name.to_string(),
+        version,
+    })
+}
+
+fn add_crate_to_overlay(
+    overlay: &mut OverlayRegistry,
+    crate_name: &str,
+    version: &Version,
+) -> Result<()> {
+    let registry_path = format!("{}-{}", crate_name, version);
+    let existed = overlay.path().join(&registry_path).is_dir();
+    materialize_crate_from_crates_io(crate_name, version, overlay.path()).with_context(|| {
+        format!(
+            "failed to materialize {} {} in overlay registry",
+            crate_name, version
+        )
+    })?;
+
+    if !existed {
+        record_added_crate(overlay, crate_name, version)?;
+    }
+
+    Ok(())
+}
+
+fn record_added_crate(
+    overlay: &mut OverlayRegistry,
+    crate_name: &str,
+    version: &Version,
+) -> Result<()> {
+    let names = rust_crate_output_names(crate_name, version);
+    let version = version.to_string();
+    if overlay
+        .state
+        .added_crates
+        .iter()
+        .any(|entry| entry.crate_name == crate_name && entry.version == version)
+    {
+        return Ok(());
+    }
+
+    overlay.state.added_crates.push(AddedCrateRecord {
+        crate_name: crate_name.to_string(),
+        version,
+        rpm_name: names.directory,
+    });
+    overlay.state.added_crates.sort_by(|a, b| {
+        a.crate_name
+            .cmp(&b.crate_name)
+            .then_with(|| a.version.cmp(&b.version))
+    });
+
+    if let Some(path) = overlay.session_file.clone() {
+        save_plan_session_state(&path, &overlay.state)?;
+    }
+
+    Ok(())
 }
 
 fn copy_registry_tree_with_hardlinks(
@@ -480,17 +730,17 @@ fn hardlink_or_copy_file(src: &Path, dest: &Path, stats: &mut OverlayCopyStats) 
 fn plan_and_materialize_missing_crate(
     missing: &MissingPackageError,
     root_manifest: &Path,
-    overlay_registry: &Path,
+    overlay: &mut OverlayRegistry,
     no_dev: bool,
     planned_keys: &mut BTreeSet<String>,
-) -> Result<PlannedCrate> {
+) -> Result<()> {
     let required_by = missing.required_by.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "missing {}, but failed to identify the package that requires it",
             missing.crate_name
         )
     })?;
-    let parent_manifest = locate_parent_manifest(&required_by, root_manifest, overlay_registry)
+    let parent_manifest = locate_parent_manifest(&required_by, root_manifest, overlay.path())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "missing {}, but failed to locate parent manifest for {} {}",
@@ -523,44 +773,25 @@ fn plan_and_materialize_missing_crate(
         );
     }
 
-    materialize_crate_from_crates_io(&missing.crate_name, &selected_version, overlay_registry)
-        .with_context(|| {
-            format!(
-                "failed to materialize {} {} in temporary overlay registry",
-                missing.crate_name, selected_version
-            )
-        })?;
-
-    Ok(PlannedCrate {
-        name: missing.crate_name.clone(),
-        version: selected_version,
-        requirement,
-        parent: Some(required_by),
-    })
+    add_crate_to_overlay(overlay, &missing.crate_name, &selected_version)?;
+    Ok(())
 }
 
-fn print_added_temporary_crates(planned: &[PlannedCrate]) {
-    println!("Added temporary crates:");
-    if planned.is_empty() {
+fn print_added_overlay_crates(added_crates: &[AddedCrateRecord]) {
+    println!("Added temporary/session crates:");
+    if added_crates.is_empty() {
         println!("  (none)");
         return;
     }
 
-    for planned_crate in planned {
-        let names = rust_crate_output_names(&planned_crate.name, &planned_crate.version);
+    for added in added_crates {
         println!(
             "  {} {} -> {}",
-            planned_crate.name, planned_crate.version, names.directory
+            added.crate_name, added.version, added.rpm_name
         );
-        if let Some(parent) = &planned_crate.parent {
-            println!(
-                "    required by: {} {} wants {}",
-                parent.name, parent.version, planned_crate.requirement
-            );
-        }
         println!(
             "    command: takopack cargo pkg {} {} --directory /tmp/providers/{}",
-            planned_crate.name, planned_crate.version, names.directory
+            added.crate_name, added.version, added.rpm_name
         );
     }
 }
@@ -585,12 +816,24 @@ fn print_version_conflicts(conflicts: &[VersionConflict]) {
 }
 
 fn parse_missing_package_error(error_text: &str) -> Option<MissingPackageError> {
-    let missing_re = Regex::new(r#"no matching package named `([^`]+)` found"#).ok()?;
-    let crate_name = missing_re
-        .captures(error_text)?
-        .get(1)?
-        .as_str()
-        .to_string();
+    let crate_name = Regex::new(r#"no matching package named `([^`]+)` found"#)
+        .ok()
+        .and_then(|regex| {
+            regex
+                .captures(error_text)
+                .and_then(|captures| captures.get(1))
+                .map(|capture| capture.as_str().to_string())
+        })
+        .or_else(|| {
+            Regex::new(r#"searched package name:\s*`([^`]+)`"#)
+                .ok()
+                .and_then(|regex| {
+                    regex
+                        .captures(error_text)
+                        .and_then(|captures| captures.get(1))
+                        .map(|capture| capture.as_str().to_string())
+                })
+        })?;
 
     let required_by_re = Regex::new(r#"required by package `([^`]+)`"#).ok()?;
     let required_by = required_by_re
@@ -615,10 +858,7 @@ fn parse_required_by_package(package: &str) -> Option<RequiredByPackage> {
     })
 }
 
-fn parse_version_conflict_error(
-    error_text: &str,
-    overlay_registry: &Path,
-) -> Option<VersionConflict> {
+fn parse_version_selection_failure(error_text: &str) -> Option<VersionSelectionFailure> {
     if !error_text.contains("failed to select a version for the requirement")
         && !error_text.contains("candidate versions found which didn't match")
     {
@@ -631,14 +871,60 @@ fn parse_version_conflict_error(
         .and_then(|captures| captures.get(1))
         .map(|capture| capture.as_str())?;
     let crate_name = parse_requirement_crate_name(req_line)?;
-    let required = parse_requirement_text(req_line).unwrap_or_else(|| req_line.to_string());
-    let existing = existing_providers_for_crate(overlay_registry, &crate_name);
-
-    Some(VersionConflict {
+    let requirement = parse_requirement_text(req_line).unwrap_or_else(|| req_line.to_string());
+    Some(VersionSelectionFailure {
         crate_name,
-        required,
-        existing,
+        requirement,
     })
+}
+
+fn plan_or_conflict_version_selection_failure(
+    failure: &VersionSelectionFailure,
+    overlay: &mut OverlayRegistry,
+    planned_keys: &mut BTreeSet<String>,
+) -> Result<Option<VersionConflict>> {
+    let selected_version = resolve_crates_io_version_req(&failure.crate_name, &failure.requirement)
+        .with_context(|| {
+            format!(
+                "failed to select crates.io version for {} {}",
+                failure.crate_name, failure.requirement
+            )
+        })?;
+    let same_compat =
+        existing_same_compat_providers(overlay.path(), &failure.crate_name, &selected_version);
+
+    if !same_compat.is_empty() {
+        return Ok(Some(VersionConflict {
+            crate_name: failure.crate_name.clone(),
+            required: failure.requirement.clone(),
+            existing: same_compat,
+        }));
+    }
+
+    let planned_key = format!("{}-{}", failure.crate_name, selected_version);
+    if !planned_keys.insert(planned_key.clone()) {
+        takopack_bail!(
+            "resolver still reports unsatisfied {} {} after adding {}; stopping to avoid a loop",
+            failure.crate_name,
+            failure.requirement,
+            planned_key
+        );
+    }
+
+    add_crate_to_overlay(overlay, &failure.crate_name, &selected_version)?;
+    Ok(None)
+}
+
+fn existing_same_compat_providers(
+    registry_dir: &Path,
+    crate_name: &str,
+    selected_version: &Version,
+) -> Vec<ExistingProvider> {
+    let wanted_compat = calculate_compat_version(selected_version);
+    existing_providers_for_crate(registry_dir, crate_name)
+        .into_iter()
+        .filter(|provider| provider.compat == wanted_compat)
+        .collect()
 }
 
 fn parse_requirement_crate_name(req_line: &str) -> Option<String> {
@@ -731,12 +1017,22 @@ fn existing_providers_for_crate(registry_dir: &Path, crate_name: &str) -> Vec<Ex
         if name != crate_name {
             continue;
         }
-        let provider_name = Version::parse(&version)
-            .map(|version| rust_crate_output_names(crate_name, &version).directory)
-            .unwrap_or_else(|_| format!("rust-{}-{}", crate_name.replace('_', "-"), version));
+        let (provider_name, compat) = Version::parse(&version)
+            .map(|version| {
+                let names = rust_crate_output_names(crate_name, &version);
+                let compat = calculate_compat_version(&version);
+                (names.directory, compat)
+            })
+            .unwrap_or_else(|_| {
+                (
+                    format!("rust-{}-{}", crate_name.replace('_', "-"), version),
+                    version.clone(),
+                )
+            });
         providers.push(ExistingProvider {
             provider_name,
             version,
+            compat,
         });
     }
 
@@ -1718,6 +2014,20 @@ Caused by:
     }
 
     #[test]
+    fn test_parse_missing_package_error_searched_package_name_format() {
+        let error = r#"cargo resolve failed: no matching package found
+searched package name: `twox-hash`
+perhaps you meant:      gix-hash
+location searched: directory source `/tmp/session/registry`
+required by package `yazi-cli v26.5.6 (/tmp/project)`
+"#;
+
+        let missing = parse_missing_package_error(error).unwrap();
+        assert_eq!(missing.crate_name, "twox-hash");
+        assert_eq!(missing.required_by.unwrap().name, "yazi-cli");
+    }
+
+    #[test]
     fn test_infer_dependency_requirement_common_sections() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("Cargo.toml");
@@ -1770,7 +2080,7 @@ unix-only = { version = "0.7" }
     }
 
     #[test]
-    fn test_parse_version_conflict_error_with_existing_provider() {
+    fn test_version_selection_failure_same_compat_is_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let provider = tmp.path().join("foo-1.5.0");
         fs::create_dir_all(&provider).unwrap();
@@ -1790,12 +2100,39 @@ Caused by:
   candidate versions found which didn't match: 1.5.0
 "#;
 
-        let conflict = parse_version_conflict_error(error, tmp.path()).unwrap();
-        assert_eq!(conflict.crate_name, "foo");
-        assert_eq!(conflict.required, ">= 1.8");
-        assert_eq!(conflict.existing.len(), 1);
-        assert_eq!(conflict.existing[0].provider_name, "rust-foo-1");
-        assert_eq!(conflict.existing[0].version, "1.5.0");
+        let failure = parse_version_selection_failure(error).unwrap();
+        assert_eq!(failure.crate_name, "foo");
+        assert_eq!(failure.requirement, ">= 1.8");
+
+        let same_compat =
+            existing_same_compat_providers(tmp.path(), "foo", &Version::parse("1.8.0").unwrap());
+        assert_eq!(same_compat.len(), 1);
+        assert_eq!(same_compat[0].provider_name, "rust-foo-1");
+        assert_eq!(same_compat[0].version, "1.5.0");
+    }
+
+    #[test]
+    fn test_version_selection_failure_different_compat_is_missing_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        for version in ["0.5.2", "0.9.12+spec-1.1.0"] {
+            let provider = tmp.path().join(format!("toml-{}", version));
+            fs::create_dir_all(&provider).unwrap();
+            fs::write(
+                provider.join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "toml"
+version = "{}"
+"#,
+                    version
+                ),
+            )
+            .unwrap();
+        }
+
+        let same_compat =
+            existing_same_compat_providers(tmp.path(), "toml", &Version::parse("1.1.2").unwrap());
+        assert!(same_compat.is_empty());
     }
 
     // -- BuildRequires tests --

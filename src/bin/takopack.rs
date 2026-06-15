@@ -227,6 +227,9 @@ fn real_main() -> Result<i32> {
                     no_dev,
                     print_buildrequires,
                     plan_missing,
+                    plan_session,
+                    plan_reset,
+                    plan_add,
                 } => {
                     log::info!("starting resolve check");
                     takopack::resolve_check::run_resolve_check(
@@ -234,6 +237,9 @@ fn real_main() -> Result<i32> {
                         no_dev,
                         print_buildrequires,
                         plan_missing,
+                        plan_session.as_deref(),
+                        plan_reset,
+                        &plan_add,
                     )
                 }
                 CargoOpt::Track {
