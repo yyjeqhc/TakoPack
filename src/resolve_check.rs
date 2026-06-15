@@ -607,9 +607,20 @@ fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
             .with_context(|| format!("failed to parse lockfile version {}", version))?;
         let compat = calculate_compat_version(&parsed_version);
         let capability_name = name.replace('_', "-");
+        let clean_version = format!(
+            "{}.{}.{}{}",
+            parsed_version.major,
+            parsed_version.minor,
+            parsed_version.patch,
+            if parsed_version.pre.is_empty() {
+                String::new()
+            } else {
+                format!("-{}", parsed_version.pre)
+            }
+        );
         buildrequires.insert(format!(
             "BuildRequires: crate({}-{}) >= {}",
-            capability_name, compat, version
+            capability_name, compat, clean_version
         ));
     }
 
