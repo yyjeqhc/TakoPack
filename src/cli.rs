@@ -276,6 +276,14 @@ pub enum CargoOpt {
         /// Add a crate/version to the plan overlay before resolving, e.g. crossterm@0.29.0
         #[arg(long, value_name = "CRATE@VERSION")]
         plan_add: Vec<String>,
+
+        /// Try a same-compat provider upgrade in the plan overlay, e.g. serde_spanned@1.1.1
+        #[arg(long, value_name = "CRATE@VERSION")]
+        plan_upgrade: Vec<String>,
+
+        /// Automatically apply same-compat upgrade candidates inside the plan overlay
+        #[arg(long)]
+        allow_session_upgrades: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

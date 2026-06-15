@@ -57,6 +57,7 @@ struct PreparedResolveProject {
 #[derive(Debug)]
 struct OverlayRegistry {
     registry_dir: PathBuf,
+    superseded_dir: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
     session_file: Option<PathBuf>,
     state: PlanSessionState,
@@ -90,14 +91,13 @@ struct ExistingProvider {
 }
 
 #[derive(Debug, Clone)]
-struct VersionConflict {
+struct PlannedAdd {
     crate_name: String,
-    required: String,
-    existing: Vec<ExistingProvider>,
+    version: Version,
 }
 
 #[derive(Debug, Clone)]
-struct PlannedAdd {
+struct PlannedUpgrade {
     crate_name: String,
     version: Version,
 }
@@ -106,13 +106,33 @@ struct PlannedAdd {
 struct VersionSelectionFailure {
     crate_name: String,
     requirement: String,
+    required_by: Option<RequiredByPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct UpgradeCandidate {
+    crate_name: String,
+    requirement: String,
+    required_by: Option<RequiredByPackage>,
+    candidate_version: Version,
+    candidate_provider_name: String,
+    existing: Vec<ExistingProvider>,
+}
+
+#[derive(Debug, Clone)]
+enum VersionSelectionPlan {
+    Continue,
+    Stopped(UpgradeCandidate),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PlanSessionState {
     schema_version: u32,
     base_registry: String,
+    #[serde(default)]
     added_crates: Vec<AddedCrateRecord>,
+    #[serde(default)]
+    upgraded_crates: Vec<UpgradedCrateRecord>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
@@ -120,6 +140,16 @@ struct AddedCrateRecord {
     crate_name: String,
     version: String,
     rpm_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+struct UpgradedCrateRecord {
+    crate_name: String,
+    from_version: String,
+    to_version: String,
+    rpm_name: String,
+    required_by: String,
+    requirement: String,
 }
 
 /// Run the `resolve-check` subcommand.
@@ -133,9 +163,19 @@ pub fn run_resolve_check(
     plan_session: Option<&str>,
     plan_reset: bool,
     plan_add: &[String],
+    plan_upgrade: &[String],
+    allow_session_upgrades: bool,
 ) -> Result<i32> {
-    if !plan_missing && (plan_session.is_some() || plan_reset || !plan_add.is_empty()) {
-        takopack_bail!("--plan-session, --plan-reset, and --plan-add require --plan-missing");
+    if !plan_missing
+        && (plan_session.is_some()
+            || plan_reset
+            || !plan_add.is_empty()
+            || !plan_upgrade.is_empty()
+            || allow_session_upgrades)
+    {
+        takopack_bail!(
+            "--plan-session, --plan-reset, --plan-add, --plan-upgrade, and --allow-session-upgrades require --plan-missing"
+        );
     }
     if plan_reset && plan_session.is_none() {
         takopack_bail!("--plan-reset requires --plan-session <NAME>");
@@ -186,6 +226,8 @@ pub fn run_resolve_check(
             plan_session,
             plan_reset,
             plan_add,
+            plan_upgrade,
+            allow_session_upgrades,
         );
     }
 
@@ -257,6 +299,8 @@ fn run_resolve_check_plan_missing(
     plan_session: Option<&str>,
     plan_reset: bool,
     plan_add: &[String],
+    plan_upgrade: &[String],
+    allow_session_upgrades: bool,
 ) -> Result<i32> {
     println!("Planning missing providers using overlay registry...");
     println!();
@@ -273,6 +317,16 @@ fn run_resolve_check_plan_missing(
         let add = parse_plan_add(add)?;
         add_crate_to_overlay(&mut overlay, &add.crate_name, &add.version)?;
     }
+    for upgrade in plan_upgrade {
+        let upgrade = parse_plan_upgrade(upgrade)?;
+        apply_upgrade_to_overlay(
+            &mut overlay,
+            &upgrade.crate_name,
+            &upgrade.version,
+            "",
+            None,
+        )?;
+    }
 
     let prepared = prepare_project_for_plan_missing(manifest, workdir, targets, is_real, no_dev)?;
     let mut planned_keys = BTreeSet::new();
@@ -280,7 +334,7 @@ fn run_resolve_check_plan_missing(
     for _ in 0..MAX_PLAN_ITERATIONS {
         match cargo_resolve_prepared(&prepared.manifest, overlay.path(), print_buildrequires) {
             Ok(outcome) => {
-                print_added_overlay_crates(&overlay.state.added_crates);
+                print_plan_state(&overlay.state);
                 println!();
                 println!("Result: ok");
                 print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
@@ -300,7 +354,7 @@ fn run_resolve_check_plan_missing(
                             continue;
                         }
                         Err(plan_err) => {
-                            print_added_overlay_crates(&overlay.state.added_crates);
+                            print_plan_state(&overlay.state);
                             println!();
                             println!("Result: failed");
                             eprintln!("{:#}", plan_err);
@@ -314,18 +368,27 @@ fn run_resolve_check_plan_missing(
                         &failure,
                         &mut overlay,
                         &mut planned_keys,
+                        allow_session_upgrades,
                     ) {
-                        Ok(None) => continue,
-                        Ok(Some(conflict)) => {
-                            print_added_overlay_crates(&overlay.state.added_crates);
+                        Ok(VersionSelectionPlan::Continue) => continue,
+                        Ok(VersionSelectionPlan::Stopped(candidate)) => {
+                            print_plan_state(&overlay.state);
                             println!();
-                            println!("Result: failed");
+                            println!("Result: stopped");
                             println!();
-                            print_version_conflicts(&[conflict]);
+                            print_upgrade_candidates(&[candidate.clone()]);
+                            println!();
+                            print_continue_with_upgrade_command(
+                                manifest,
+                                no_dev,
+                                print_buildrequires,
+                                plan_session,
+                                &candidate,
+                            );
                             return Ok(1);
                         }
                         Err(plan_err) => {
-                            print_added_overlay_crates(&overlay.state.added_crates);
+                            print_plan_state(&overlay.state);
                             println!();
                             println!("Result: failed");
                             eprintln!("{:#}", plan_err);
@@ -334,7 +397,7 @@ fn run_resolve_check_plan_missing(
                     }
                 }
 
-                print_added_overlay_crates(&overlay.state.added_crates);
+                print_plan_state(&overlay.state);
                 println!();
                 println!("Result: failed");
                 println!();
@@ -345,7 +408,7 @@ fn run_resolve_check_plan_missing(
         }
     }
 
-    print_added_overlay_crates(&overlay.state.added_crates);
+    print_plan_state(&overlay.state);
     println!();
     println!("Result: failed");
     eprintln!(
@@ -367,6 +430,7 @@ impl PlanSessionState {
             schema_version: 1,
             base_registry: base_registry.display().to_string(),
             added_crates: Vec::new(),
+            upgraded_crates: Vec::new(),
         }
     }
 }
@@ -461,11 +525,15 @@ fn create_overlay_registry(
         .prefix("takopack-overlay-registry-")
         .tempdir()
         .context("failed to create temporary overlay registry")?;
-    let registry_path = tempdir.path().to_path_buf();
+    let registry_path = tempdir.path().join("registry");
+    let superseded_path = tempdir.path().join("superseded");
+    fs::create_dir_all(&registry_path)
+        .with_context(|| format!("failed to create {}", registry_path.display()))?;
     let mut stats = OverlayCopyStats::default();
     copy_registry_tree_with_hardlinks(registry_dir, &registry_path, &mut stats)?;
     Ok(OverlayRegistry {
         registry_dir: registry_path,
+        superseded_dir: superseded_path,
         _tempdir: Some(tempdir),
         session_file: None,
         state: PlanSessionState::new(registry_dir),
@@ -481,6 +549,7 @@ fn create_session_overlay_registry(
     validate_plan_session_name(session_name)?;
     let session_root = plan_session_root()?.join(session_name);
     let registry_path = session_root.join("registry");
+    let superseded_path = session_root.join("superseded");
     let session_file = session_root.join("session.json");
     let mut stats = OverlayCopyStats::default();
 
@@ -511,6 +580,7 @@ fn create_session_overlay_registry(
 
     Ok(OverlayRegistry {
         registry_dir: registry_path,
+        superseded_dir: superseded_path,
         _tempdir: None,
         session_file: Some(session_file),
         state,
@@ -582,6 +652,21 @@ fn parse_plan_add(value: &str) -> Result<PlannedAdd> {
     })
 }
 
+fn parse_plan_upgrade(value: &str) -> Result<PlannedUpgrade> {
+    let Some((crate_name, version)) = value.rsplit_once('@') else {
+        takopack_bail!("invalid --plan-upgrade '{}'; expected CRATE@VERSION", value);
+    };
+    if crate_name.is_empty() || version.is_empty() {
+        takopack_bail!("invalid --plan-upgrade '{}'; expected CRATE@VERSION", value);
+    }
+    let version = Version::parse(version)
+        .with_context(|| format!("invalid version in --plan-upgrade '{}'", value))?;
+    Ok(PlannedUpgrade {
+        crate_name: crate_name.to_string(),
+        version,
+    })
+}
+
 fn add_crate_to_overlay(
     overlay: &mut OverlayRegistry,
     crate_name: &str,
@@ -628,6 +713,134 @@ fn record_added_crate(
         a.crate_name
             .cmp(&b.crate_name)
             .then_with(|| a.version.cmp(&b.version))
+    });
+
+    if let Some(path) = overlay.session_file.clone() {
+        save_plan_session_state(&path, &overlay.state)?;
+    }
+
+    Ok(())
+}
+
+fn apply_upgrade_to_overlay(
+    overlay: &mut OverlayRegistry,
+    crate_name: &str,
+    to_version: &Version,
+    requirement: &str,
+    required_by: Option<&RequiredByPackage>,
+) -> Result<()> {
+    let to_version_string = to_version.to_string();
+    let already_recorded = overlay
+        .state
+        .upgraded_crates
+        .iter()
+        .any(|entry| entry.crate_name == crate_name && entry.to_version == to_version_string);
+    let existing = existing_same_compat_providers(overlay.path(), crate_name, to_version);
+    let old_existing: Vec<ExistingProvider> = existing
+        .into_iter()
+        .filter(|provider| provider.version != to_version_string)
+        .collect();
+
+    if old_existing.is_empty() && already_recorded {
+        return Ok(());
+    }
+    if old_existing.is_empty()
+        && !overlay
+            .path()
+            .join(format!("{}-{}", crate_name, to_version))
+            .is_dir()
+    {
+        takopack_bail!(
+            "no same-compat provider found for {}; use --plan-add for new compat providers",
+            crate_name
+        );
+    }
+
+    materialize_crate_from_crates_io(crate_name, to_version, overlay.path()).with_context(
+        || {
+            format!(
+                "failed to materialize upgrade candidate {} {} in overlay registry",
+                crate_name, to_version
+            )
+        },
+    )?;
+
+    for provider in old_existing {
+        supersede_provider_dir(overlay, crate_name, &provider.version)?;
+        record_upgraded_crate(
+            overlay,
+            crate_name,
+            &provider.version,
+            to_version,
+            &provider.provider_name,
+            requirement,
+            required_by,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn supersede_provider_dir(
+    overlay: &OverlayRegistry,
+    crate_name: &str,
+    version: &str,
+) -> Result<()> {
+    let dir_name = format!("{}-{}", crate_name, version);
+    let src = overlay.path().join(&dir_name);
+    if !src.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&overlay.superseded_dir)
+        .with_context(|| format!("failed to create {}", overlay.superseded_dir.display()))?;
+    let dest = overlay.superseded_dir.join(&dir_name);
+    if dest.exists() {
+        fs::remove_dir_all(&dest)
+            .with_context(|| format!("failed to remove old superseded {}", dest.display()))?;
+    }
+    fs::rename(&src, &dest).with_context(|| {
+        format!(
+            "failed to move superseded provider {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn record_upgraded_crate(
+    overlay: &mut OverlayRegistry,
+    crate_name: &str,
+    from_version: &str,
+    to_version: &Version,
+    rpm_name: &str,
+    requirement: &str,
+    required_by: Option<&RequiredByPackage>,
+) -> Result<()> {
+    let to_version = to_version.to_string();
+    if overlay.state.upgraded_crates.iter().any(|entry| {
+        entry.crate_name == crate_name
+            && entry.from_version == from_version
+            && entry.to_version == to_version
+    }) {
+        return Ok(());
+    }
+
+    overlay.state.upgraded_crates.push(UpgradedCrateRecord {
+        crate_name: crate_name.to_string(),
+        from_version: from_version.to_string(),
+        to_version,
+        rpm_name: rpm_name.to_string(),
+        required_by: required_by.map(format_required_by).unwrap_or_default(),
+        requirement: requirement.to_string(),
+    });
+    overlay.state.upgraded_crates.sort_by(|a, b| {
+        a.crate_name
+            .cmp(&b.crate_name)
+            .then_with(|| a.from_version.cmp(&b.from_version))
+            .then_with(|| a.to_version.cmp(&b.to_version))
     });
 
     if let Some(path) = overlay.session_file.clone() {
@@ -777,42 +990,107 @@ fn plan_and_materialize_missing_crate(
     Ok(())
 }
 
-fn print_added_overlay_crates(added_crates: &[AddedCrateRecord]) {
-    println!("Added temporary/session crates:");
-    if added_crates.is_empty() {
+fn print_plan_state(state: &PlanSessionState) {
+    println!("New provider candidates:");
+    if state.added_crates.is_empty() {
         println!("  (none)");
-        return;
+    } else {
+        for added in &state.added_crates {
+            println!(
+                "  {} {} -> {}",
+                added.crate_name, added.version, added.rpm_name
+            );
+            println!(
+                "    command: takopack cargo pkg {} {} --directory /tmp/providers/{}",
+                added.crate_name, added.version, added.rpm_name
+            );
+        }
     }
 
-    for added in added_crates {
-        println!(
-            "  {} {} -> {}",
-            added.crate_name, added.version, added.rpm_name
-        );
-        println!(
-            "    command: takopack cargo pkg {} {} --directory /tmp/providers/{}",
-            added.crate_name, added.version, added.rpm_name
-        );
+    println!();
+    println!("Upgrade candidates:");
+    if state.upgraded_crates.is_empty() {
+        println!("  (none)");
+    } else {
+        for upgraded in &state.upgraded_crates {
+            println!(
+                "  {} {} -> {} -> {}",
+                upgraded.crate_name, upgraded.from_version, upgraded.to_version, upgraded.rpm_name
+            );
+            if !upgraded.requirement.is_empty() {
+                println!("    required: {}", upgraded.requirement);
+            }
+            if !upgraded.required_by.is_empty() {
+                println!("    required by: {}", upgraded.required_by);
+            }
+        }
     }
 }
 
-fn print_version_conflicts(conflicts: &[VersionConflict]) {
-    println!("Version conflicts:");
-    for conflict in conflicts {
-        println!("  {}", conflict.crate_name);
-        println!("    required: {}", conflict.required);
-        if conflict.existing.is_empty() {
-            println!("    existing provider: (none found in overlay)");
-        } else {
-            for existing in &conflict.existing {
-                println!(
-                    "    existing provider: {} {}",
-                    existing.provider_name, existing.version
-                );
-            }
+fn print_upgrade_candidates(candidates: &[UpgradeCandidate]) {
+    println!("Upgrade candidates:");
+    for candidate in candidates {
+        println!("  {}", candidate.crate_name);
+        for existing in &candidate.existing {
+            println!(
+                "    existing: {} {}",
+                existing.provider_name, existing.version
+            );
         }
-        println!("    action: review provider upgrade or add exact-version provider");
+        println!("    required: {}", candidate.requirement);
+        if let Some(required_by) = &candidate.required_by {
+            println!("    required by: {}", format_required_by(required_by));
+        }
+        println!("    candidate: {}", candidate.candidate_version);
+        println!(
+            "    candidate provider: {}",
+            candidate.candidate_provider_name
+        );
+        println!("    action: upgrade existing provider");
     }
+}
+
+fn print_continue_with_upgrade_command(
+    manifest: &Path,
+    no_dev: bool,
+    print_buildrequires: bool,
+    plan_session: Option<&str>,
+    candidate: &UpgradeCandidate,
+) {
+    println!("Continue with:");
+    let mut parts = vec![
+        "takopack".to_string(),
+        "cargo".to_string(),
+        "resolve-check".to_string(),
+        shell_quote(&manifest.display().to_string()),
+    ];
+    if no_dev {
+        parts.push("--no-dev".to_string());
+    }
+    parts.push("--plan-missing".to_string());
+    if let Some(session) = plan_session {
+        parts.push("--plan-session".to_string());
+        parts.push(shell_quote(session));
+    }
+    if print_buildrequires {
+        parts.push("--print-buildrequires".to_string());
+    }
+    parts.push("--plan-upgrade".to_string());
+    parts.push(format!(
+        "{}@{}",
+        candidate.crate_name, candidate.candidate_version
+    ));
+    println!("  {}", parts.join(" "));
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn parse_missing_package_error(error_text: &str) -> Option<MissingPackageError> {
@@ -858,6 +1136,27 @@ fn parse_required_by_package(package: &str) -> Option<RequiredByPackage> {
     })
 }
 
+fn format_required_by(required_by: &RequiredByPackage) -> String {
+    let version = Version::parse(&required_by.version)
+        .map(|version| clean_semver_without_build(&version))
+        .unwrap_or_else(|_| required_by.version.clone());
+    format!("{} {}", required_by.name, version)
+}
+
+fn clean_semver_without_build(version: &Version) -> String {
+    format!(
+        "{}.{}.{}{}",
+        version.major,
+        version.minor,
+        version.patch,
+        if version.pre.is_empty() {
+            String::new()
+        } else {
+            format!("-{}", version.pre)
+        }
+    )
+}
+
 fn parse_version_selection_failure(error_text: &str) -> Option<VersionSelectionFailure> {
     if !error_text.contains("failed to select a version for the requirement")
         && !error_text.contains("candidate versions found which didn't match")
@@ -872,9 +1171,15 @@ fn parse_version_selection_failure(error_text: &str) -> Option<VersionSelectionF
         .map(|capture| capture.as_str())?;
     let crate_name = parse_requirement_crate_name(req_line)?;
     let requirement = parse_requirement_text(req_line).unwrap_or_else(|| req_line.to_string());
+    let required_by_re = Regex::new(r#"required by package `([^`]+)`"#).ok()?;
+    let required_by = required_by_re
+        .captures(error_text)
+        .and_then(|captures| captures.get(1))
+        .and_then(|package| parse_required_by_package(package.as_str()));
     Some(VersionSelectionFailure {
         crate_name,
         requirement,
+        required_by,
     })
 }
 
@@ -882,7 +1187,8 @@ fn plan_or_conflict_version_selection_failure(
     failure: &VersionSelectionFailure,
     overlay: &mut OverlayRegistry,
     planned_keys: &mut BTreeSet<String>,
-) -> Result<Option<VersionConflict>> {
+    allow_session_upgrades: bool,
+) -> Result<VersionSelectionPlan> {
     let selected_version = resolve_crates_io_version_req(&failure.crate_name, &failure.requirement)
         .with_context(|| {
             format!(
@@ -892,13 +1198,38 @@ fn plan_or_conflict_version_selection_failure(
         })?;
     let same_compat =
         existing_same_compat_providers(overlay.path(), &failure.crate_name, &selected_version);
+    let selected_version_string = selected_version.to_string();
+    let old_same_compat: Vec<ExistingProvider> = same_compat
+        .iter()
+        .filter(|provider| provider.version != selected_version_string)
+        .cloned()
+        .collect();
+
+    if !old_same_compat.is_empty() {
+        let candidate_provider_name =
+            rust_crate_output_names(&failure.crate_name, &selected_version).directory;
+        let candidate = UpgradeCandidate {
+            crate_name: failure.crate_name.clone(),
+            requirement: failure.requirement.clone(),
+            required_by: failure.required_by.clone(),
+            candidate_version: selected_version,
+            candidate_provider_name,
+            existing: old_same_compat,
+        };
+        if allow_session_upgrades {
+            apply_upgrade_candidate_to_overlay(overlay, &candidate)?;
+            return Ok(VersionSelectionPlan::Continue);
+        }
+        return Ok(VersionSelectionPlan::Stopped(candidate));
+    }
 
     if !same_compat.is_empty() {
-        return Ok(Some(VersionConflict {
-            crate_name: failure.crate_name.clone(),
-            required: failure.requirement.clone(),
-            existing: same_compat,
-        }));
+        takopack_bail!(
+            "{} {} is already present in the overlay, but Cargo still reports it does not satisfy {}; this may be a feature or policy conflict",
+            failure.crate_name,
+            selected_version_string,
+            failure.requirement
+        );
     }
 
     let planned_key = format!("{}-{}", failure.crate_name, selected_version);
@@ -912,7 +1243,20 @@ fn plan_or_conflict_version_selection_failure(
     }
 
     add_crate_to_overlay(overlay, &failure.crate_name, &selected_version)?;
-    Ok(None)
+    Ok(VersionSelectionPlan::Continue)
+}
+
+fn apply_upgrade_candidate_to_overlay(
+    overlay: &mut OverlayRegistry,
+    candidate: &UpgradeCandidate,
+) -> Result<()> {
+    apply_upgrade_to_overlay(
+        overlay,
+        &candidate.crate_name,
+        &candidate.candidate_version,
+        &candidate.requirement,
+        candidate.required_by.as_ref(),
+    )
 }
 
 fn existing_same_compat_providers(
@@ -1641,17 +1985,7 @@ fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
             .with_context(|| format!("failed to parse lockfile version {}", version))?;
         let compat = calculate_compat_version(&parsed_version);
         let capability_name = name.replace('_', "-");
-        let clean_version = format!(
-            "{}.{}.{}{}",
-            parsed_version.major,
-            parsed_version.minor,
-            parsed_version.patch,
-            if parsed_version.pre.is_empty() {
-                String::new()
-            } else {
-                format!("-{}", parsed_version.pre)
-            }
-        );
+        let clean_version = clean_semver_without_build(&parsed_version);
         buildrequires.insert(format!(
             "BuildRequires: crate({}-{}) >= {}",
             capability_name, compat, clean_version
@@ -2133,6 +2467,27 @@ version = "{}"
         let same_compat =
             existing_same_compat_providers(tmp.path(), "toml", &Version::parse("1.1.2").unwrap());
         assert!(same_compat.is_empty());
+    }
+
+    #[test]
+    fn test_plan_session_state_defaults_upgraded_crates() {
+        let json = r#"{
+  "schema_version": 1,
+  "base_registry": "/tmp/registry",
+  "added_crates": []
+}"#;
+        let state: PlanSessionState = serde_json::from_str(json).unwrap();
+        assert!(state.upgraded_crates.is_empty());
+    }
+
+    #[test]
+    fn test_format_required_by_strips_build_metadata() {
+        let required_by = RequiredByPackage {
+            name: "toml_datetime".to_string(),
+            version: "0.7.3+spec-1.1.0".to_string(),
+            path: None,
+        };
+        assert_eq!(format_required_by(&required_by), "toml_datetime 0.7.3");
     }
 
     // -- BuildRequires tests --

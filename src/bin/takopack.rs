@@ -230,6 +230,8 @@ fn real_main() -> Result<i32> {
                     plan_session,
                     plan_reset,
                     plan_add,
+                    plan_upgrade,
+                    allow_session_upgrades,
                 } => {
                     log::info!("starting resolve check");
                     takopack::resolve_check::run_resolve_check(
@@ -240,6 +242,8 @@ fn real_main() -> Result<i32> {
                         plan_session.as_deref(),
                         plan_reset,
                         &plan_add,
+                        &plan_upgrade,
+                        allow_session_upgrades,
                     )
                 }
                 CargoOpt::Track {
