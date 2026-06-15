@@ -4,20 +4,26 @@
 //! successfully resolve (generate a lockfile) using only the TakoPack
 //! local directory registry in offline mode.
 //!
+//! Uses the Cargo API (`Workspace`, `ops::generate_lockfile`) directly
+//! rather than spawning an external `cargo` process.
+//!
 //! ## Current limitations (MVP)
 //!
-//! * The check always copies only `Cargo.toml` into a temporary directory
-//!   rather than cloning the entire project tree.  This means workspace
-//!   manifests, path dependencies, and build scripts that reference local
-//!   files will not work until a future version adds full-tree copy.
+//! * Virtual mode copies only `Cargo.toml` and creates stub target files
+//!   in a temp directory.  Workspace manifests, path dependencies, and
+//!   build scripts that reference sibling files will not resolve.
+//! * Real mode operates on the original directory; Cargo may create or
+//!   update `Cargo.lock` there.
 //! * No structured error analysis (need_add / need_update) is performed;
-//!   the raw Cargo stderr is forwarded on failure.
+//!   the raw Cargo API error is printed on failure.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context;
+use cargo::core::Workspace;
+use cargo::ops;
+use cargo::util::GlobalContext;
 
 use crate::config::load_takopack_toml;
 use crate::errors::Result;
@@ -31,7 +37,7 @@ use crate::errors::Result;
 /// Returns an exit code: 0 = resolve succeeded, 1 = failed or error.
 pub fn run_resolve_check(path: &Path) -> Result<i32> {
     // 1. Determine manifest path and working directory.
-    let (manifest, _workdir) = resolve_manifest(path)?;
+    let (manifest, workdir) = resolve_manifest(path)?;
 
     // 2. Determine registry directory.
     let registry_dir = resolve_registry_dir()?;
@@ -43,51 +49,45 @@ pub fn run_resolve_check(path: &Path) -> Result<i32> {
         );
     }
 
+    // 3. Parse targets from the manifest.
+    let targets = parse_manifest_targets(&manifest)?;
+
     println!("Resolve check");
     println!("  manifest: {}", manifest.display());
     println!("  registry: {}", registry_dir.display());
 
-    // 3. Try real mode first.
-    let (real_ok, real_stderr) = try_resolve(&manifest, &registry_dir, "real")?;
+    // 4. Decide mode based on whether declared targets exist on disk.
+    let is_real = detect_real_mode(&targets, &workdir);
 
-    if real_ok {
+    if is_real {
         println!("  mode: real");
         println!();
-        println!("Result: ok");
-        return Ok(0);
-    }
-
-    // 4. Check if real mode failed due to "no targets" – if so, retry with
-    //    virtual mode.
-    if is_no_targets_error(&real_stderr) {
-        eprintln!();
-        eprintln!("real mode failed with no targets; retrying in virtual mode");
-
-        let (virtual_ok, virtual_stderr) = try_resolve_virtual(&manifest, &registry_dir)?;
-
-        println!("  mode: virtual (fallback)");
+        match cargo_resolve(&manifest, &registry_dir) {
+            Ok(()) => {
+                println!("Result: ok");
+                Ok(0)
+            }
+            Err(e) => {
+                println!("Result: failed");
+                eprintln!("{:?}", e);
+                Ok(1)
+            }
+        }
+    } else {
+        println!("  mode: virtual");
         println!();
-
-        if virtual_ok {
-            println!("Result: ok");
-            return Ok(0);
+        match cargo_resolve_virtual(&manifest, &registry_dir, &targets) {
+            Ok(()) => {
+                println!("Result: ok");
+                Ok(0)
+            }
+            Err(e) => {
+                println!("Result: failed");
+                eprintln!("{:?}", e);
+                Ok(1)
+            }
         }
-
-        println!("Result: failed");
-        if !virtual_stderr.is_empty() {
-            eprintln!("{}", virtual_stderr);
-        }
-        return Ok(1);
     }
-
-    // 5. Real mode failed for a resolve / dependency reason – report as-is.
-    println!("  mode: real");
-    println!();
-    println!("Result: failed");
-    if !real_stderr.is_empty() {
-        eprintln!("{}", real_stderr);
-    }
-    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -113,18 +113,150 @@ fn resolve_manifest(path: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest target parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed target information from a `Cargo.toml`.
+#[derive(Debug, Clone)]
+struct ManifestTargets {
+    /// `true` if the manifest contains `[workspace]`.
+    has_workspace: bool,
+    /// Library target path (explicit `[lib].path` or default `src/lib.rs`).
+    /// `None` if no `[lib]` section and we should fall through to defaults.
+    lib_path: Option<PathBuf>,
+    /// Whether a `[lib]` section exists at all.
+    has_lib_section: bool,
+    /// Binary target paths.  Each entry is the path from `[[bin]].path`,
+    /// or a Cargo-default path derived from `[[bin]].name`.
+    bin_paths: Vec<PathBuf>,
+    /// Whether any `[[bin]]` sections exist.
+    has_bin_sections: bool,
+}
+
+/// Parse `Cargo.toml` to extract target declarations without loading the
+/// full Cargo machinery.  We use the `toml` crate to read the relevant
+/// sections.
+fn parse_manifest_targets(manifest: &Path) -> Result<ManifestTargets> {
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    let table = doc.as_table();
+
+    let has_workspace = table
+        .and_then(|t| t.get("workspace"))
+        .and_then(|v| v.as_table())
+        .is_some();
+
+    // [lib]
+    let lib_section = table.and_then(|t| t.get("lib")).and_then(|v| v.as_table());
+    let has_lib_section = lib_section.is_some();
+    let lib_path = if let Some(lib) = lib_section {
+        if let Some(p) = lib.get("path").and_then(|v| v.as_str()) {
+            Some(PathBuf::from(p))
+        } else {
+            // [lib] exists but no path → default is src/lib.rs
+            Some(PathBuf::from("src/lib.rs"))
+        }
+    } else {
+        None
+    };
+
+    // [[bin]]
+    let bin_array = table.and_then(|t| t.get("bin")).and_then(|v| v.as_array());
+    let has_bin_sections = bin_array.is_some();
+    let mut bin_paths = Vec::new();
+    if let Some(bins) = bin_array {
+        for bin in bins {
+            if let Some(bin_table) = bin.as_table() {
+                if let Some(p) = bin_table.get("path").and_then(|v| v.as_str()) {
+                    bin_paths.push(PathBuf::from(p));
+                } else if let Some(name) = bin_table.get("name").and_then(|v| v.as_str()) {
+                    // Cargo default: src/bin/<name>.rs
+                    bin_paths.push(PathBuf::from(format!("src/bin/{}.rs", name)));
+                }
+            }
+        }
+    }
+
+    Ok(ManifestTargets {
+        has_workspace,
+        lib_path,
+        has_lib_section,
+        bin_paths,
+        has_bin_sections,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Mode detection
+// ---------------------------------------------------------------------------
+
+/// Determine whether the manifest directory is a real Cargo project
+/// (real mode) or a bare `Cargo.toml` that needs scaffolding (virtual mode).
+///
+/// Rules:
+/// 1. `[workspace]` → always real mode.
+/// 2. `[lib]` with path → check if the file exists in workdir.
+/// 3. `[[bin]]` with paths → check if at least one file exists.
+/// 4. No explicit targets → check default paths (`src/lib.rs`,
+///    `src/main.rs`, `src/bin/*.rs`).
+/// 5. Otherwise → virtual mode.
+fn detect_real_mode(targets: &ManifestTargets, workdir: &Path) -> bool {
+    // 1. Workspace is always real.
+    if targets.has_workspace {
+        return true;
+    }
+
+    let has_explicit_targets = targets.has_lib_section || targets.has_bin_sections;
+
+    if has_explicit_targets {
+        // 2. Check declared lib target.
+        if let Some(ref lib_path) = targets.lib_path {
+            if workdir.join(lib_path).exists() {
+                return true;
+            }
+        }
+
+        // 3. Check declared bin targets – at least one must exist.
+        for bin_path in &targets.bin_paths {
+            if workdir.join(bin_path).exists() {
+                return true;
+            }
+        }
+
+        // Explicit targets declared, but none of the files exist → virtual.
+        return false;
+    }
+
+    // 4. No explicit targets: check Cargo defaults.
+    if workdir.join("src/lib.rs").exists() || workdir.join("src/main.rs").exists() {
+        return true;
+    }
+    if let Ok(entries) = fs::read_dir(workdir.join("src/bin")) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "rs") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Registry directory resolution
 // ---------------------------------------------------------------------------
 
 fn resolve_registry_dir() -> Result<PathBuf> {
     // Try takopack.toml first.
-    if let Some((_config_path, config)) = load_takopack_toml()? {
+    if let Some((config_path, config)) = load_takopack_toml()? {
         if let Some(registry) = config.registry {
             if let Some(local_path) = registry.local_path {
                 let path = if local_path.is_absolute() {
                     local_path
                 } else {
-                    _config_path
+                    config_path
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
                         .join(local_path)
@@ -148,71 +280,119 @@ fn default_registry_dir() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve execution helpers
+// Cargo API resolve – real mode
 // ---------------------------------------------------------------------------
 
-/// Run `cargo generate-lockfile` in a temporary copy of the manifest, using
-/// the local registry as a crates-io replacement in offline mode.
-///
-/// Returns `(success, stderr_text)`.
-fn try_resolve(manifest: &Path, registry_dir: &Path, label: &str) -> Result<(bool, String)> {
-    let tmp =
-        tempfile::tempdir().context("failed to create temporary directory for resolve check")?;
+/// Resolve dependencies using the Cargo API, operating on the original
+/// project directory.  A temporary `CARGO_HOME` is created so that we
+/// can inject the local-registry source replacement without touching
+/// the project's own `.cargo/config.toml`.
+fn cargo_resolve(manifest: &Path, registry_dir: &Path) -> Result<()> {
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest.display()))?;
+
+    let cargo_home = make_cargo_home(registry_dir)?;
+    let cargo_home_path = cargo_home.path().to_path_buf();
+
+    let gctx = make_global_context(&cargo_home_path)?;
+    let ws = Workspace::new(&manifest, &gctx)
+        .with_context(|| format!("failed to open workspace at {}", manifest.display()))?;
+
+    ops::generate_lockfile(&ws).context("cargo resolve failed")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cargo API resolve – virtual mode
+// ---------------------------------------------------------------------------
+
+/// Create a temporary project directory with stub target files derived
+/// from the manifest's declared targets, copy `Cargo.toml` there, and
+/// resolve.
+fn cargo_resolve_virtual(
+    manifest: &Path,
+    registry_dir: &Path,
+    targets: &ManifestTargets,
+) -> Result<()> {
+    let tmp = tempfile::tempdir().context("failed to create temporary directory")?;
     let tmp_path = tmp.path();
 
-    // Copy Cargo.toml into the temp dir.
-    fs::copy(manifest, tmp_path.join("Cargo.toml"))
+    // Copy Cargo.toml
+    let tmp_manifest = tmp_path.join("Cargo.toml");
+    fs::copy(manifest, &tmp_manifest)
         .with_context(|| format!("failed to copy {} to tempdir", manifest.display()))?;
 
-    // If the manifest lives alongside a src/ directory, copy it so that
-    // Cargo can find at least one target.
-    let parent = manifest.parent().unwrap_or_else(|| Path::new("."));
-    let src_dir = parent.join("src");
-    if src_dir.is_dir() {
-        copy_dir_simple(&src_dir, &tmp_path.join("src"))?;
+    // Create stub target files based on manifest declarations.
+    create_virtual_stubs(tmp_path, targets)?;
+
+    let tmp_manifest = tmp_manifest
+        .canonicalize()
+        .context("failed to canonicalize temp manifest")?;
+
+    let cargo_home = make_cargo_home(registry_dir)?;
+    let cargo_home_path = cargo_home.path().to_path_buf();
+
+    let gctx = make_global_context(&cargo_home_path)?;
+    let ws = Workspace::new(&tmp_manifest, &gctx)
+        .with_context(|| format!("failed to open workspace at {}", tmp_manifest.display()))?;
+
+    ops::generate_lockfile(&ws).context("cargo resolve failed")?;
+    Ok(())
+}
+
+/// Create stub source files in `project_dir` so that Cargo finds all
+/// declared targets.
+fn create_virtual_stubs(project_dir: &Path, targets: &ManifestTargets) -> Result<()> {
+    let stub_content = "";
+    let mut created_any = false;
+
+    // Lib target
+    if let Some(ref lib_path) = targets.lib_path {
+        let full = project_dir.join(lib_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&full, stub_content)?;
+        log::debug!("virtual stub: {}", lib_path.display());
+        created_any = true;
     }
 
-    // Write .cargo/config.toml to replace crates-io with local registry.
-    write_cargo_config(tmp_path, registry_dir)?;
+    // Bin targets
+    for bin_path in &targets.bin_paths {
+        let full = project_dir.join(bin_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Bin targets need fn main()
+        fs::write(&full, "fn main() {}\n")?;
+        log::debug!("virtual stub: {}", bin_path.display());
+        created_any = true;
+    }
 
-    log::debug!(
-        "resolve-check [{}]: running cargo generate-lockfile in {}",
-        label,
-        tmp_path.display()
-    );
+    // If no targets were declared at all, create a default src/lib.rs
+    if !created_any {
+        let src = project_dir.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("lib.rs"), stub_content)?;
+        log::debug!("virtual stub: src/lib.rs (default)");
+    }
 
-    run_cargo_generate_lockfile(tmp_path)
+    Ok(())
 }
 
-/// Virtual mode: copy Cargo.toml and create a stub `src/lib.rs`.
-fn try_resolve_virtual(manifest: &Path, registry_dir: &Path) -> Result<(bool, String)> {
-    let tmp = tempfile::tempdir()
-        .context("failed to create temporary directory for virtual resolve check")?;
-    let tmp_path = tmp.path();
+// ---------------------------------------------------------------------------
+// Cargo home / GlobalContext helpers
+// ---------------------------------------------------------------------------
 
-    fs::copy(manifest, tmp_path.join("Cargo.toml"))
-        .with_context(|| format!("failed to copy {} to tempdir", manifest.display()))?;
-
-    // Create stub source so Cargo has a target.
-    let src = tmp_path.join("src");
-    fs::create_dir_all(&src)?;
-    fs::write(src.join("lib.rs"), "")?;
-
-    write_cargo_config(tmp_path, registry_dir)?;
-
-    log::debug!(
-        "resolve-check [virtual]: running cargo generate-lockfile in {}",
-        tmp_path.display()
-    );
-
-    run_cargo_generate_lockfile(tmp_path)
-}
-
-/// Write `.cargo/config.toml` that replaces `crates-io` with the local
-/// directory registry and enables offline mode.
-fn write_cargo_config(project_dir: &Path, registry_dir: &Path) -> Result<()> {
-    let cargo_dir = project_dir.join(".cargo");
-    fs::create_dir_all(&cargo_dir)?;
+/// Create a temporary `CARGO_HOME` directory containing a `config.toml`
+/// that replaces `crates-io` with the TakoPack local directory registry
+/// and enables offline mode.
+///
+/// The returned `TempDir` must be kept alive for the duration of the
+/// resolve operation.
+fn make_cargo_home(registry_dir: &Path) -> Result<tempfile::TempDir> {
+    let cargo_home = tempfile::tempdir().context("failed to create temp CARGO_HOME")?;
 
     let config_content = format!(
         r#"[source.crates-io]
@@ -227,63 +407,35 @@ offline = true
         registry_dir.display()
     );
 
-    fs::write(cargo_dir.join("config.toml"), config_content)?;
-    Ok(())
+    fs::write(cargo_home.path().join("config.toml"), config_content)?;
+    Ok(cargo_home)
 }
 
-/// Invoke `cargo generate-lockfile` in the given directory and capture output.
-fn run_cargo_generate_lockfile(project_dir: &Path) -> Result<(bool, String)> {
-    let output = Command::new("cargo")
-        .arg("generate-lockfile")
-        .current_dir(project_dir)
-        .env("CARGO_HOME", project_dir.join(".cargo-home"))
-        .output()
-        .context("failed to execute `cargo generate-lockfile`")?;
+/// Build a Cargo `GlobalContext` that uses the given directory as
+/// `CARGO_HOME`.  This is the same pattern used elsewhere in TakoPack
+/// (`GlobalContext::default()`) but with a custom home directory so the
+/// source-replacement config we wrote is picked up.
+fn make_global_context(cargo_home: &Path) -> Result<GlobalContext> {
+    // Setting CARGO_HOME causes GlobalContext::default() to read
+    // config from that directory.
+    std::env::set_var("CARGO_HOME", cargo_home);
+    let mut gctx = GlobalContext::default()?;
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // Configure offline mode via the API as well (belt-and-suspenders
+    // alongside the config.toml `[net] offline = true`).
+    gctx.configure(
+        0,     // verbose
+        false, // quiet
+        None,  // color
+        false, // frozen
+        false, // locked
+        true,  // offline
+        &gctx.target_dir()?.map(|x| x.into_path_unlocked()),
+        &[], // unstable flags
+        &[], // cli config
+    )?;
 
-    if !stdout.is_empty() {
-        log::debug!("cargo stdout:\n{}", stdout);
-    }
-    if !stderr.is_empty() {
-        log::debug!("cargo stderr:\n{}", stderr);
-    }
-
-    Ok((output.status.success(), stderr))
-}
-
-// ---------------------------------------------------------------------------
-// Error classification
-// ---------------------------------------------------------------------------
-
-/// Return `true` if the Cargo error indicates a bare manifest with no
-/// targets (missing src/lib.rs, src/main.rs, etc.).
-fn is_no_targets_error(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    lower.contains("no targets specified in the manifest")
-        || lower.contains("can't find")
-            && (lower.contains("src/lib.rs") || lower.contains("src/main.rs"))
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem helpers
-// ---------------------------------------------------------------------------
-
-/// Recursively copy a directory tree.  Not performance-critical for MVP.
-fn copy_dir_simple(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let dest_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_simple(&entry.path(), &dest_path)?;
-        } else {
-            fs::copy(entry.path(), &dest_path)?;
-        }
-    }
-    Ok(())
+    Ok(gctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,31 +446,224 @@ fn copy_dir_simple(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    // -- detect_real_mode tests --
+
     #[test]
-    fn test_is_no_targets_error_positive() {
-        assert!(is_no_targets_error(
-            "error: failed to parse manifest\n\
-             Caused by:\n  no targets specified in the manifest\n"
-        ));
+    fn test_real_mode_src_lib_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "").unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(detect_real_mode(&targets, tmp.path()));
     }
 
     #[test]
-    fn test_is_no_targets_error_src_lib() {
-        assert!(is_no_targets_error(
-            "error: can't find `src/lib.rs` or `src/main.rs`"
-        ));
+    fn test_real_mode_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(&manifest, "[workspace]\nmembers = [\"a\"]\n").unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(targets.has_workspace);
+        assert!(detect_real_mode(&targets, tmp.path()));
     }
 
     #[test]
-    fn test_is_no_targets_error_negative() {
-        assert!(!is_no_targets_error(
-            "error: failed to select a version for `serde`"
-        ));
+    fn test_virtual_mode_lib_declared_but_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"t\"\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        // Do NOT create src/lib.rs
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(!detect_real_mode(&targets, tmp.path()));
     }
+
+    #[test]
+    fn test_virtual_mode_bin_declared_but_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"t\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        // Do NOT create src/main.rs
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(!detect_real_mode(&targets, tmp.path()));
+    }
+
+    #[test]
+    fn test_real_mode_lib_declared_and_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "").unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(detect_real_mode(&targets, tmp.path()));
+    }
+
+    #[test]
+    fn test_real_mode_bin_declared_and_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"myapp\"\npath = \"src/bin/myapp.rs\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        fs::write(tmp.path().join("src/bin/myapp.rs"), "fn main() {}").unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(detect_real_mode(&targets, tmp.path()));
+    }
+
+    #[test]
+    fn test_virtual_mode_bare_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(!detect_real_mode(&targets, tmp.path()));
+    }
+
+    // -- parse_manifest_targets tests --
+
+    #[test]
+    fn test_parse_targets_cargo_c_style() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "cargo-c"
+version = "0.1.0"
+
+[lib]
+name = "cargo_c"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-capi"
+path = "src/bin/capi.rs"
+
+[[bin]]
+name = "cargo-cbuild"
+path = "src/bin/cbuild.rs"
+"#,
+        )
+        .unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(targets.has_lib_section);
+        assert_eq!(targets.lib_path, Some(PathBuf::from("src/lib.rs")));
+        assert_eq!(targets.bin_paths.len(), 2);
+        assert_eq!(targets.bin_paths[0], PathBuf::from("src/bin/capi.rs"));
+        assert_eq!(targets.bin_paths[1], PathBuf::from("src/bin/cbuild.rs"));
+    }
+
+    #[test]
+    fn test_parse_targets_bin_without_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"mybin\"\n",
+        )
+        .unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(targets.has_bin_sections);
+        assert_eq!(targets.bin_paths, vec![PathBuf::from("src/bin/mybin.rs")]);
+    }
+
+    #[test]
+    fn test_parse_targets_lib_without_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"t\"\n",
+        )
+        .unwrap();
+
+        let targets = parse_manifest_targets(&manifest).unwrap();
+        assert!(targets.has_lib_section);
+        assert_eq!(targets.lib_path, Some(PathBuf::from("src/lib.rs")));
+    }
+
+    // -- create_virtual_stubs tests --
+
+    #[test]
+    fn test_virtual_stubs_cargo_c_style() {
+        let tmp = tempfile::tempdir().unwrap();
+        let targets = ManifestTargets {
+            has_workspace: false,
+            lib_path: Some(PathBuf::from("src/lib.rs")),
+            has_lib_section: true,
+            bin_paths: vec![
+                PathBuf::from("src/bin/capi.rs"),
+                PathBuf::from("src/bin/cbuild.rs"),
+            ],
+            has_bin_sections: true,
+        };
+
+        create_virtual_stubs(tmp.path(), &targets).unwrap();
+
+        assert!(tmp.path().join("src/lib.rs").exists());
+        assert!(tmp.path().join("src/bin/capi.rs").exists());
+        assert!(tmp.path().join("src/bin/cbuild.rs").exists());
+
+        // Bin stubs should have fn main()
+        let capi = fs::read_to_string(tmp.path().join("src/bin/capi.rs")).unwrap();
+        assert!(capi.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_virtual_stubs_no_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let targets = ManifestTargets {
+            has_workspace: false,
+            lib_path: None,
+            has_lib_section: false,
+            bin_paths: vec![],
+            has_bin_sections: false,
+        };
+
+        create_virtual_stubs(tmp.path(), &targets).unwrap();
+
+        // Should create default src/lib.rs
+        assert!(tmp.path().join("src/lib.rs").exists());
+    }
+
+    // -- resolve_manifest tests --
 
     #[test]
     fn test_resolve_manifest_dir() {
-        // Create a temp directory with a Cargo.toml
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("Cargo.toml");
         fs::write(
