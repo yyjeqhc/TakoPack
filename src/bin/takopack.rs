@@ -222,6 +222,10 @@ fn real_main() -> Result<i32> {
                     log::info!("starting registry sync");
                     takopack::registry_sync::run_registry_sync(dry_run, jobs)
                 }
+                CargoOpt::ResolveCheck { path } => {
+                    log::info!("starting resolve check");
+                    takopack::resolve_check::run_resolve_check(&path)
+                }
                 CargoOpt::Track {
                     crate_name,
                     version,

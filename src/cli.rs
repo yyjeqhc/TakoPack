@@ -246,6 +246,13 @@ pub enum CargoOpt {
         #[arg(short = 'j', long, default_value_t = 8, value_name = "N")]
         jobs: usize,
     },
+    /// Check whether a Cargo.toml can resolve against the local TakoPack registry
+    #[command(name = "resolve-check")]
+    ResolveCheck {
+        /// Path to a directory containing Cargo.toml, or a Cargo.toml file
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+    },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]
     #[command(group(

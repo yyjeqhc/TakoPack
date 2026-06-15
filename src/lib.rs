@@ -17,5 +17,6 @@ pub mod python_package;
 pub mod recursive_package;
 pub mod registry_sync;
 pub mod repo_check;
+pub mod resolve_check;
 pub mod spec_from_toml;
 pub mod track_command;
