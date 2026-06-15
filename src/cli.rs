@@ -252,6 +252,14 @@ pub enum CargoOpt {
         /// Path to a directory containing Cargo.toml, or a Cargo.toml file
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
+
+        /// Resolve against a temporary manifest with dev/test/bench dependencies removed
+        #[arg(long)]
+        no_dev: bool,
+
+        /// Print BuildRequires candidates from the generated Cargo.lock on success
+        #[arg(long)]
+        print_buildrequires: bool,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]

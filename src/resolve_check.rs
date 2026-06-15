@@ -17,6 +17,7 @@
 //! * No structured error analysis (need_add / need_update) is performed;
 //!   the raw Cargo API error is printed on failure.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,18 +25,26 @@ use anyhow::Context;
 use cargo::core::Workspace;
 use cargo::ops;
 use cargo::util::GlobalContext;
+use semver::Version;
+use walkdir::WalkDir;
 
 use crate::config::load_takopack_toml;
 use crate::errors::Result;
+use crate::util::calculate_compat_version;
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default)]
+struct ResolveOutcome {
+    buildrequires: Vec<String>,
+}
+
 /// Run the `resolve-check` subcommand.
 ///
 /// Returns an exit code: 0 = resolve succeeded, 1 = failed or error.
-pub fn run_resolve_check(path: &Path) -> Result<i32> {
+pub fn run_resolve_check(path: &Path, no_dev: bool, print_buildrequires: bool) -> Result<i32> {
     // 1. Determine manifest path and working directory.
     let (manifest, workdir) = resolve_manifest(path)?;
 
@@ -61,10 +70,18 @@ pub fn run_resolve_check(path: &Path) -> Result<i32> {
 
     if is_real {
         println!("  mode: real");
+        println!("  no_dev: {}", no_dev);
         println!();
-        match cargo_resolve(&manifest, &registry_dir) {
-            Ok(()) => {
+        match cargo_resolve(
+            &manifest,
+            &workdir,
+            &registry_dir,
+            no_dev,
+            print_buildrequires,
+        ) {
+            Ok(outcome) => {
                 println!("Result: ok");
+                print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
                 Ok(0)
             }
             Err(e) => {
@@ -75,10 +92,18 @@ pub fn run_resolve_check(path: &Path) -> Result<i32> {
         }
     } else {
         println!("  mode: virtual");
+        println!("  no_dev: {}", no_dev);
         println!();
-        match cargo_resolve_virtual(&manifest, &registry_dir, &targets) {
-            Ok(()) => {
+        match cargo_resolve_virtual_with_options(
+            &manifest,
+            &registry_dir,
+            &targets,
+            no_dev,
+            print_buildrequires,
+        ) {
+            Ok(outcome) => {
                 println!("Result: ok");
+                print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
                 Ok(0)
             }
             Err(e) => {
@@ -87,6 +112,18 @@ pub fn run_resolve_check(path: &Path) -> Result<i32> {
                 Ok(1)
             }
         }
+    }
+}
+
+fn print_buildrequires_if_requested(print_buildrequires: bool, buildrequires: &[String]) {
+    if !print_buildrequires {
+        return;
+    }
+
+    println!();
+    println!("BuildRequires:");
+    for line in buildrequires {
+        println!("{}", line);
     }
 }
 
@@ -287,10 +324,24 @@ fn default_registry_dir() -> Result<PathBuf> {
 /// project directory.  A temporary `CARGO_HOME` is created so that we
 /// can inject the local-registry source replacement without touching
 /// the project's own `.cargo/config.toml`.
-fn cargo_resolve(manifest: &Path, registry_dir: &Path) -> Result<()> {
-    let manifest = manifest
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", manifest.display()))?;
+fn cargo_resolve(
+    manifest: &Path,
+    workdir: &Path,
+    registry_dir: &Path,
+    no_dev: bool,
+    print_buildrequires: bool,
+) -> Result<ResolveOutcome> {
+    let _tmp_project;
+    let manifest = if no_dev {
+        let (tmp_project, tmp_manifest) = make_no_dev_real_project(manifest, workdir)?;
+        _tmp_project = Some(tmp_project);
+        tmp_manifest
+    } else {
+        _tmp_project = None;
+        manifest
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", manifest.display()))?
+    };
 
     let cargo_home = make_cargo_home(registry_dir)?;
     let cargo_home_path = cargo_home.path().to_path_buf();
@@ -300,7 +351,14 @@ fn cargo_resolve(manifest: &Path, registry_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to open workspace at {}", manifest.display()))?;
 
     ops::generate_lockfile(&ws).context("cargo resolve failed")?;
-    Ok(())
+    let buildrequires = if print_buildrequires {
+        let lockfile = ws.root().join("Cargo.lock");
+        buildrequires_from_lockfile(&lockfile)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(ResolveOutcome { buildrequires })
 }
 
 // ---------------------------------------------------------------------------
@@ -310,11 +368,13 @@ fn cargo_resolve(manifest: &Path, registry_dir: &Path) -> Result<()> {
 /// Create a temporary project directory with stub target files derived
 /// from the manifest's declared targets, copy `Cargo.toml` there, and
 /// resolve.
-fn cargo_resolve_virtual(
+fn cargo_resolve_virtual_with_options(
     manifest: &Path,
     registry_dir: &Path,
     targets: &ManifestTargets,
-) -> Result<()> {
+    no_dev: bool,
+    print_buildrequires: bool,
+) -> Result<ResolveOutcome> {
     let tmp = tempfile::tempdir().context("failed to create temporary directory")?;
     let tmp_path = tmp.path();
 
@@ -322,6 +382,9 @@ fn cargo_resolve_virtual(
     let tmp_manifest = tmp_path.join("Cargo.toml");
     fs::copy(manifest, &tmp_manifest)
         .with_context(|| format!("failed to copy {} to tempdir", manifest.display()))?;
+    if no_dev {
+        strip_dev_dependencies_from_manifest(&tmp_manifest)?;
+    }
 
     // Create stub target files based on manifest declarations.
     create_virtual_stubs(tmp_path, targets)?;
@@ -338,7 +401,14 @@ fn cargo_resolve_virtual(
         .with_context(|| format!("failed to open workspace at {}", tmp_manifest.display()))?;
 
     ops::generate_lockfile(&ws).context("cargo resolve failed")?;
-    Ok(())
+    let buildrequires = if print_buildrequires {
+        let lockfile = ws.root().join("Cargo.lock");
+        buildrequires_from_lockfile(&lockfile)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(ResolveOutcome { buildrequires })
 }
 
 /// Create stub source files in `project_dir` so that Cargo finds all
@@ -379,6 +449,171 @@ fn create_virtual_stubs(project_dir: &Path, targets: &ManifestTargets) -> Result
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// no-dev manifest view
+// ---------------------------------------------------------------------------
+
+fn make_no_dev_real_project(
+    manifest: &Path,
+    workdir: &Path,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    let workdir = workdir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", workdir.display()))?;
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest.display()))?;
+    let manifest_rel = manifest
+        .strip_prefix(&workdir)
+        .with_context(|| format!("{} is not under {}", manifest.display(), workdir.display()))?
+        .to_path_buf();
+
+    let tmp = tempfile::tempdir().context("failed to create no-dev temporary project")?;
+    copy_project_tree_for_resolve(&workdir, tmp.path())?;
+
+    let tmp_manifest = tmp.path().join(manifest_rel);
+    strip_dev_dependencies_from_manifest(&tmp_manifest)?;
+    let tmp_manifest = tmp_manifest
+        .canonicalize()
+        .context("failed to canonicalize no-dev temp manifest")?;
+
+    Ok((tmp, tmp_manifest))
+}
+
+fn copy_project_tree_for_resolve(source_dir: &Path, dest_dir: &Path) -> Result<()> {
+    for entry in WalkDir::new(source_dir)
+        .into_iter()
+        .filter_entry(|entry| should_copy_resolve_entry(entry.path(), source_dir))
+    {
+        let entry = entry.context("failed to walk source tree for no-dev resolve")?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(source_dir)
+            .with_context(|| format!("{} is not under {}", path.display(), source_dir.display()))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let dest = dest_dir.join(rel);
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            fs::create_dir_all(&dest)
+                .with_context(|| format!("failed to create {}", dest.display()))?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(path, &dest).with_context(|| {
+                format!("failed to copy {} to {}", path.display(), dest.display())
+            })?;
+        } else if file_type.is_symlink() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let metadata = fs::metadata(path)
+                .with_context(|| format!("failed to inspect symlink target {}", path.display()))?;
+            if metadata.is_file() {
+                fs::copy(path, &dest).with_context(|| {
+                    format!("failed to copy {} to {}", path.display(), dest.display())
+                })?;
+            } else if metadata.is_dir() {
+                fs::create_dir_all(&dest)
+                    .with_context(|| format!("failed to create {}", dest.display()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn should_copy_resolve_entry(path: &Path, source_dir: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(source_dir) else {
+        return true;
+    };
+    let Some(first) = rel.components().next() else {
+        return true;
+    };
+    let first = first.as_os_str();
+    first != "target" && first != ".git"
+}
+
+fn strip_dev_dependencies_from_manifest(manifest: &Path) -> Result<()> {
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let mut doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+
+    if let Some(root) = doc.as_table_mut() {
+        root.remove("dev-dependencies");
+        root.remove("bench");
+        root.remove("test");
+
+        if let Some(targets) = root
+            .get_mut("target")
+            .and_then(|value| value.as_table_mut())
+        {
+            for (_, target) in targets.iter_mut() {
+                if let Some(target_table) = target.as_table_mut() {
+                    target_table.remove("dev-dependencies");
+                }
+            }
+        }
+    }
+
+    let sanitized = toml::to_string_pretty(&doc)
+        .with_context(|| format!("failed to serialize sanitized {}", manifest.display()))?;
+    fs::write(manifest, sanitized)
+        .with_context(|| format!("failed to write sanitized {}", manifest.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BuildRequires output
+// ---------------------------------------------------------------------------
+
+fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
+    let content = fs::read_to_string(lockfile)
+        .with_context(|| format!("failed to read generated {}", lockfile.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse generated {}", lockfile.display()))?;
+    let packages = doc
+        .get("package")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow::anyhow!("generated Cargo.lock has no package array"))?;
+
+    let mut buildrequires = BTreeSet::new();
+    for package in packages {
+        let Some(package) = package.as_table() else {
+            continue;
+        };
+        let Some(source) = package.get("source").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !source.starts_with("registry+") {
+            continue;
+        }
+
+        let Some(name) = package.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(version) = package.get("version").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let parsed_version = Version::parse(version)
+            .with_context(|| format!("failed to parse lockfile version {}", version))?;
+        let compat = calculate_compat_version(&parsed_version);
+        let capability_name = name.replace('_', "-");
+        buildrequires.insert(format!(
+            "BuildRequires: crate({}-{}) >= {}",
+            capability_name, compat, version
+        ));
+    }
+
+    Ok(buildrequires.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +893,107 @@ path = "src/bin/cbuild.rs"
 
         // Should create default src/lib.rs
         assert!(tmp.path().join("src/lib.rs").exists());
+    }
+
+    // -- no-dev sanitizer tests --
+
+    #[test]
+    fn test_strip_dev_dependencies_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "t"
+version = "0.1.0"
+
+[dependencies]
+serde = "1"
+
+[dev-dependencies]
+criterion = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "bench"
+
+[[test]]
+name = "integration"
+"#,
+        )
+        .unwrap();
+
+        strip_dev_dependencies_from_manifest(&manifest).unwrap();
+
+        let content = fs::read_to_string(&manifest).unwrap();
+        let doc: toml::Value = toml::from_str(&content).unwrap();
+        let root = doc.as_table().unwrap();
+
+        assert!(root.get("dependencies").is_some());
+        assert!(root.get("dev-dependencies").is_none());
+        assert!(root.get("bench").is_none());
+        assert!(root.get("test").is_none());
+
+        let unix_target = root
+            .get("target")
+            .and_then(|target| target.get("cfg(unix)"))
+            .and_then(|target| target.as_table())
+            .unwrap();
+        assert!(unix_target.get("dependencies").is_some());
+        assert!(unix_target.get("dev-dependencies").is_none());
+    }
+
+    // -- BuildRequires tests --
+
+    #[test]
+    fn test_buildrequires_from_lockfile_skips_non_registry_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = tmp.path().join("Cargo.lock");
+        fs::write(
+            &lockfile,
+            r#"
+version = 3
+
+[[package]]
+name = "root"
+version = "0.1.0"
+
+[[package]]
+name = "local_dep"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tokenizers"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tiny_http"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .unwrap();
+
+        let buildrequires = buildrequires_from_lockfile(&lockfile).unwrap();
+        assert_eq!(
+            buildrequires,
+            vec![
+                "BuildRequires: crate(serde-1) >= 1.0.228",
+                "BuildRequires: crate(tiny-http-0.12) >= 0.12.0",
+                "BuildRequires: crate(tokenizers-0.22) >= 0.22.2",
+            ]
+        );
     }
 
     // -- resolve_manifest tests --
