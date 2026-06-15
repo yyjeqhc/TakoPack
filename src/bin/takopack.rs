@@ -56,13 +56,13 @@ fn real_main() -> Result<i32> {
                     let takopack_dir = output_path.join("takopack");
                     let source_spec = takopack_dir.join(&output_names.spec_file);
 
-                    // Create final output directory and copy the spec plus original Cargo.toml.
+                    // Create final output directory and copy the spec plus normalized Cargo.toml.
                     fs::create_dir_all(&final_output)?;
                     let final_spec = final_output.join(&output_names.spec_file);
 
                     if source_spec.exists() {
                         fs::copy(&source_spec, &final_spec)?;
-                        let final_cargo_toml = takopack::util::copy_original_cargo_toml_to_dir(
+                        let final_cargo_toml = takopack::util::copy_normalized_cargo_toml_to_dir(
                             output_path,
                             &final_output,
                         )?;

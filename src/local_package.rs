@@ -333,7 +333,7 @@ fn process_complete_crate(
     if source_spec.exists() {
         fs::copy(&source_spec, &final_spec)
             .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
-        crate::util::copy_original_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
+        crate::util::copy_normalized_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
 
         log::info!("Spec file saved to: {}", final_spec.display());
         println!("Spec file: {}", final_spec.display());

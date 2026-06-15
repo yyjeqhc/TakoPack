@@ -453,13 +453,13 @@ pub fn backup_cargo_toml(
     Ok(())
 }
 
-pub fn copy_original_cargo_toml_to_dir(source_dir: &Path, target_dir: &Path) -> Result<PathBuf> {
+pub fn copy_normalized_cargo_toml_to_dir(source_dir: &Path, target_dir: &Path) -> Result<PathBuf> {
     let cargo_toml_orig = source_dir.join("Cargo.toml.orig");
     let cargo_toml = source_dir.join("Cargo.toml");
-    let source = if cargo_toml_orig.exists() {
-        cargo_toml_orig
-    } else {
+    let source = if cargo_toml.exists() {
         cargo_toml
+    } else {
+        cargo_toml_orig
     };
 
     if !source.exists() {
@@ -479,8 +479,41 @@ pub fn copy_original_cargo_toml_to_dir(source_dir: &Path, target_dir: &Path) -> 
     }
 
     fs::copy(&source, &target)
-        .with_context(|| format!("Failed to copy original Cargo.toml to {:?}", target))?;
+        .with_context(|| format!("Failed to copy Cargo.toml to {:?}", target))?;
+
+    let copied = fs::read_to_string(&target)
+        .with_context(|| format!("Failed to read copied Cargo.toml at {:?}", target))?;
+    if cargo_toml_has_workspace_inheritance(&copied) {
+        takopack_warn!(
+            "warning: copied Cargo.toml at {} contains workspace inheritance; provider manifests should be independently parseable",
+            target.display()
+        );
+    }
+
     Ok(target)
+}
+
+pub fn cargo_toml_has_workspace_inheritance(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            return false;
+        }
+
+        if matches!(
+            line,
+            "[workspace]" | "[workspace.package]" | "[workspace.dependencies]"
+        ) {
+            return true;
+        }
+
+        if line.contains(".workspace") {
+            return true;
+        }
+
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("workspace=true")
+    })
 }
 
 /// Backup Cargo.lock to ${XDG_DATA_HOME:-$HOME/.local/share}/takopack/cargo_back directory
@@ -597,7 +630,7 @@ pub fn process_single_crate(
         // Copy spec file to target directory
         if source_spec.exists() {
             fs::copy(&source_spec, &final_spec)?;
-            copy_original_cargo_toml_to_dir(output_path, &target_dir)?;
+            copy_normalized_cargo_toml_to_dir(output_path, &target_dir)?;
             log::debug!("Copied spec file to: {:?}", final_spec);
         } else {
             return Err(anyhow::anyhow!(
@@ -625,10 +658,12 @@ pub fn process_single_crate(
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_compat_version, package_final_output_dir_with_base, resolve_output_dir_with_base,
-        rust_crate_output_names,
+        calculate_compat_version, cargo_toml_has_workspace_inheritance,
+        copy_normalized_cargo_toml_to_dir, package_final_output_dir_with_base,
+        resolve_output_dir_with_base, rust_crate_output_names,
     };
     use semver::Version;
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -667,6 +702,63 @@ mod tests {
             rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
             "rust-base64-0.22.spec"
         );
+    }
+
+    #[test]
+    fn copy_normalized_cargo_toml_prefers_cargo_toml_over_orig() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        fs::write(
+            source.path().join("Cargo.toml"),
+            "[package]\nname = \"normalized\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("Cargo.toml.orig"),
+            "[package]\nname = \"raw\"\nversion = \"1.0.0\"\nworkspace = true\n",
+        )
+        .unwrap();
+
+        copy_normalized_cargo_toml_to_dir(source.path(), out.path()).unwrap();
+
+        let copied = fs::read_to_string(out.path().join("Cargo.toml")).unwrap();
+        assert!(copied.contains("name = \"normalized\""));
+        assert!(!copied.contains("workspace = true"));
+    }
+
+    #[test]
+    fn copy_normalized_cargo_toml_falls_back_to_orig_only_when_needed() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        fs::write(
+            source.path().join("Cargo.toml.orig"),
+            "[package]\nname = \"raw\"\nversion = \"1.0.0\"\nworkspace = true\n",
+        )
+        .unwrap();
+
+        copy_normalized_cargo_toml_to_dir(source.path(), out.path()).unwrap();
+
+        let copied = fs::read_to_string(out.path().join("Cargo.toml")).unwrap();
+        assert!(copied.contains("name = \"raw\""));
+        assert!(copied.contains("workspace = true"));
+    }
+
+    #[test]
+    fn cargo_toml_workspace_inheritance_detection_is_conservative() {
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[package]\nname = \"raw\"\nworkspace = true\n"
+        ));
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[package]\nauthors.workspace = true\n"
+        ));
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[workspace.dependencies]\nserde = \"1\"\n"
+        ));
+        assert!(!cargo_toml_has_workspace_inheritance(
+            "[package]\nname = \"normalized\"\nversion = \"1.0.0\"\n"
+        ));
     }
 
     #[test]

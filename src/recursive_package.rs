@@ -339,7 +339,7 @@ impl RecursivePackager {
                     temp_spec_path, final_spec_path
                 )
             })?;
-            crate::util::copy_original_cargo_toml_to_dir(&temp_pkg_dir, &final_pkg_dir)?;
+            crate::util::copy_normalized_cargo_toml_to_dir(&temp_pkg_dir, &final_pkg_dir)?;
         } else {
             anyhow::bail!("Spec file not found: {:?}", temp_spec_path);
         }
