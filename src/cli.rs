@@ -2,6 +2,7 @@ use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand, Val
 
 use crate::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
+    range_audit::RangeCapabilityPolicy,
     recursive_package::RecursivePackageArgs,
     repo_check::BuildReqsKind,
 };
@@ -45,6 +46,9 @@ pub enum CargoOpt {
         extract: PackageExtractArgs,
         #[command(flatten)]
         finish: PackageExecuteArgs,
+        /// Policy for range-capability warnings (warn|error|allow)
+        #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
+        range_capability_policy: RangeCapabilityPolicy,
     },
     /// Recursively package a crate and all its dependencies (vendor mode)
     #[command(alias = "v")]
@@ -92,6 +96,10 @@ pub enum CargoOpt {
 
         #[command(flatten)]
         finish: PackageExecuteArgs,
+
+        /// Policy for range-capability warnings (warn|error|allow)
+        #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
+        range_capability_policy: RangeCapabilityPolicy,
     },
     /// Generate RPM BuildRequires candidates from Cargo.toml
     #[command(name = "buildreqs")]
@@ -332,6 +340,21 @@ pub enum CargoOpt {
         /// Output file for crates that need action (default: needs_action.txt)
         #[arg(long, value_name = "FILE")]
         action_file: Option<std::path::PathBuf>,
+    },
+    /// Audit Cargo.toml dependencies for range requirements that span multiple RPM compat keys
+    #[command(name = "range-audit")]
+    RangeAudit {
+        /// Path to a Cargo.toml file, crate directory, or workspace directory
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Exit non-zero if any warnings are found
+        #[arg(long)]
+        strict: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 

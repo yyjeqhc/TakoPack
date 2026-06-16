@@ -7,6 +7,7 @@ use toml::Value;
 use crate::config::Config;
 use crate::crates::CrateInfo;
 use crate::package::PackageExecuteArgs;
+use crate::range_audit::{self, RangeCapabilityPolicy};
 use crate::takopack::{self, DebInfo};
 use crate::util::write_file_ensuring_dir;
 
@@ -15,6 +16,7 @@ pub fn process_local_package(
     path: &Path,
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
     // Canonicalize the path first to get absolute path
     let path_abs =
@@ -59,6 +61,7 @@ pub fn process_local_package(
         &temp_cargo_toml,
         output_dir,
         finish_args,
+        range_capability_policy,
     )
 }
 
@@ -250,6 +253,7 @@ fn process_complete_crate(
     cargo_toml: &Path,
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
     // Load config if available
     let config_path = temp_crate_dir.join("takopack.toml");
@@ -274,6 +278,16 @@ fn process_complete_crate(
     let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
     let output_names = crate::util::rust_crate_output_names(crate_name, version);
+
+    if range_capability_policy != RangeCapabilityPolicy::Allow {
+        let warnings = range_audit::audit_cargo_dependencies(
+            crate_info.dependencies(),
+            Some(&output_names.directory),
+        );
+        if range_audit::emit_warnings(&warnings, range_capability_policy) {
+            anyhow::bail!("range capability audit failed (policy: error)");
+        }
+    }
 
     // Determine final output package directory.
     let final_output = crate::util::package_final_output_dir(output_dir.as_deref(), &output_names)?;
@@ -348,6 +362,7 @@ fn process_complete_crate(
 mod tests {
     use super::{materialize_manifest_backed_temp_crate, process_local_package};
     use crate::package::PackageExecuteArgs;
+    use crate::range_audit::RangeCapabilityPolicy;
     use crate::util::rust_crate_output_names;
     use semver::Version;
     use std::fs;
@@ -537,7 +552,13 @@ edition = "2021"
             rust_crate_output_names("localpkg_smoke", &Version::parse("0.1.0").unwrap());
         let package_dir = output.path().join("explicit-final-package-dir");
 
-        process_local_package(source.path(), Some(package_dir.clone()), finish).unwrap();
+        process_local_package(
+            source.path(),
+            Some(package_dir.clone()),
+            finish,
+            RangeCapabilityPolicy::Allow,
+        )
+        .unwrap();
 
         assert!(package_dir.join(&output_names.spec_file).exists());
         assert!(package_dir.join("Cargo.toml").exists());

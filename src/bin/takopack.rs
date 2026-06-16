@@ -5,6 +5,7 @@ use takopack::cli::{CargoOpt, Cli, Opt, PyOpt};
 use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
+use takopack::range_audit::{self, RangeCapabilityPolicy};
 use takopack::recursive_package::RecursivePackager;
 use takopack::repo_check::{BuildReqsOptions, RepoCheckOptions, RepoIndexOptions};
 use takopack::spec_from_toml::parse_dependencies_from_toml;
@@ -26,6 +27,7 @@ fn real_main() -> Result<i32> {
                     init,
                     mut extract,
                     finish,
+                    range_capability_policy,
                 } => {
                     use std::fs;
 
@@ -45,6 +47,15 @@ fn real_main() -> Result<i32> {
 
                     process.extract(extract)?;
                     process.apply_overrides()?;
+                    if range_capability_policy != RangeCapabilityPolicy::Allow {
+                        let warnings = range_audit::audit_cargo_dependencies(
+                            process.crate_info().dependencies(),
+                            Some(&output_names.directory),
+                        );
+                        if range_audit::emit_warnings(&warnings, range_capability_policy) {
+                            anyhow::bail!("range capability audit failed (policy: error)");
+                        }
+                    }
                     process.prepare_orig_tarball()?;
                     process.prepare_takopack_folder(finish)?;
 
@@ -126,9 +137,15 @@ fn real_main() -> Result<i32> {
                     path,
                     output,
                     finish,
+                    range_capability_policy,
                 } => {
                     log::info!("packaging from local directory: {:?}", path);
-                    takopack::local_package::process_local_package(&path, output, finish)?;
+                    takopack::local_package::process_local_package(
+                        &path,
+                        output,
+                        finish,
+                        range_capability_policy,
+                    )?;
                     Ok(0)
                 }
                 CargoOpt::BuildReqs {
@@ -272,6 +289,31 @@ fn real_main() -> Result<i32> {
                         action_file,
                     )?;
                     Ok(0)
+                }
+                CargoOpt::RangeAudit { path, strict, json } => {
+                    log::info!("running range capability audit on: {:?}", path);
+                    let warnings = range_audit::scan_directory(&path)?;
+                    if json {
+                        let report = range_audit::RangeAuditReport {
+                            warnings: warnings.clone(),
+                        };
+                        println!("{}", report.to_json());
+                    } else {
+                        for w in &warnings {
+                            eprintln!("{}", w);
+                            eprintln!();
+                        }
+                        if warnings.is_empty() {
+                            eprintln!("No range capability warnings found.");
+                        } else {
+                            eprintln!("{} range capability warning(s) found.", warnings.len());
+                        }
+                    }
+                    if strict && !warnings.is_empty() {
+                        Ok(1)
+                    } else {
+                        Ok(0)
+                    }
                 }
             }
         }
