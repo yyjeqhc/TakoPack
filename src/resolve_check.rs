@@ -1654,14 +1654,20 @@ fn plan_and_materialize_missing_crate(
                 required_by.version
             )
         })?;
-    let requirement = infer_dependency_requirement(&parent_manifest, &missing.crate_name, !no_dev)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing {}, but failed to infer version requirement from {}",
-                missing.crate_name,
-                parent_manifest.display()
-            )
-        })?;
+    let workspace_manifest = workspace_root_manifest_for_parent(&parent_manifest, root_manifest);
+    let requirement = infer_dependency_requirement_from_manifest_or_workspace(
+        &parent_manifest,
+        &missing.crate_name,
+        !no_dev,
+        workspace_manifest.as_deref(),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing {}, but failed to infer version requirement from {}",
+            missing.crate_name,
+            parent_manifest.display()
+        )
+    })?;
     let selected_version = resolve_crates_io_version_req(&missing.crate_name, &requirement)
         .with_context(|| {
             format!(
@@ -2162,30 +2168,66 @@ fn existing_providers_for_crate(registry_dir: &Path, crate_name: &str) -> Vec<Ex
     providers
 }
 
+#[cfg(test)]
 fn infer_dependency_requirement(
     parent_manifest: &Path,
     missing_crate: &str,
     include_dev: bool,
 ) -> Result<Option<String>> {
+    infer_dependency_requirement_from_manifest_or_workspace(
+        parent_manifest,
+        missing_crate,
+        include_dev,
+        None,
+    )
+}
+
+fn infer_dependency_requirement_from_manifest_or_workspace(
+    parent_manifest: &Path,
+    missing_crate: &str,
+    include_dev: bool,
+    workspace_root_manifest: Option<&Path>,
+) -> Result<Option<String>> {
     let content = fs::read_to_string(parent_manifest)
         .with_context(|| format!("failed to read {}", parent_manifest.display()))?;
-    let doc: toml::Value = toml::from_str(&content)
+    let parent_doc: toml::Value = toml::from_str(&content)
         .with_context(|| format!("failed to parse {}", parent_manifest.display()))?;
-    let Some(root) = doc.as_table() else {
+
+    let workspace_doc =
+        load_workspace_dependency_doc(parent_manifest, &parent_doc, workspace_root_manifest)?;
+
+    infer_dependency_requirement_from_docs(
+        &parent_doc,
+        workspace_doc.as_ref().unwrap_or(&parent_doc),
+        missing_crate,
+        include_dev,
+    )
+}
+
+fn infer_dependency_requirement_from_docs(
+    parent_doc: &toml::Value,
+    workspace_doc: &toml::Value,
+    missing_crate: &str,
+    include_dev: bool,
+) -> Result<Option<String>> {
+    let Some(root) = parent_doc.as_table() else {
         return Ok(None);
     };
 
     for section in ["dependencies", "build-dependencies"] {
         if let Some(requirement) =
-            dependency_requirement_from_section(root, &doc, section, missing_crate)
+            dependency_requirement_from_section(root, workspace_doc, section, missing_crate)
         {
             return Ok(Some(requirement));
         }
     }
     if include_dev {
-        if let Some(requirement) =
-            dependency_requirement_from_section(root, &doc, "dev-dependencies", missing_crate)
-        {
+        if let Some(requirement) = dependency_requirement_from_section(
+            root,
+            workspace_doc,
+            "dev-dependencies",
+            missing_crate,
+        ) {
             return Ok(Some(requirement));
         }
     }
@@ -2196,16 +2238,19 @@ fn infer_dependency_requirement(
                 continue;
             };
             for section in ["dependencies", "build-dependencies"] {
-                if let Some(requirement) =
-                    dependency_requirement_from_section(target, &doc, section, missing_crate)
-                {
+                if let Some(requirement) = dependency_requirement_from_section(
+                    target,
+                    workspace_doc,
+                    section,
+                    missing_crate,
+                ) {
                     return Ok(Some(requirement));
                 }
             }
             if include_dev {
                 if let Some(requirement) = dependency_requirement_from_section(
                     target,
-                    &doc,
+                    workspace_doc,
                     "dev-dependencies",
                     missing_crate,
                 ) {
@@ -2215,19 +2260,106 @@ fn infer_dependency_requirement(
         }
     }
 
+    if let Some(requirement) =
+        workspace_dependency_requirement_by_package(workspace_doc, missing_crate)
+    {
+        return Ok(Some(requirement));
+    }
+
     Ok(None)
+}
+
+fn load_workspace_dependency_doc(
+    parent_manifest: &Path,
+    parent_doc: &toml::Value,
+    workspace_root_manifest: Option<&Path>,
+) -> Result<Option<toml::Value>> {
+    if let Some(workspace_root_manifest) = workspace_root_manifest
+        .filter(|workspace_root_manifest| {
+            manifest_is_workspace_ancestor(parent_manifest, workspace_root_manifest)
+        })
+        .filter(|workspace_root_manifest| {
+            canonical_or_original(workspace_root_manifest) != canonical_or_original(parent_manifest)
+        })
+    {
+        let content = fs::read_to_string(workspace_root_manifest)
+            .with_context(|| format!("failed to read {}", workspace_root_manifest.display()))?;
+        let doc: toml::Value = toml::from_str(&content)
+            .with_context(|| format!("failed to parse {}", workspace_root_manifest.display()))?;
+        if has_workspace_dependencies(&doc) {
+            return Ok(Some(doc));
+        }
+    }
+
+    if has_workspace_dependencies(parent_doc) {
+        return Ok(None);
+    }
+
+    let Some(discovered) = discover_workspace_dependency_manifest(parent_manifest)? else {
+        return Ok(None);
+    };
+    if canonical_or_original(&discovered) == canonical_or_original(parent_manifest) {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&discovered)
+        .with_context(|| format!("failed to read {}", discovered.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", discovered.display()))?;
+    Ok(Some(doc))
+}
+
+fn manifest_is_workspace_ancestor(parent_manifest: &Path, workspace_root_manifest: &Path) -> bool {
+    if canonical_or_original(parent_manifest) == canonical_or_original(workspace_root_manifest) {
+        return true;
+    }
+
+    let Some(workspace_dir) = workspace_root_manifest.parent() else {
+        return false;
+    };
+    canonical_or_original(parent_manifest).starts_with(canonical_or_original(workspace_dir))
+}
+
+fn discover_workspace_dependency_manifest(parent_manifest: &Path) -> Result<Option<PathBuf>> {
+    let mut dir = parent_manifest.parent();
+    while let Some(current) = dir {
+        let candidate = current.join("Cargo.toml");
+        if candidate.is_file() {
+            let content = fs::read_to_string(&candidate)
+                .with_context(|| format!("failed to read {}", candidate.display()))?;
+            let doc: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("failed to parse {}", candidate.display()))?;
+            if has_workspace_dependencies(&doc) {
+                return Ok(Some(candidate));
+            }
+        }
+        dir = current.parent();
+    }
+
+    Ok(None)
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn has_workspace_dependencies(doc: &toml::Value) -> bool {
+    doc.get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|deps| deps.as_table())
+        .is_some()
 }
 
 fn dependency_requirement_from_section(
     table: &toml::map::Map<String, toml::Value>,
-    root_doc: &toml::Value,
+    workspace_doc: &toml::Value,
     section: &str,
     missing_crate: &str,
 ) -> Option<String> {
     let deps = table.get(section)?.as_table()?;
     for (alias, dep_value) in deps {
         if let Some(requirement) =
-            dependency_requirement_from_value(alias, dep_value, root_doc, missing_crate)
+            dependency_requirement_from_value(alias, dep_value, workspace_doc, missing_crate)
         {
             return Some(requirement);
         }
@@ -2239,7 +2371,92 @@ fn dependency_requirement_from_section(
 fn dependency_requirement_from_value(
     alias: &str,
     dep_value: &toml::Value,
-    root_doc: &toml::Value,
+    workspace_doc: &toml::Value,
+    missing_crate: &str,
+) -> Option<String> {
+    match dep_value {
+        toml::Value::String(requirement) if alias == missing_crate => Some(requirement.clone()),
+        toml::Value::Table(dep_table) => {
+            if dep_table
+                .get("workspace")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return workspace_dependency_requirement(workspace_doc, alias, missing_crate);
+            }
+
+            let package_name = dep_table
+                .get("package")
+                .and_then(|value| value.as_str())
+                .unwrap_or(alias);
+            if package_name != missing_crate && alias != missing_crate {
+                return None;
+            }
+
+            dependency_requirement_from_dependency_table(dep_table)
+        }
+        _ => None,
+    }
+}
+
+fn dependency_requirement_from_dependency_table(
+    dep_table: &toml::map::Map<String, toml::Value>,
+) -> Option<String> {
+    if dep_table.get("path").is_some() && dep_table.get("version").is_none() {
+        return None;
+    }
+
+    dep_table
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(|version| version.to_string())
+        .or_else(|| Some("*".to_string()))
+}
+
+fn workspace_dependency_requirement(
+    workspace_doc: &toml::Value,
+    member_alias: &str,
+    missing_crate: &str,
+) -> Option<String> {
+    let deps = workspace_dependencies(workspace_doc)?;
+    if let Some(dep_value) = deps.get(member_alias) {
+        if let Some(requirement) =
+            workspace_dependency_requirement_from_value(member_alias, dep_value, missing_crate)
+        {
+            return Some(requirement);
+        }
+    }
+
+    workspace_dependency_requirement_by_package(workspace_doc, missing_crate)
+}
+
+fn workspace_dependency_requirement_by_package(
+    workspace_doc: &toml::Value,
+    missing_crate: &str,
+) -> Option<String> {
+    let deps = workspace_dependencies(workspace_doc)?;
+    for (alias, dep_value) in deps {
+        if let Some(requirement) =
+            workspace_dependency_requirement_from_value(alias, dep_value, missing_crate)
+        {
+            return Some(requirement);
+        }
+    }
+    None
+}
+
+fn workspace_dependencies(
+    workspace_doc: &toml::Value,
+) -> Option<&toml::map::Map<String, toml::Value>> {
+    workspace_doc
+        .get("workspace")?
+        .get("dependencies")?
+        .as_table()
+}
+
+fn workspace_dependency_requirement_from_value(
+    alias: &str,
+    dep_value: &toml::Value,
     missing_crate: &str,
 ) -> Option<String> {
     match dep_value {
@@ -2249,38 +2466,21 @@ fn dependency_requirement_from_value(
                 .get("package")
                 .and_then(|value| value.as_str())
                 .unwrap_or(alias);
-            if package_name != missing_crate {
+            if package_name != missing_crate && alias != missing_crate {
                 return None;
             }
-
-            if dep_table
-                .get("workspace")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-            {
-                return workspace_dependency_requirement(root_doc, package_name);
-            }
-
-            dep_table
-                .get("version")
-                .and_then(|value| value.as_str())
-                .map(|version| version.to_string())
-                .or_else(|| Some("*".to_string()))
+            dependency_requirement_from_dependency_table(dep_table)
         }
         _ => None,
     }
 }
 
-fn workspace_dependency_requirement(root_doc: &toml::Value, crate_name: &str) -> Option<String> {
-    let deps = root_doc.get("workspace")?.get("dependencies")?.as_table()?;
-    for (alias, dep_value) in deps {
-        if let Some(requirement) =
-            dependency_requirement_from_value(alias, dep_value, root_doc, crate_name)
-        {
-            return Some(requirement);
-        }
-    }
-    None
+fn workspace_root_manifest_for_parent(
+    parent_manifest: &Path,
+    root_manifest: &Path,
+) -> Option<PathBuf> {
+    manifest_is_workspace_ancestor(parent_manifest, root_manifest)
+        .then(|| root_manifest.to_path_buf())
 }
 
 // ---------------------------------------------------------------------------
@@ -3308,6 +3508,211 @@ unix-only = { version = "0.7" }
         assert_eq!(
             infer_dependency_requirement(&manifest, "dev-only", true).unwrap(),
             Some("5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_dependency_string_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_manifest = tmp.path().join("Cargo.toml");
+        let member_dir = tmp.path().join("rsvg_convert");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            r#"[workspace]
+members = ["rsvg_convert"]
+
+[workspace.dependencies]
+cairo-rs = "0.22.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &member_manifest,
+            r#"[package]
+name = "rsvg-convert"
+version = "0.1.0"
+
+[dependencies]
+cairo-rs = { workspace = true, features = ["v1_18", "pdf"] }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_dependency_requirement_from_manifest_or_workspace(
+                &member_manifest,
+                "cairo-rs",
+                false,
+                Some(&root_manifest)
+            )
+            .unwrap(),
+            Some("0.22.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_dependency_table_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_manifest = tmp.path().join("Cargo.toml");
+        let member_dir = tmp.path().join("member");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+image = { version = "0.25.0", default-features = false }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &member_manifest,
+            r#"[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+image = { workspace = true, features = ["png"] }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_dependency_requirement_from_manifest_or_workspace(
+                &member_manifest,
+                "image",
+                false,
+                Some(&root_manifest)
+            )
+            .unwrap(),
+            Some("0.25.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_target_specific_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_manifest = tmp.path().join("Cargo.toml");
+        let member_dir = tmp.path().join("member");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+windows = "0.62.2"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &member_manifest,
+            r#"[package]
+name = "member"
+version = "0.1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_dependency_requirement_from_manifest_or_workspace(
+                &member_manifest,
+                "windows",
+                false,
+                Some(&root_manifest)
+            )
+            .unwrap(),
+            Some("0.62.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_dependency_package_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_manifest = tmp.path().join("Cargo.toml");
+        let member_dir = tmp.path().join("member");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+gtk = { package = "gtk4", version = "0.9.0" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &member_manifest,
+            r#"[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+gtk = { workspace = true }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_dependency_requirement_from_manifest_or_workspace(
+                &member_manifest,
+                "gtk4",
+                false,
+                Some(&root_manifest)
+            )
+            .unwrap(),
+            Some("0.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_path_dependency_is_not_provider_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_manifest = tmp.path().join("Cargo.toml");
+        let member_dir = tmp.path().join("member");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            r#"[workspace]
+members = ["member", "rsvg"]
+
+[workspace.dependencies]
+librsvg = { path = "rsvg" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &member_manifest,
+            r#"[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+librsvg = { workspace = true }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_dependency_requirement_from_manifest_or_workspace(
+                &member_manifest,
+                "librsvg",
+                false,
+                Some(&root_manifest)
+            )
+            .unwrap(),
+            None
         );
     }
 
