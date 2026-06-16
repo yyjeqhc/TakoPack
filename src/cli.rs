@@ -340,8 +340,11 @@ pub enum CargoOpt {
 /// Controls how the baseline cargo registry is copied into a plan session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PlanSessionStorage {
-    /// Try reflink (CoW) first, fall back to regular copy. Never hardlink.
+    /// Try fuse-overlay first, then reflink, then copy. Never hardlink.
     Auto,
+    /// Use fuse-overlayfs to mount baseline as read-only lower layer.
+    #[value(name = "fuse-overlay")]
+    FuseOverlay,
     /// Use reflink (CoW) copy. Fail if the filesystem does not support it.
     Reflink,
     /// Regular recursive copy. Slowest but safest.
@@ -354,6 +357,7 @@ impl std::fmt::Display for PlanSessionStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlanSessionStorage::Auto => write!(f, "auto"),
+            PlanSessionStorage::FuseOverlay => write!(f, "fuse-overlay"),
             PlanSessionStorage::Reflink => write!(f, "reflink"),
             PlanSessionStorage::Copy => write!(f, "copy"),
             PlanSessionStorage::Hardlink => write!(f, "hardlink"),

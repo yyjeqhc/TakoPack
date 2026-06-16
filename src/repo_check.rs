@@ -1521,8 +1521,8 @@ fn buildreq_requirement_floor(requirement: Option<&str>) -> Vec<u64> {
 fn print_buildreqs(result: &BuildReqsResult) {
     for record in &result.buildrequires {
         match &record.requirement {
-            Some(requirement) => println!("BuildRequires: {} {}", record.capability, requirement),
-            None => println!("BuildRequires: {}", record.capability),
+            Some(requirement) => println!("BuildRequires:  {} {}", record.capability, requirement),
+            None => println!("BuildRequires:  {}", record.capability),
         }
     }
 }

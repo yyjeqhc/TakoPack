@@ -58,6 +58,7 @@ struct OverlayRegistry {
     registry_dir: PathBuf,
     superseded_dir: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
+    unmount_on_drop: bool,
     session_name: Option<String>,
     session_root: Option<PathBuf>,
     session_file: Option<PathBuf>,
@@ -75,6 +76,7 @@ struct OverlayCopyStats {
 /// The actual storage method used after mode resolution (e.g. auto → copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedStorageMethod {
+    FuseOverlay,
     Reflink,
     Copy,
     Hardlink,
@@ -150,6 +152,10 @@ struct PlanSessionState {
     registry_storage: Option<String>,
     #[serde(default)]
     session_registry: Option<String>,
+    #[serde(default)]
+    overlay_upper: Option<String>,
+    #[serde(default)]
+    overlay_work: Option<String>,
     #[serde(default)]
     added_crates: Vec<AddedCrateRecord>,
     #[serde(default)]
@@ -365,7 +371,8 @@ fn run_resolve_check_plan_missing(
     println!("Planning missing providers using overlay registry...");
     println!();
 
-    let mut overlay = create_overlay_registry(registry_dir, plan_session, plan_reset, plan_session_storage)?;
+    let mut overlay =
+        create_overlay_registry(registry_dir, plan_session, plan_reset, plan_session_storage)?;
     log::debug!(
         "overlay registry: {} (hardlinked files: {}, copied files: {})",
         overlay.path().display(),
@@ -524,6 +531,14 @@ impl OverlayRegistry {
     }
 }
 
+impl Drop for OverlayRegistry {
+    fn drop(&mut self) {
+        if self.unmount_on_drop {
+            unmount_session_registry_best_effort(&self.registry_dir);
+        }
+    }
+}
+
 impl PlanSessionState {
     fn new(base_registry: &Path) -> Self {
         Self {
@@ -531,6 +546,8 @@ impl PlanSessionState {
             base_registry: base_registry.display().to_string(),
             registry_storage: None,
             session_registry: None,
+            overlay_upper: None,
+            overlay_work: None,
             added_crates: Vec::new(),
             upgraded_crates: Vec::new(),
             last_result: None,
@@ -633,18 +650,25 @@ fn create_overlay_registry(
         .context("failed to create temporary overlay registry")?;
     let registry_path = tempdir.path().join("registry");
     let superseded_path = tempdir.path().join("superseded");
-    fs::create_dir_all(&registry_path)
-        .with_context(|| format!("failed to create {}", registry_path.display()))?;
-    let mut stats = OverlayCopyStats::default();
-    // Temporary (non-session) overlays: use the requested storage mode.
-    // For temp overlays hardlink is acceptable since the tempdir is ephemeral.
-    let resolved = resolve_storage_mode(storage_mode, registry_dir, &registry_path)?;
-    copy_registry_tree(registry_dir, &registry_path, resolved, &mut stats)?;
-    println!("plan session registry storage: {}", storage_method_label(resolved));
+    let upper_path = tempdir.path().join("upper");
+    let work_path = tempdir.path().join("work");
+    let (resolved, stats, mounted_fuse_overlay) = initialize_registry_storage(
+        registry_dir,
+        &registry_path,
+        &upper_path,
+        &work_path,
+        storage_mode,
+    )?;
+
+    println!(
+        "plan session registry storage: {}",
+        storage_method_label(resolved)
+    );
     Ok(OverlayRegistry {
         registry_dir: registry_path,
         superseded_dir: superseded_path,
         _tempdir: Some(tempdir),
+        unmount_on_drop: mounted_fuse_overlay,
         session_name: None,
         session_root: None,
         session_file: None,
@@ -664,15 +688,18 @@ fn create_session_overlay_registry(
     let registry_path = session_root.join("registry");
     let superseded_path = session_root.join("superseded");
     let session_file = session_root.join("session.json");
+    let upper_path = session_root.join("upper");
+    let work_path = session_root.join("work");
     let mut stats = OverlayCopyStats::default();
 
     if plan_reset && session_root.exists() {
+        unmount_session_registry_best_effort(&registry_path);
         fs::remove_dir_all(&session_root)
             .with_context(|| format!("failed to reset plan session {}", session_root.display()))?;
     }
 
     let state = if session_root.exists() {
-        let state = load_plan_session_state(&session_file)?;
+        let mut state = load_plan_session_state(&session_file)?;
         if state.base_registry != registry_dir.display().to_string() {
             takopack_bail!(
                 "plan session '{}' was created from {}, but current registry is {}; use --plan-reset to recreate it",
@@ -681,20 +708,75 @@ fn create_session_overlay_registry(
                 registry_dir.display()
             );
         }
+        // If the existing session was fuse-overlay, ensure it is mounted.
+        if state.registry_storage.as_deref() == Some("fuse-overlay") {
+            if !is_mountpoint(&registry_path) {
+                log::info!(
+                    "fuse-overlay session '{}' is not mounted; remounting",
+                    session_name
+                );
+                let upper = state
+                    .overlay_upper
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| upper_path.clone());
+                let work = state
+                    .overlay_work
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| work_path.clone());
+                mount_prepared_fuse_overlay(registry_dir, &upper, &work, &registry_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to remount fuse-overlay for plan session '{}'",
+                            session_name
+                        )
+                    })?;
+                if state.overlay_upper.is_none() || state.overlay_work.is_none() {
+                    state.overlay_upper = Some(upper.display().to_string());
+                    state.overlay_work = Some(work.display().to_string());
+                    save_plan_session_state(&session_file, &state)?;
+                }
+            }
+        }
         println!(
             "plan session registry storage: {} (reusing existing session)",
             state.registry_storage.as_deref().unwrap_or("unknown")
         );
         state
     } else {
-        fs::create_dir_all(&registry_path)
-            .with_context(|| format!("failed to create {}", registry_path.display()))?;
-        let resolved = resolve_storage_mode(storage_mode, registry_dir, &registry_path)?;
-        copy_registry_tree(registry_dir, &registry_path, resolved, &mut stats)?;
-        println!("plan session registry storage: {}", storage_method_label(resolved));
+        let (resolved, created_stats, _mounted_fuse_overlay) = match initialize_registry_storage(
+            registry_dir,
+            &registry_path,
+            &upper_path,
+            &work_path,
+            storage_mode,
+        ) {
+            Ok(created) => created,
+            Err(err) => {
+                unmount_session_registry_best_effort(&registry_path);
+                let _ = fs::remove_dir_all(&session_root);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to initialize plan session '{}' registry",
+                        session_name
+                    )
+                });
+            }
+        };
+        stats = created_stats;
+
+        println!(
+            "plan session registry storage: {}",
+            storage_method_label(resolved)
+        );
         let mut state = PlanSessionState::new(registry_dir);
         state.registry_storage = Some(storage_method_label(resolved).to_string());
         state.session_registry = Some(registry_path.display().to_string());
+        if resolved == ResolvedStorageMethod::FuseOverlay {
+            state.overlay_upper = Some(upper_path.display().to_string());
+            state.overlay_work = Some(work_path.display().to_string());
+        }
         save_plan_session_state(&session_file, &state)?;
         state
     };
@@ -703,12 +785,130 @@ fn create_session_overlay_registry(
         registry_dir: registry_path,
         superseded_dir: superseded_path,
         _tempdir: None,
+        unmount_on_drop: false,
         session_name: Some(session_name.to_string()),
         session_root: Some(session_root),
         session_file: Some(session_file),
         state,
         stats,
     })
+}
+
+fn initialize_registry_storage(
+    source_dir: &Path,
+    registry_path: &Path,
+    upper_path: &Path,
+    work_path: &Path,
+    storage_mode: PlanSessionStorage,
+) -> Result<(ResolvedStorageMethod, OverlayCopyStats, bool)> {
+    let mut stats = OverlayCopyStats::default();
+
+    match storage_mode {
+        PlanSessionStorage::FuseOverlay => {
+            mount_prepared_fuse_overlay(source_dir, upper_path, work_path, registry_path)?;
+            Ok((ResolvedStorageMethod::FuseOverlay, stats, true))
+        }
+        PlanSessionStorage::Auto => {
+            match mount_prepared_fuse_overlay(source_dir, upper_path, work_path, registry_path) {
+                Ok(()) => Ok((ResolvedStorageMethod::FuseOverlay, stats, true)),
+                Err(err) => {
+                    log::info!(
+                        "fuse-overlayfs unavailable or failed for {}; falling back to reflink/copy: {:#}",
+                        registry_path.display(),
+                        err
+                    );
+                    cleanup_failed_fuse_overlay_dirs(registry_path, upper_path, work_path)?;
+                    let resolved = copy_registry_tree_with_reflink_fallback(
+                        source_dir,
+                        registry_path,
+                        PlanSessionStorage::Auto,
+                        &mut stats,
+                    )?;
+                    Ok((resolved, stats, false))
+                }
+            }
+        }
+        PlanSessionStorage::Reflink | PlanSessionStorage::Copy | PlanSessionStorage::Hardlink => {
+            let resolved = copy_registry_tree_with_reflink_fallback(
+                source_dir,
+                registry_path,
+                storage_mode,
+                &mut stats,
+            )?;
+            Ok((resolved, stats, false))
+        }
+    }
+}
+
+fn copy_registry_tree_with_reflink_fallback(
+    source_dir: &Path,
+    registry_path: &Path,
+    storage_mode: PlanSessionStorage,
+    stats: &mut OverlayCopyStats,
+) -> Result<ResolvedStorageMethod> {
+    fs::create_dir_all(registry_path)
+        .with_context(|| format!("failed to create {}", registry_path.display()))?;
+
+    let resolved = resolve_storage_mode_without_fuse(storage_mode, source_dir, registry_path)?;
+    match copy_registry_tree(source_dir, registry_path, resolved, stats) {
+        Ok(()) => Ok(resolved),
+        Err(err)
+            if storage_mode == PlanSessionStorage::Auto
+                && resolved == ResolvedStorageMethod::Reflink =>
+        {
+            log::info!(
+                "reflink copy failed for {}; falling back to copy: {:#}",
+                registry_path.display(),
+                err
+            );
+            remove_dir_all_if_exists(registry_path)?;
+            fs::create_dir_all(registry_path)
+                .with_context(|| format!("failed to recreate {}", registry_path.display()))?;
+            *stats = OverlayCopyStats::default();
+            copy_registry_tree(
+                source_dir,
+                registry_path,
+                ResolvedStorageMethod::Copy,
+                stats,
+            )?;
+            Ok(ResolvedStorageMethod::Copy)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn mount_prepared_fuse_overlay(
+    lowerdir: &Path,
+    upperdir: &Path,
+    workdir: &Path,
+    merged: &Path,
+) -> Result<()> {
+    fs::create_dir_all(merged).with_context(|| format!("failed to create {}", merged.display()))?;
+    fs::create_dir_all(upperdir)
+        .with_context(|| format!("failed to create {}", upperdir.display()))?;
+    fs::create_dir_all(workdir)
+        .with_context(|| format!("failed to create {}", workdir.display()))?;
+    mount_fuse_overlay(lowerdir, upperdir, workdir, merged)
+}
+
+fn cleanup_failed_fuse_overlay_dirs(
+    registry_path: &Path,
+    upper_path: &Path,
+    work_path: &Path,
+) -> Result<()> {
+    unmount_session_registry_best_effort(registry_path);
+    remove_dir_all_if_exists(registry_path)?;
+    remove_dir_all_if_exists(upper_path)?;
+    remove_dir_all_if_exists(work_path)?;
+    Ok(())
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 fn plan_session_root() -> Result<PathBuf> {
@@ -1015,39 +1215,148 @@ fn record_upgraded_crate(
     Ok(())
 }
 
-/// Resolve the requested `PlanSessionStorage` into a concrete method.
+/// Resolve storage modes that do not require creating a live overlay mount.
 ///
-/// For `Auto`, we try a single-file reflink probe; if it fails we fall back
-/// to plain copy.  `Reflink` and `Copy` are used as-is.  `Hardlink` preserves
-/// the legacy behavior.
-fn resolve_storage_mode(
+/// Actual `Auto` initialization is handled by `initialize_registry_storage`,
+/// which first attempts a real fuse-overlayfs mount and falls back here only
+/// when fuse-overlayfs is unavailable or the mount fails.
+fn resolve_storage_mode_without_fuse(
     mode: PlanSessionStorage,
     source_dir: &Path,
     dest_dir: &Path,
 ) -> Result<ResolvedStorageMethod> {
     match mode {
-        PlanSessionStorage::Reflink => Ok(ResolvedStorageMethod::Reflink),
-        PlanSessionStorage::Copy => Ok(ResolvedStorageMethod::Copy),
-        PlanSessionStorage::Hardlink => Ok(ResolvedStorageMethod::Hardlink),
+        PlanSessionStorage::FuseOverlay => {
+            takopack_bail!("internal error: fuse-overlay requested in non-fuse storage resolver");
+        }
         PlanSessionStorage::Auto => {
-            // Probe whether reflink works between source and dest filesystems.
             if probe_reflink_support(source_dir, dest_dir) {
                 Ok(ResolvedStorageMethod::Reflink)
             } else {
-                log::info!("reflink not supported between {} and {}; falling back to copy",
-                    source_dir.display(), dest_dir.display());
+                log::info!(
+                    "reflink not supported between {} and {}; falling back to copy",
+                    source_dir.display(),
+                    dest_dir.display()
+                );
                 Ok(ResolvedStorageMethod::Copy)
             }
         }
+        PlanSessionStorage::Reflink => Ok(ResolvedStorageMethod::Reflink),
+        PlanSessionStorage::Copy => Ok(ResolvedStorageMethod::Copy),
+        PlanSessionStorage::Hardlink => Ok(ResolvedStorageMethod::Hardlink),
     }
 }
 
 fn storage_method_label(method: ResolvedStorageMethod) -> &'static str {
     match method {
+        ResolvedStorageMethod::FuseOverlay => "fuse-overlay",
         ResolvedStorageMethod::Reflink => "reflink",
         ResolvedStorageMethod::Copy => "copy",
         ResolvedStorageMethod::Hardlink => "hardlink",
     }
+}
+
+/// Check whether `fuse-overlayfs` command is available on the system.
+fn probe_fuse_overlayfs() -> bool {
+    use std::process::Command;
+    Command::new("fuse-overlayfs")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Mount a fuse-overlayfs overlay.
+///
+/// `lowerdir`: the baseline registry (read-only layer).
+/// `upperdir`: writable upper layer for copy-on-write.
+/// `workdir`:  overlay internal work directory.
+/// `merged`:   the merged mount point visible to the session.
+fn mount_fuse_overlay(
+    lowerdir: &Path,
+    upperdir: &Path,
+    workdir: &Path,
+    merged: &Path,
+) -> Result<()> {
+    use std::process::Command;
+    if !probe_fuse_overlayfs() {
+        takopack_bail!(
+            "fuse-overlayfs is not available; install fuse-overlayfs or use a different storage mode"
+        );
+    }
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lowerdir.display(),
+        upperdir.display(),
+        workdir.display()
+    );
+    let output = Command::new("fuse-overlayfs")
+        .arg("-o")
+        .arg(&options)
+        .arg(merged)
+        .output()
+        .context("failed to execute fuse-overlayfs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("fuse-overlayfs mount failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Best-effort unmount of a FUSE mount point.
+///
+/// Tries fusermount3, fusermount, then umount.  Logs failures but does not
+/// return an error, since this is used during cleanup where we want to
+/// continue even if unmount fails.
+fn unmount_session_registry_best_effort(path: &Path) {
+    use std::process::Command;
+
+    for cmd in &["fusermount3", "fusermount", "umount"] {
+        let args: Vec<&str> = if *cmd == "umount" { vec![] } else { vec!["-u"] };
+        let mut command = Command::new(cmd);
+        for arg in &args {
+            command.arg(arg);
+        }
+        command.arg(path);
+        match command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                log::debug!("unmounted {} using {}", path.display(), cmd);
+                return;
+            }
+            _ => continue,
+        }
+    }
+    log::debug!(
+        "best-effort unmount of {} failed with all methods; continuing",
+        path.display()
+    );
+}
+
+/// Check whether a path is a mount point by reading `/proc/self/mountinfo`.
+fn is_mountpoint(path: &Path) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let canonical_str = canonical.display().to_string();
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // Each line in mountinfo has fields separated by spaces.
+    // Field 5 (0-indexed: 4) is the mount point.
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 5 && fields[4] == canonical_str {
+            return true;
+        }
+    }
+    false
 }
 
 /// Try to create a reflink copy of a small probe file to detect CoW support.
@@ -1163,30 +1472,35 @@ fn copy_file_with_mode(
     }
 
     match method {
-        ResolvedStorageMethod::Hardlink => {
-            match fs::hard_link(src, dest) {
-                Ok(()) => {
-                    stats.hardlinked_files += 1;
-                    Ok(())
-                }
-                Err(err) => {
-                    log::debug!(
-                        "hardlink {} -> {} failed: {}; falling back to copy",
-                        src.display(),
-                        dest.display(),
-                        err
-                    );
-                    fs::copy(src, dest).with_context(|| {
-                        format!("failed to copy {} to {}", src.display(), dest.display())
-                    })?;
-                    stats.copied_files += 1;
-                    Ok(())
-                }
-            }
+        ResolvedStorageMethod::FuseOverlay => {
+            takopack_bail!("internal error: fuse-overlay storage cannot be used for file copies");
         }
+        ResolvedStorageMethod::Hardlink => match fs::hard_link(src, dest) {
+            Ok(()) => {
+                stats.hardlinked_files += 1;
+                Ok(())
+            }
+            Err(err) => {
+                log::debug!(
+                    "hardlink {} -> {} failed: {}; falling back to copy",
+                    src.display(),
+                    dest.display(),
+                    err
+                );
+                fs::copy(src, dest).with_context(|| {
+                    format!("failed to copy {} to {}", src.display(), dest.display())
+                })?;
+                stats.copied_files += 1;
+                Ok(())
+            }
+        },
         ResolvedStorageMethod::Reflink => {
             reflink_copy_file(src, dest).with_context(|| {
-                format!("reflink copy {} -> {} failed", src.display(), dest.display())
+                format!(
+                    "reflink copy {} -> {} failed",
+                    src.display(),
+                    dest.display()
+                )
             })?;
             stats.reflinked_files += 1;
             Ok(())
@@ -2965,6 +3279,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         fs::metadata(path).unwrap().ino()
     }
 
+    #[cfg(unix)]
+    struct FuseOverlayMountGuard(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for FuseOverlayMountGuard {
+        fn drop(&mut self) {
+            unmount_session_registry_best_effort(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn fuse_overlay_mount_usable() -> bool {
+        if !probe_fuse_overlayfs() {
+            return false;
+        }
+
+        let Ok(tmp) = tempfile::tempdir() else {
+            return false;
+        };
+        let lower = tmp.path().join("lower");
+        let merged = tmp.path().join("merged");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+        if fs::create_dir_all(&lower).is_err()
+            || fs::write(lower.join("probe.txt"), "probe\n").is_err()
+            || fs::create_dir_all(&merged).is_err()
+            || fs::create_dir_all(&upper).is_err()
+            || fs::create_dir_all(&work).is_err()
+        {
+            return false;
+        }
+
+        match mount_fuse_overlay(&lower, &upper, &work, &merged) {
+            Ok(()) => {
+                let usable = merged.join("probe.txt").is_file();
+                unmount_session_registry_best_effort(&merged);
+                usable
+            }
+            Err(err) => {
+                println!("SKIP: fuse-overlayfs mount is not usable: {:#}", err);
+                false
+            }
+        }
+    }
+
     /// Test 1: copy mode creates independent files (different inodes),
     /// and modifying the session file does not change the baseline.
     #[test]
@@ -2978,13 +3337,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         create_test_baseline(&base);
 
         let mut stats = OverlayCopyStats::default();
-        copy_registry_tree(
-            &base,
-            &session,
-            ResolvedStorageMethod::Copy,
-            &mut stats,
-        )
-        .unwrap();
+        copy_registry_tree(&base, &session, ResolvedStorageMethod::Copy, &mut stats).unwrap();
 
         let base_toml = base.join("foo-1.0.0/Cargo.toml");
         let session_toml = session.join("foo-1.0.0/Cargo.toml");
@@ -3031,41 +3384,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("base");
         let session = tmp.path().join("session");
-        fs::create_dir_all(&session).unwrap();
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
 
         create_test_baseline(&base);
 
-        // resolve_storage_mode for Auto will probe reflink support.
-        // On most test filesystems (ext4, tmpfs) reflink is not supported,
-        // so it will fall back to Copy.  Either way, not Hardlink.
-        let resolved = resolve_storage_mode(
-            PlanSessionStorage::Auto,
-            &base,
-            &session,
-        )
-        .unwrap();
+        let (resolved, stats, mounted) =
+            initialize_registry_storage(&base, &session, &upper, &work, PlanSessionStorage::Auto)
+                .unwrap();
+        let _guard = mounted.then(|| FuseOverlayMountGuard(session.clone()));
 
-        // The resolved mode must NOT be Hardlink.
         assert_ne!(
             resolved,
             ResolvedStorageMethod::Hardlink,
             "auto mode must never resolve to hardlink"
         );
-
-        let mut stats = OverlayCopyStats::default();
-        copy_registry_tree(&base, &session, resolved, &mut stats).unwrap();
+        assert_eq!(stats.hardlinked_files, 0, "auto mode must not hardlink");
 
         let base_toml = base.join("foo-1.0.0/Cargo.toml");
         let session_toml = session.join("foo-1.0.0/Cargo.toml");
 
-        // Inodes must differ.
-        assert_ne!(
-            inode_of(&base_toml),
-            inode_of(&session_toml),
-            "auto mode: session and baseline files must not share inodes"
-        );
+        if resolved == ResolvedStorageMethod::FuseOverlay {
+            let original_content = fs::read_to_string(&base_toml).unwrap();
+            fs::write(&session_toml, "# modified in auto fuse-overlay session\n").unwrap();
+            assert_eq!(
+                fs::read_to_string(&base_toml).unwrap(),
+                original_content,
+                "auto fuse-overlay must not modify the baseline"
+            );
 
-        assert_eq!(stats.hardlinked_files, 0, "auto mode must not hardlink");
+            let upper_toml = upper.join("foo-1.0.0/Cargo.toml");
+            assert!(
+                upper_toml.is_file(),
+                "auto fuse-overlay should copy up writes"
+            );
+            assert_ne!(
+                inode_of(&base_toml),
+                inode_of(&upper_toml),
+                "auto fuse-overlay: baseline and upper files must not share inodes"
+            );
+        } else {
+            assert!(
+                session_toml.is_file(),
+                "session copy should contain baseline files"
+            );
+
+            assert_ne!(
+                inode_of(&base_toml),
+                inode_of(&session_toml),
+                "auto mode: session and baseline files must not share inodes"
+            );
+        }
     }
 
     /// Test 3: hardlink mode preserves legacy behavior.
@@ -3081,13 +3450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         create_test_baseline(&base);
 
         let mut stats = OverlayCopyStats::default();
-        copy_registry_tree(
-            &base,
-            &session,
-            ResolvedStorageMethod::Hardlink,
-            &mut stats,
-        )
-        .unwrap();
+        copy_registry_tree(&base, &session, ResolvedStorageMethod::Hardlink, &mut stats).unwrap();
 
         let base_toml = base.join("foo-1.0.0/Cargo.toml");
         let session_toml = session.join("foo-1.0.0/Cargo.toml");
@@ -3100,5 +3463,167 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         );
 
         assert!(stats.hardlinked_files > 0, "should have hardlinked files");
+    }
+
+    // -- fuse-overlay storage mode tests --
+
+    /// Test 4: auto mode prefers fuse-overlay when fuse-overlayfs is usable.
+    #[test]
+    #[cfg(unix)]
+    fn test_auto_prefers_fuse_overlay_if_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let session = tmp.path().join("session");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+
+        create_test_baseline(&base);
+
+        let (resolved, _stats, mounted) =
+            initialize_registry_storage(&base, &session, &upper, &work, PlanSessionStorage::Auto)
+                .unwrap();
+        let _guard = mounted.then(|| FuseOverlayMountGuard(session.clone()));
+
+        if fuse_overlay_mount_usable() {
+            assert_eq!(
+                resolved,
+                ResolvedStorageMethod::FuseOverlay,
+                "auto should prefer fuse-overlay when fuse-overlayfs can mount"
+            );
+        } else {
+            println!(
+                "SKIP: fuse-overlayfs is not usable; auto correctly fell back to {:?}",
+                resolved
+            );
+            assert_ne!(resolved, ResolvedStorageMethod::Hardlink);
+            assert_ne!(resolved, ResolvedStorageMethod::FuseOverlay);
+        }
+    }
+
+    /// Test 5: fuse-overlay does not pollute baseline.
+    #[test]
+    #[cfg(unix)]
+    fn test_fuse_overlay_no_baseline_pollution() {
+        if !fuse_overlay_mount_usable() {
+            println!(
+                "SKIP: fuse-overlayfs is not usable; skipping fuse-overlay baseline pollution test"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let merged = tmp.path().join("merged");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+
+        create_test_baseline(&base);
+        fs::create_dir_all(&merged).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        mount_fuse_overlay(&base, &upper, &work, &merged).unwrap();
+        let _guard = FuseOverlayMountGuard(merged.clone());
+
+        let base_toml = base.join("foo-1.0.0/Cargo.toml");
+        let merged_toml = merged.join("foo-1.0.0/Cargo.toml");
+
+        // File should be visible through the overlay.
+        assert!(
+            merged_toml.is_file(),
+            "merged overlay should show baseline files"
+        );
+
+        // Save original content.
+        let original_content = fs::read_to_string(&base_toml).unwrap();
+
+        // Modify through the overlay.
+        fs::write(&merged_toml, "# modified in fuse-overlay session\n").unwrap();
+
+        // Baseline must be unchanged.
+        let after_content = fs::read_to_string(&base_toml).unwrap();
+        assert_eq!(
+            original_content, after_content,
+            "fuse-overlay: modifying through overlay must not change baseline"
+        );
+
+        // Merged file should have new content.
+        let merged_content = fs::read_to_string(&merged_toml).unwrap();
+        assert_eq!(merged_content, "# modified in fuse-overlay session\n");
+
+        // Upper dir should have the copy-up.
+        let upper_toml = upper.join("foo-1.0.0/Cargo.toml");
+        assert!(
+            upper_toml.is_file(),
+            "upper dir should contain copy-up file"
+        );
+    }
+
+    /// Test 6: plan-reset unmounts fuse-overlay before removing session.
+    #[test]
+    #[cfg(unix)]
+    fn test_plan_reset_unmounts_old_overlay() {
+        if !fuse_overlay_mount_usable() {
+            println!("SKIP: fuse-overlayfs is not usable; skipping plan-reset unmount test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let session_root = tmp.path().join("session");
+        let merged = session_root.join("registry");
+        let upper = session_root.join("upper");
+        let work = session_root.join("work");
+
+        create_test_baseline(&base);
+        fs::create_dir_all(&merged).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        fs::create_dir_all(&work).unwrap();
+
+        mount_fuse_overlay(&base, &upper, &work, &merged).unwrap();
+        assert!(
+            is_mountpoint(&merged),
+            "should be mounted after fuse-overlay mount"
+        );
+
+        // Simulate plan-reset: unmount then remove.
+        unmount_session_registry_best_effort(&merged);
+        assert!(
+            !is_mountpoint(&merged),
+            "should not be mounted after unmount"
+        );
+
+        // remove_dir_all should succeed now.
+        fs::remove_dir_all(&session_root).unwrap();
+        assert!(!session_root.exists(), "session root should be removed");
+    }
+
+    /// Test 7: explicit fuse-overlay failures do not fall back to copying.
+    #[test]
+    fn test_fuse_overlay_explicit_failure_no_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let registry = tmp.path().join("registry");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work-file");
+        create_test_baseline(&base);
+        fs::write(&work, "not a directory\n").unwrap();
+
+        let result = initialize_registry_storage(
+            &base,
+            &registry,
+            &upper,
+            &work,
+            PlanSessionStorage::FuseOverlay,
+        );
+
+        assert!(
+            result.is_err(),
+            "explicit fuse-overlay should fail when mount setup is invalid"
+        );
+        assert!(
+            !registry.join("foo-1.0.0/Cargo.toml").exists(),
+            "explicit fuse-overlay failure must not fall back to copy"
+        );
     }
 }
