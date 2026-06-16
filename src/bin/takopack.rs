@@ -235,6 +235,7 @@ fn real_main() -> Result<i32> {
                     max_plan_iterations,
                     plan_progress_interval,
                     plan_summary_only,
+                    plan_session_storage,
                 } => {
                     log::info!("starting resolve check");
                     takopack::resolve_check::run_resolve_check(
@@ -250,6 +251,7 @@ fn real_main() -> Result<i32> {
                         max_plan_iterations,
                         plan_progress_interval,
                         plan_summary_only,
+                        plan_session_storage,
                     )
                 }
                 CargoOpt::Track {

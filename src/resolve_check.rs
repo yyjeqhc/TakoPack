@@ -31,6 +31,7 @@ use semver::Version;
 use serde_derive::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::cli::PlanSessionStorage;
 use crate::config::load_takopack_toml;
 use crate::crates::resolve_crates_io_version_req;
 use crate::errors::Result;
@@ -68,6 +69,15 @@ struct OverlayRegistry {
 struct OverlayCopyStats {
     hardlinked_files: usize,
     copied_files: usize,
+    reflinked_files: usize,
+}
+
+/// The actual storage method used after mode resolution (e.g. auto → copy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedStorageMethod {
+    Reflink,
+    Copy,
+    Hardlink,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +147,10 @@ struct PlanSessionState {
     schema_version: u32,
     base_registry: String,
     #[serde(default)]
+    registry_storage: Option<String>,
+    #[serde(default)]
+    session_registry: Option<String>,
+    #[serde(default)]
     added_crates: Vec<AddedCrateRecord>,
     #[serde(default)]
     upgraded_crates: Vec<UpgradedCrateRecord>,
@@ -181,6 +195,7 @@ pub fn run_resolve_check(
     max_plan_iterations: usize,
     plan_progress_interval: usize,
     plan_summary_only: bool,
+    plan_session_storage: PlanSessionStorage,
 ) -> Result<i32> {
     if !plan_missing
         && (plan_session.is_some()
@@ -269,6 +284,7 @@ pub fn run_resolve_check(
             allow_session_upgrades,
             max_plan_iterations,
             plan_progress_interval,
+            plan_session_storage,
         );
     }
 
@@ -344,11 +360,12 @@ fn run_resolve_check_plan_missing(
     allow_session_upgrades: bool,
     max_plan_iterations: usize,
     plan_progress_interval: usize,
+    plan_session_storage: PlanSessionStorage,
 ) -> Result<i32> {
     println!("Planning missing providers using overlay registry...");
     println!();
 
-    let mut overlay = create_overlay_registry(registry_dir, plan_session, plan_reset)?;
+    let mut overlay = create_overlay_registry(registry_dir, plan_session, plan_reset, plan_session_storage)?;
     log::debug!(
         "overlay registry: {} (hardlinked files: {}, copied files: {})",
         overlay.path().display(),
@@ -512,6 +529,8 @@ impl PlanSessionState {
         Self {
             schema_version: 1,
             base_registry: base_registry.display().to_string(),
+            registry_storage: None,
+            session_registry: None,
             added_crates: Vec::new(),
             upgraded_crates: Vec::new(),
             last_result: None,
@@ -602,9 +621,10 @@ fn create_overlay_registry(
     registry_dir: &Path,
     plan_session: Option<&str>,
     plan_reset: bool,
+    storage_mode: PlanSessionStorage,
 ) -> Result<OverlayRegistry> {
     if let Some(name) = plan_session {
-        return create_session_overlay_registry(registry_dir, name, plan_reset);
+        return create_session_overlay_registry(registry_dir, name, plan_reset, storage_mode);
     }
 
     let tempdir = tempfile::Builder::new()
@@ -616,7 +636,11 @@ fn create_overlay_registry(
     fs::create_dir_all(&registry_path)
         .with_context(|| format!("failed to create {}", registry_path.display()))?;
     let mut stats = OverlayCopyStats::default();
-    copy_registry_tree_with_hardlinks(registry_dir, &registry_path, &mut stats)?;
+    // Temporary (non-session) overlays: use the requested storage mode.
+    // For temp overlays hardlink is acceptable since the tempdir is ephemeral.
+    let resolved = resolve_storage_mode(storage_mode, registry_dir, &registry_path)?;
+    copy_registry_tree(registry_dir, &registry_path, resolved, &mut stats)?;
+    println!("plan session registry storage: {}", storage_method_label(resolved));
     Ok(OverlayRegistry {
         registry_dir: registry_path,
         superseded_dir: superseded_path,
@@ -633,6 +657,7 @@ fn create_session_overlay_registry(
     registry_dir: &Path,
     session_name: &str,
     plan_reset: bool,
+    storage_mode: PlanSessionStorage,
 ) -> Result<OverlayRegistry> {
     validate_plan_session_name(session_name)?;
     let session_root = plan_session_root()?.join(session_name);
@@ -656,12 +681,20 @@ fn create_session_overlay_registry(
                 registry_dir.display()
             );
         }
+        println!(
+            "plan session registry storage: {} (reusing existing session)",
+            state.registry_storage.as_deref().unwrap_or("unknown")
+        );
         state
     } else {
         fs::create_dir_all(&registry_path)
             .with_context(|| format!("failed to create {}", registry_path.display()))?;
-        copy_registry_tree_with_hardlinks(registry_dir, &registry_path, &mut stats)?;
-        let state = PlanSessionState::new(registry_dir);
+        let resolved = resolve_storage_mode(storage_mode, registry_dir, &registry_path)?;
+        copy_registry_tree(registry_dir, &registry_path, resolved, &mut stats)?;
+        println!("plan session registry storage: {}", storage_method_label(resolved));
+        let mut state = PlanSessionState::new(registry_dir);
+        state.registry_storage = Some(storage_method_label(resolved).to_string());
+        state.session_registry = Some(registry_path.display().to_string());
         save_plan_session_state(&session_file, &state)?;
         state
     };
@@ -982,9 +1015,81 @@ fn record_upgraded_crate(
     Ok(())
 }
 
-fn copy_registry_tree_with_hardlinks(
+/// Resolve the requested `PlanSessionStorage` into a concrete method.
+///
+/// For `Auto`, we try a single-file reflink probe; if it fails we fall back
+/// to plain copy.  `Reflink` and `Copy` are used as-is.  `Hardlink` preserves
+/// the legacy behavior.
+fn resolve_storage_mode(
+    mode: PlanSessionStorage,
     source_dir: &Path,
     dest_dir: &Path,
+) -> Result<ResolvedStorageMethod> {
+    match mode {
+        PlanSessionStorage::Reflink => Ok(ResolvedStorageMethod::Reflink),
+        PlanSessionStorage::Copy => Ok(ResolvedStorageMethod::Copy),
+        PlanSessionStorage::Hardlink => Ok(ResolvedStorageMethod::Hardlink),
+        PlanSessionStorage::Auto => {
+            // Probe whether reflink works between source and dest filesystems.
+            if probe_reflink_support(source_dir, dest_dir) {
+                Ok(ResolvedStorageMethod::Reflink)
+            } else {
+                log::info!("reflink not supported between {} and {}; falling back to copy",
+                    source_dir.display(), dest_dir.display());
+                Ok(ResolvedStorageMethod::Copy)
+            }
+        }
+    }
+}
+
+fn storage_method_label(method: ResolvedStorageMethod) -> &'static str {
+    match method {
+        ResolvedStorageMethod::Reflink => "reflink",
+        ResolvedStorageMethod::Copy => "copy",
+        ResolvedStorageMethod::Hardlink => "hardlink",
+    }
+}
+
+/// Try to create a reflink copy of a small probe file to detect CoW support.
+fn probe_reflink_support(source_dir: &Path, dest_dir: &Path) -> bool {
+    use std::process::Command;
+
+    // Find any regular file in source_dir to use as a probe.
+    let probe_src = WalkDir::new(source_dir)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().is_file());
+    let Some(probe_src) = probe_src else {
+        // Empty registry — reflink is fine (nothing to copy).
+        return true;
+    };
+
+    let probe_dest = dest_dir.join(".takopack-reflink-probe");
+    let result = Command::new("cp")
+        .args(["--reflink=always", "--"])
+        .arg(probe_src.path())
+        .arg(&probe_dest)
+        .output();
+
+    let _ = fs::remove_file(&probe_dest);
+
+    match result {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Copy the registry tree from `source_dir` to `dest_dir` using the
+/// specified storage method.
+///
+/// For `Auto` mode callers: if the initial attempt with `Reflink` fails,
+/// the caller should remove the partially-created dest and retry with `Copy`.
+/// However, `resolve_storage_mode` already probes, so this is a safety net.
+fn copy_registry_tree(
+    source_dir: &Path,
+    dest_dir: &Path,
+    method: ResolvedStorageMethod,
     stats: &mut OverlayCopyStats,
 ) -> Result<()> {
     for entry in WalkDir::new(source_dir)
@@ -1006,12 +1111,12 @@ fn copy_registry_tree_with_hardlinks(
             fs::create_dir_all(&dest)
                 .with_context(|| format!("failed to create {}", dest.display()))?;
         } else if file_type.is_file() {
-            hardlink_or_copy_file(path, &dest, stats)?;
+            copy_file_with_mode(path, &dest, method, stats)?;
         } else if file_type.is_symlink() {
             let metadata = fs::metadata(path)
                 .with_context(|| format!("failed to inspect symlink target {}", path.display()))?;
             if metadata.is_file() {
-                hardlink_or_copy_file(path, &dest, stats)?;
+                copy_file_with_mode(path, &dest, method, stats)?;
             } else if metadata.is_dir() {
                 fs::create_dir_all(&dest)
                     .with_context(|| format!("failed to create {}", dest.display()))?;
@@ -1045,24 +1150,48 @@ fn should_copy_registry_entry(path: &Path, source_dir: &Path) -> bool {
     !name.starts_with(".takopack-sync-") && !name.starts_with(".takopack-plan-")
 }
 
-fn hardlink_or_copy_file(src: &Path, dest: &Path, stats: &mut OverlayCopyStats) -> Result<()> {
+/// Copy a single file using the specified method.
+fn copy_file_with_mode(
+    src: &Path,
+    dest: &Path,
+    method: ResolvedStorageMethod,
+    stats: &mut OverlayCopyStats,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    match fs::hard_link(src, dest) {
-        Ok(()) => {
-            stats.hardlinked_files += 1;
+    match method {
+        ResolvedStorageMethod::Hardlink => {
+            match fs::hard_link(src, dest) {
+                Ok(()) => {
+                    stats.hardlinked_files += 1;
+                    Ok(())
+                }
+                Err(err) => {
+                    log::debug!(
+                        "hardlink {} -> {} failed: {}; falling back to copy",
+                        src.display(),
+                        dest.display(),
+                        err
+                    );
+                    fs::copy(src, dest).with_context(|| {
+                        format!("failed to copy {} to {}", src.display(), dest.display())
+                    })?;
+                    stats.copied_files += 1;
+                    Ok(())
+                }
+            }
+        }
+        ResolvedStorageMethod::Reflink => {
+            reflink_copy_file(src, dest).with_context(|| {
+                format!("reflink copy {} -> {} failed", src.display(), dest.display())
+            })?;
+            stats.reflinked_files += 1;
             Ok(())
         }
-        Err(err) => {
-            log::debug!(
-                "hardlink {} -> {} failed: {}; falling back to copy",
-                src.display(),
-                dest.display(),
-                err
-            );
+        ResolvedStorageMethod::Copy => {
             fs::copy(src, dest).with_context(|| {
                 format!("failed to copy {} to {}", src.display(), dest.display())
             })?;
@@ -1070,6 +1199,28 @@ fn hardlink_or_copy_file(src: &Path, dest: &Path, stats: &mut OverlayCopyStats) 
             Ok(())
         }
     }
+}
+
+/// Perform a reflink (CoW) copy of a single file using `cp --reflink=always`.
+fn reflink_copy_file(src: &Path, dest: &Path) -> Result<()> {
+    use std::process::Command;
+    let output = Command::new("cp")
+        .args(["--reflink=always", "--preserve=mode,timestamps", "--"])
+        .arg(src)
+        .arg(dest)
+        .output()
+        .with_context(|| format!("failed to execute cp for reflink copy of {}", src.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "cp --reflink=always failed for {} -> {}: {}",
+            src.display(),
+            dest.display(),
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn plan_and_materialize_missing_crate(
@@ -2792,5 +2943,162 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let tmp = tempfile::tempdir().unwrap();
         let result = resolve_manifest(tmp.path());
         assert!(result.is_err());
+    }
+
+    // -- Storage mode tests --
+
+    /// Helper: create a minimal baseline registry with a single crate directory.
+    fn create_test_baseline(base: &Path) {
+        let crate_dir = base.join("foo-1.0.0");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(crate_dir.join("README.md"), "# foo\n").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    /// Test 1: copy mode creates independent files (different inodes),
+    /// and modifying the session file does not change the baseline.
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_mode_does_not_pollute_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let session = tmp.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+
+        create_test_baseline(&base);
+
+        let mut stats = OverlayCopyStats::default();
+        copy_registry_tree(
+            &base,
+            &session,
+            ResolvedStorageMethod::Copy,
+            &mut stats,
+        )
+        .unwrap();
+
+        let base_toml = base.join("foo-1.0.0/Cargo.toml");
+        let session_toml = session.join("foo-1.0.0/Cargo.toml");
+
+        // Files must exist in both locations.
+        assert!(base_toml.is_file());
+        assert!(session_toml.is_file());
+
+        // Inodes must differ (not hardlinked).
+        assert_ne!(
+            inode_of(&base_toml),
+            inode_of(&session_toml),
+            "copy mode must create independent files, not hardlinks"
+        );
+
+        // Save original baseline content.
+        let original_content = fs::read_to_string(&base_toml).unwrap();
+
+        // Modify the session file.
+        fs::write(&session_toml, "# modified in session\n").unwrap();
+
+        // Baseline must be unchanged.
+        let after_content = fs::read_to_string(&base_toml).unwrap();
+        assert_eq!(
+            original_content, after_content,
+            "copy mode: modifying session file must not change baseline"
+        );
+
+        // Session file must have the new content.
+        let session_content = fs::read_to_string(&session_toml).unwrap();
+        assert_eq!(session_content, "# modified in session\n");
+
+        // Stats verification.
+        assert!(stats.copied_files > 0, "should have copied files");
+        assert_eq!(stats.hardlinked_files, 0, "should not have hardlinked");
+    }
+
+    /// Test 2: auto mode does not use hardlink.
+    /// Regardless of whether reflink or copy is chosen, files must have
+    /// different inodes from the baseline.
+    #[test]
+    #[cfg(unix)]
+    fn test_auto_mode_does_not_use_hardlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let session = tmp.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+
+        create_test_baseline(&base);
+
+        // resolve_storage_mode for Auto will probe reflink support.
+        // On most test filesystems (ext4, tmpfs) reflink is not supported,
+        // so it will fall back to Copy.  Either way, not Hardlink.
+        let resolved = resolve_storage_mode(
+            PlanSessionStorage::Auto,
+            &base,
+            &session,
+        )
+        .unwrap();
+
+        // The resolved mode must NOT be Hardlink.
+        assert_ne!(
+            resolved,
+            ResolvedStorageMethod::Hardlink,
+            "auto mode must never resolve to hardlink"
+        );
+
+        let mut stats = OverlayCopyStats::default();
+        copy_registry_tree(&base, &session, resolved, &mut stats).unwrap();
+
+        let base_toml = base.join("foo-1.0.0/Cargo.toml");
+        let session_toml = session.join("foo-1.0.0/Cargo.toml");
+
+        // Inodes must differ.
+        assert_ne!(
+            inode_of(&base_toml),
+            inode_of(&session_toml),
+            "auto mode: session and baseline files must not share inodes"
+        );
+
+        assert_eq!(stats.hardlinked_files, 0, "auto mode must not hardlink");
+    }
+
+    /// Test 3: hardlink mode preserves legacy behavior.
+    /// Files should share the same inode.
+    #[test]
+    #[cfg(unix)]
+    fn test_hardlink_mode_preserves_compat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let session = tmp.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+
+        create_test_baseline(&base);
+
+        let mut stats = OverlayCopyStats::default();
+        copy_registry_tree(
+            &base,
+            &session,
+            ResolvedStorageMethod::Hardlink,
+            &mut stats,
+        )
+        .unwrap();
+
+        let base_toml = base.join("foo-1.0.0/Cargo.toml");
+        let session_toml = session.join("foo-1.0.0/Cargo.toml");
+
+        // In hardlink mode, files should share the same inode.
+        assert_eq!(
+            inode_of(&base_toml),
+            inode_of(&session_toml),
+            "hardlink mode: files should share the same inode"
+        );
+
+        assert!(stats.hardlinked_files > 0, "should have hardlinked files");
     }
 }

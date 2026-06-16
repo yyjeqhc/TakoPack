@@ -1,4 +1,4 @@
-use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
+use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand, ValueEnum};
 
 use crate::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
@@ -296,6 +296,10 @@ pub enum CargoOpt {
         /// Print the named plan session summary without resolving or modifying it
         #[arg(long)]
         plan_summary_only: bool,
+
+        /// Storage mode for plan session registry initialization from baseline
+        #[arg(long, value_enum, default_value_t = PlanSessionStorage::Auto, value_name = "MODE")]
+        plan_session_storage: PlanSessionStorage,
     },
     /// Track dependencies from a crate and generate action list
     #[command(name = "track")]
@@ -329,6 +333,32 @@ pub enum CargoOpt {
         #[arg(long, value_name = "FILE")]
         action_file: Option<std::path::PathBuf>,
     },
+}
+
+/// Storage mode for plan session registry creation.
+///
+/// Controls how the baseline cargo registry is copied into a plan session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PlanSessionStorage {
+    /// Try reflink (CoW) first, fall back to regular copy. Never hardlink.
+    Auto,
+    /// Use reflink (CoW) copy. Fail if the filesystem does not support it.
+    Reflink,
+    /// Regular recursive copy. Slowest but safest.
+    Copy,
+    /// Hard-link files from baseline. Fast but session edits can pollute baseline.
+    Hardlink,
+}
+
+impl std::fmt::Display for PlanSessionStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanSessionStorage::Auto => write!(f, "auto"),
+            PlanSessionStorage::Reflink => write!(f, "reflink"),
+            PlanSessionStorage::Copy => write!(f, "copy"),
+            PlanSessionStorage::Hardlink => write!(f, "hardlink"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
