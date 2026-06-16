@@ -580,7 +580,7 @@ fn prepare_project_for_plan_missing(
         copy_project_tree_for_resolve(&workdir, tmp.path())?;
         let tmp_manifest = tmp.path().join(manifest_rel);
         if no_dev {
-            strip_dev_dependencies_from_manifest(&tmp_manifest)?;
+            strip_dev_dependencies_from_project(tmp.path())?;
         }
         let tmp_manifest = tmp_manifest
             .canonicalize()
@@ -1164,7 +1164,7 @@ fn supersede_provider_dir(
         fs::remove_dir_all(&dest)
             .with_context(|| format!("failed to remove old superseded {}", dest.display()))?;
     }
-    fs::rename(&src, &dest).with_context(|| {
+    move_dir_or_copy_remove(&src, &dest).with_context(|| {
         format!(
             "failed to move superseded provider {} to {}",
             src.display(),
@@ -1173,6 +1173,102 @@ fn supersede_provider_dir(
     })?;
 
     Ok(true)
+}
+
+const EXDEV_RAW_OS_ERROR: i32 = 18;
+
+fn move_dir_or_copy_remove(src: &Path, dest: &Path) -> Result<()> {
+    move_dir_or_copy_remove_with(src, dest, |src, dest| fs::rename(src, dest))
+}
+
+fn move_dir_or_copy_remove_with<F>(src: &Path, dest: &Path, rename_fn: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    if dest.exists() {
+        takopack_bail!("destination already exists: {}", dest.display());
+    }
+
+    match rename_fn(src, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device_link(&err) => {
+            log::debug!(
+                "rename {} -> {} failed with EXDEV; copying then removing source",
+                src.display(),
+                dest.display()
+            );
+            copy_dir_recursively(src, dest)?;
+            fs::remove_dir_all(src)
+                .with_context(|| format!("failed to remove moved source {}", src.display()))?;
+            Ok(())
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to rename {} to {}", src.display(), dest.display())),
+    }
+}
+
+fn is_cross_device_link(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(EXDEV_RAW_OS_ERROR)
+}
+
+fn copy_dir_recursively(src: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        takopack_bail!("destination already exists: {}", dest.display());
+    }
+    let metadata =
+        fs::metadata(src).with_context(|| format!("failed to inspect {}", src.display()))?;
+    if !metadata.is_dir() {
+        takopack_bail!("source is not a directory: {}", src.display());
+    }
+
+    fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    for entry in WalkDir::new(src) {
+        let entry = entry.with_context(|| format!("failed to walk {}", src.display()))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(src)
+            .with_context(|| format!("{} is not under {}", path.display(), src.display()))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let out = dest.join(rel);
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            fs::create_dir_all(&out)
+                .with_context(|| format!("failed to create {}", out.display()))?;
+        } else if file_type.is_file() {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(path, &out).with_context(|| {
+                format!("failed to copy {} to {}", path.display(), out.display())
+            })?;
+            let permissions = fs::metadata(path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?
+                .permissions();
+            fs::set_permissions(&out, permissions)
+                .with_context(|| format!("failed to set permissions on {}", out.display()))?;
+        } else if file_type.is_symlink() {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let metadata = fs::metadata(path)
+                .with_context(|| format!("failed to inspect symlink target {}", path.display()))?;
+            if metadata.is_file() {
+                fs::copy(path, &out).with_context(|| {
+                    format!("failed to copy {} to {}", path.display(), out.display())
+                })?;
+            } else if metadata.is_dir() {
+                fs::create_dir_all(&out)
+                    .with_context(|| format!("failed to create {}", out.display()))?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn record_upgraded_crate(
@@ -2534,7 +2630,7 @@ fn make_no_dev_real_project(
     copy_project_tree_for_resolve(&workdir, tmp.path())?;
 
     let tmp_manifest = tmp.path().join(manifest_rel);
-    strip_dev_dependencies_from_manifest(&tmp_manifest)?;
+    strip_dev_dependencies_from_project(tmp.path())?;
     let tmp_manifest = tmp_manifest
         .canonicalize()
         .context("failed to canonicalize no-dev temp manifest")?;
@@ -2599,6 +2695,20 @@ fn should_copy_resolve_entry(path: &Path, source_dir: &Path) -> bool {
     };
     let first = first.as_os_str();
     first != "target" && first != ".git"
+}
+
+fn strip_dev_dependencies_from_project(project_dir: &Path) -> Result<()> {
+    for entry in WalkDir::new(project_dir)
+        .into_iter()
+        .filter_entry(|entry| should_copy_resolve_entry(entry.path(), project_dir))
+    {
+        let entry = entry.context("failed to walk project manifests for no-dev resolve")?;
+        if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
+            continue;
+        }
+        strip_dev_dependencies_from_manifest(entry.path())?;
+    }
+    Ok(())
 }
 
 fn strip_dev_dependencies_from_manifest(manifest: &Path) -> Result<()> {
@@ -2974,11 +3084,17 @@ serde = "1"
 [dev-dependencies]
 criterion = "0.7"
 
+[dev-dependencies.claim]
+version = "0.5"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(unix)'.dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies.claim]
+version = "0.5"
 
 [[bench]]
 name = "bench"
@@ -3007,6 +3123,106 @@ name = "integration"
             .unwrap();
         assert!(unix_target.get("dependencies").is_some());
         assert!(unix_target.get("dev-dependencies").is_none());
+
+        let windows_target = root
+            .get("target")
+            .and_then(|target| target.get("cfg(windows)"))
+            .and_then(|target| target.as_table())
+            .unwrap();
+        assert!(windows_target.get("dev-dependencies").is_none());
+    }
+
+    #[test]
+    fn test_strip_dev_dependencies_from_project_workspace_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("member/src")).unwrap();
+        fs::write(tmp.path().join("src_placeholder"), "").unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["member"]
+
+[package]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+serde = "1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+claim = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+tempfile = "3"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("member/Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+aho-corasick = "1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+claim = "0.5"
+
+[dev-dependencies.pretty_assertions]
+version = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.61"
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies.claim]
+version = "0.5"
+"#,
+        )
+        .unwrap();
+
+        strip_dev_dependencies_from_project(tmp.path()).unwrap();
+
+        let root_content = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        let root_doc: toml::Value = toml::from_str(&root_content).unwrap();
+        let root = root_doc.as_table().unwrap();
+        assert!(root.get("workspace").is_some());
+        assert!(root.get("dependencies").is_some());
+        assert!(root.get("build-dependencies").is_some());
+        assert!(root.get("dev-dependencies").is_none());
+        let unix_target = root
+            .get("target")
+            .and_then(|target| target.get("cfg(unix)"))
+            .and_then(|target| target.as_table())
+            .unwrap();
+        assert!(unix_target.get("dependencies").is_some());
+        assert!(unix_target.get("dev-dependencies").is_none());
+
+        let member_content = fs::read_to_string(tmp.path().join("member/Cargo.toml")).unwrap();
+        let member_doc: toml::Value = toml::from_str(&member_content).unwrap();
+        let member = member_doc.as_table().unwrap();
+        assert!(member.get("dependencies").is_some());
+        assert!(member.get("build-dependencies").is_some());
+        assert!(member.get("dev-dependencies").is_none());
+        let windows_target = member
+            .get("target")
+            .and_then(|target| target.get("cfg(windows)"))
+            .and_then(|target| target.as_table())
+            .unwrap();
+        assert!(windows_target.get("dependencies").is_some());
+        assert!(windows_target.get("dev-dependencies").is_none());
     }
 
     // -- plan-missing parser tests --
@@ -3217,6 +3433,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 "BuildRequires: crate(tiny-http-0.12) >= 0.12.0",
                 "BuildRequires: crate(tokenizers-0.22) >= 0.22.2",
             ]
+        );
+    }
+
+    // -- directory move helper tests --
+
+    #[test]
+    fn test_move_dir_or_copy_remove_falls_back_on_exdev() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src-provider");
+        let dest = tmp.path().join("dest-provider");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(src.join("nested/file.txt"), "payload\n").unwrap();
+
+        move_dir_or_copy_remove_with(&src, &dest, |_, _| {
+            Err(std::io::Error::from_raw_os_error(EXDEV_RAW_OS_ERROR))
+        })
+        .unwrap();
+
+        assert!(
+            !src.exists(),
+            "source should be removed after copy fallback"
+        );
+        assert!(dest.is_dir(), "destination should exist after fallback");
+        assert_eq!(
+            fs::read_to_string(dest.join("Cargo.toml")).unwrap(),
+            "[package]\nname = \"x\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("nested/file.txt")).unwrap(),
+            "payload\n"
         );
     }
 
