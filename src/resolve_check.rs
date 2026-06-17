@@ -2979,7 +2979,7 @@ fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
         let capability_name = name.replace('_', "-");
         let clean_version = clean_semver_without_build(&parsed_version);
         buildrequires.insert(format!(
-            "BuildRequires: crate({}-{}) >= {}",
+            "BuildRequires:  crate({}-{}) >= {}",
             capability_name, compat, clean_version
         ));
     }
@@ -3834,9 +3834,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert_eq!(
             buildrequires,
             vec![
-                "BuildRequires: crate(serde-1) >= 1.0.228",
-                "BuildRequires: crate(tiny-http-0.12) >= 0.12.0",
-                "BuildRequires: crate(tokenizers-0.22) >= 0.22.2",
+                "BuildRequires:  crate(serde-1) >= 1.0.228",
+                "BuildRequires:  crate(tiny-http-0.12) >= 0.12.0",
+                "BuildRequires:  crate(tokenizers-0.22) >= 0.22.2",
             ]
         );
     }
