@@ -148,6 +148,21 @@ fn real_main() -> Result<i32> {
                     )?;
                     Ok(0)
                 }
+                CargoOpt::RegenerateProvider {
+                    provider_dir,
+                    output,
+                    base_cargo_toml,
+                    range_capability_policy,
+                } => {
+                    log::info!("regenerating provider directory: {:?}", provider_dir);
+                    takopack::regen_provider::regenerate_provider(
+                        &provider_dir,
+                        &output,
+                        base_cargo_toml.as_deref(),
+                        range_capability_policy,
+                    )?;
+                    Ok(0)
+                }
                 CargoOpt::BuildReqs {
                     file,
                     index,

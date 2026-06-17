@@ -16,6 +16,7 @@ pub mod package;
 pub mod python_package;
 pub mod range_audit;
 pub mod recursive_package;
+pub mod regen_provider;
 pub mod registry_sync;
 pub mod repo_check;
 pub mod resolve_check;

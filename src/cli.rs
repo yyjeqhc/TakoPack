@@ -101,6 +101,30 @@ pub enum CargoOpt {
         #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
         range_capability_policy: RangeCapabilityPolicy,
     },
+    /// Regenerate an existing provider while preserving source metadata
+    #[command(name = "regen-provider", alias = "regenerate-provider")]
+    RegenerateProvider {
+        /// Existing provider directory containing Cargo.toml and a .spec file
+        #[arg(value_name = "EXISTING_PROVIDER_DIR")]
+        provider_dir: std::path::PathBuf,
+
+        /// Output provider directory. Must not be the input directory.
+        #[arg(
+            short = 'o',
+            long = "directory",
+            alias = "output",
+            value_name = "OUT_DIR"
+        )]
+        output: std::path::PathBuf,
+
+        /// Optional base Cargo.toml used to generate the incremental Cargo.toml patch
+        #[arg(long, value_name = "PATH")]
+        base_cargo_toml: Option<std::path::PathBuf>,
+
+        /// Policy for range-capability warnings (warn|error|allow)
+        #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
+        range_capability_policy: RangeCapabilityPolicy,
+    },
     /// Generate RPM BuildRequires candidates from Cargo.toml
     #[command(name = "buildreqs")]
     BuildReqs {

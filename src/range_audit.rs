@@ -298,8 +298,12 @@ fn caret_upper_bound(comp: &Comparator) -> Version {
 
     if major > 0 {
         Version::new(major + 1, 0, 0)
+    } else if comp.minor.is_none() {
+        Version::new(1, 0, 0)
     } else if minor > 0 {
         Version::new(0, minor + 1, 0)
+    } else if comp.patch.is_none() {
+        Version::new(0, 1, 0)
     } else {
         Version::new(0, 0, patch + 1)
     }
@@ -845,6 +849,7 @@ mod tests {
     fn range_0_0_x_no_warning() {
         // ">=0.0.3, <0.0.4" -> only in 0.0.3 compat
         assert!(check(">=0.0.3, <0.0.4").is_none());
+        assert!(check("0.0.6").is_none());
     }
 
     #[test]
@@ -852,6 +857,15 @@ mod tests {
         // ">=0.0.3, <0.0.5" -> spans 0.0.3 and 0.0.4
         let w = check(">=0.0.3, <0.0.5");
         assert!(w.is_some(), ">=0.0.3,<0.0.5 should warn (0.0.x compat)");
+
+        let w = check("0.0");
+        assert!(
+            w.is_some(),
+            "0.0 should warn because it spans 0.0.x compat keys"
+        );
+
+        let w = check(">=0.0, <0.1");
+        assert!(w.is_some(), ">=0.0,<0.1 should warn");
     }
 
     #[test]
