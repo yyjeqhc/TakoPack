@@ -29,7 +29,7 @@ use serde_derive::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::config::load_takopack_toml;
+use crate::config::{default_registry_dir, load_takopack_toml};
 use crate::errors::Result;
 
 const TAKOPACK_METADATA_DIR: &str = ".takopack";
@@ -240,14 +240,6 @@ fn resolve_paths() -> Result<(PathBuf, PathBuf)> {
     };
 
     Ok((ruyispec_dir, registry_dir))
-}
-
-/// `$XDG_DATA_HOME/takopack/cargo-registry` or `~/.local/share/takopack/cargo-registry`.
-fn default_registry_dir() -> Result<PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine XDG_DATA_HOME / home directory for default registry path")
-    })?;
-    Ok(data_dir.join("takopack").join("cargo-registry"))
 }
 
 // ---------------------------------------------------------------------------

@@ -316,7 +316,7 @@ fn clean_package_name(pkg_name: &str) -> String {
     cleaned_parts.join("-")
 }
 
-fn crate_requirements_from_cargo_deps(
+pub(crate) fn crate_requirements_from_cargo_deps(
     deps: &[Dependency],
     current_crate_name: &str,
 ) -> Vec<CrateRequirement> {

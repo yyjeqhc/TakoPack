@@ -256,8 +256,11 @@ fn real_main() -> Result<i32> {
                 }
                 CargoOpt::ResolveCheck {
                     path,
+                    registry,
                     no_dev,
                     print_buildrequires,
+                    buildrequires_mode,
+                    buildrequires_report,
                     plan_missing,
                     plan_session,
                     plan_reset,
@@ -272,8 +275,11 @@ fn real_main() -> Result<i32> {
                     log::info!("starting resolve check");
                     takopack::resolve_check::run_resolve_check(
                         &path,
+                        registry.as_deref(),
                         no_dev,
                         print_buildrequires,
+                        buildrequires_mode,
+                        buildrequires_report.as_deref(),
                         plan_missing,
                         plan_session.as_deref(),
                         plan_reset,

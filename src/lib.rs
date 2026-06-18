@@ -8,6 +8,7 @@ pub mod util;
 
 pub mod batch_package;
 pub mod build_order;
+pub mod buildreqs_compact;
 pub mod crate_database;
 pub mod deb_dependencies;
 pub mod local_package;

@@ -285,13 +285,25 @@ pub enum CargoOpt {
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
 
+        /// Local Cargo directory registry. Overrides [registry].local_path in takopack.toml
+        #[arg(long, value_name = "DIR")]
+        registry: Option<std::path::PathBuf>,
+
         /// Resolve against a temporary manifest with dev/test/bench dependencies removed
         #[arg(long)]
         no_dev: bool,
 
-        /// Print BuildRequires candidates from the generated Cargo.lock on success
+        /// Deprecated: resolve-check prints BuildRequires by default
         #[arg(long)]
         print_buildrequires: bool,
+
+        /// BuildRequires output strategy
+        #[arg(long, value_enum, default_value_t = BuildRequiresMode::Roots)]
+        buildrequires_mode: BuildRequiresMode,
+
+        /// Output BuildRequires generation and roots validation report
+        #[arg(long, value_name = "PATH")]
+        buildrequires_report: Option<std::path::PathBuf>,
 
         /// Temporarily fetch missing crates into an overlay registry to plan providers
         #[arg(long)]
@@ -408,6 +420,23 @@ impl std::fmt::Display for PlanSessionStorage {
             PlanSessionStorage::Reflink => write!(f, "reflink"),
             PlanSessionStorage::Copy => write!(f, "copy"),
             PlanSessionStorage::Hardlink => write!(f, "hardlink"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BuildRequiresMode {
+    /// Print every registry package from the resolved Cargo.lock.
+    Flattened,
+    /// Print root direct dependency feature requirements from Cargo.toml.
+    Roots,
+}
+
+impl std::fmt::Display for BuildRequiresMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildRequiresMode::Flattened => write!(f, "flattened"),
+            BuildRequiresMode::Roots => write!(f, "roots"),
         }
     }
 }

@@ -954,7 +954,7 @@ pub fn all_dependencies_and_features_filtered(
                         }
                     }
                     None if dependency_is_dev_dependency(manifest, dep_name.as_str()) => {
-                        takopack_warn!(
+                        log::debug!(
                             "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                  dev-dependency \"{}\"",
                             manifest.package_id(),
@@ -968,7 +968,7 @@ pub fn all_dependencies_and_features_filtered(
                         include_dev_dependencies,
                     ) =>
                     {
-                        takopack_warn!(
+                        log::debug!(
                             "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
                             manifest.package_id(),
                             feature,
@@ -1003,7 +1003,7 @@ pub fn all_dependencies_and_features_filtered(
                         }
                         None => {
                             if dependency_is_dev_dependency(manifest, dep_name.as_str()) {
-                                takopack_warn!(
+                                log::debug!(
                                     "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                      dev-dependency \"{}\"",
                                     manifest.package_id(),
@@ -1015,7 +1015,7 @@ pub fn all_dependencies_and_features_filtered(
                                 dep_name.as_str(),
                                 include_dev_dependencies,
                             ) {
-                                takopack_warn!(
+                                log::debug!(
                                     "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
                                     manifest.package_id(),
                                     feature,
@@ -1075,7 +1075,7 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
     }
 
     if is_special_rustc_workspace_crate(dep.package_name().as_str()) {
-        takopack_warn!(
+        log::debug!(
             "Skipping special/internal Rust workspace dependency from runtime Requires: {}",
             dep.package_name()
         );
@@ -1085,7 +1085,7 @@ pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencie
     if matches!(dep.kind(), DepKind::Build | DepKind::Development)
         && !dependency_matches_openruyi_linux_target(dep)
     {
-        takopack_warn!(
+        log::debug!(
             "Skipping target-specific build/dev dependency not enabled for x86_64-unknown-linux-gnu Requires: {} {:?}",
             dep.package_name(),
             dep.platform().map(|platform| platform.to_string())

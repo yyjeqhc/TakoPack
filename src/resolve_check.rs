@@ -18,7 +18,7 @@
 //!   plan-missing mode performs limited structured analysis for missing crates
 //!   and version conflicts.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,12 +31,15 @@ use semver::Version;
 use serde_derive::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::cli::PlanSessionStorage;
-use crate::config::load_takopack_toml;
+use crate::buildreqs_compact::{validate_buildrequires_closure, BuildRequiresClosureValidation};
+use crate::cli::{BuildRequiresMode, PlanSessionStorage};
 use crate::crates::resolve_crates_io_version_req;
 use crate::errors::Result;
 use crate::registry_sync::materialize_crate_from_crates_io;
+use crate::takopack::spec::normalize_feature_name;
 use crate::util::{calculate_compat_version, rust_crate_output_names};
+
+const BASE_FEATURE_SENTINEL: &str = "\0takopack-base";
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -45,6 +48,71 @@ use crate::util::{calculate_compat_version, rust_crate_output_names};
 #[derive(Debug, Default)]
 struct ResolveOutcome {
     buildrequires: Vec<String>,
+    lock_packages: Vec<LockPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct LockPackage {
+    name: String,
+    version: Version,
+    source: Option<String>,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RootBuildRequires {
+    lines: Vec<String>,
+    direct_dep_count: usize,
+    feature_requirement_count: usize,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RootDependency {
+    alias: String,
+    package: String,
+    version_requirement: Option<String>,
+    path: Option<PathBuf>,
+    non_registry_source: bool,
+    optional: bool,
+    default_features: bool,
+    features: BTreeSet<String>,
+    inherited_workspace: bool,
+    target_specific: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RootFeatureActivation {
+    active_optional_deps: BTreeSet<String>,
+    dependency_features: BTreeMap<String, BTreeSet<String>>,
+    weak_dependency_features: Vec<(String, String)>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedPackage {
+    version: Version,
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceDependencyContext {
+    manifest: PathBuf,
+    doc: toml::Value,
+}
+
+#[derive(Debug, Clone)]
+struct BuildRequiresReport {
+    mode: BuildRequiresMode,
+    root_direct_deps: usize,
+    root_feature_requirements: usize,
+    flattened_requirements: usize,
+    covered_flattened_requirements: usize,
+    missing_flattened_requirements: usize,
+    missing_by_package: BTreeMap<String, Vec<String>>,
+    missing_by_reason: BTreeMap<String, Vec<String>>,
+    validation: Option<BuildRequiresClosureValidation>,
+    notes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -190,8 +258,11 @@ struct UpgradedCrateRecord {
 /// Returns an exit code: 0 = resolve succeeded, 1 = failed or error.
 pub fn run_resolve_check(
     path: &Path,
+    registry: Option<&Path>,
     no_dev: bool,
-    print_buildrequires: bool,
+    _print_buildrequires: bool,
+    buildrequires_mode: BuildRequiresMode,
+    buildrequires_report: Option<&Path>,
     plan_missing: bool,
     plan_session: Option<&str>,
     plan_reset: bool,
@@ -236,7 +307,7 @@ pub fn run_resolve_check(
     let (manifest, workdir) = resolve_manifest(path)?;
 
     // 2. Determine registry directory.
-    let registry_dir = resolve_registry_dir()?;
+    let registry_dir = crate::config::resolve_registry_dir(registry)?;
     if !registry_dir.is_dir() {
         takopack_bail!(
             "local registry directory does not exist: {}\n\
@@ -282,7 +353,8 @@ pub fn run_resolve_check(
             &targets,
             is_real,
             no_dev,
-            print_buildrequires,
+            buildrequires_mode,
+            buildrequires_report,
             plan_session,
             plan_reset,
             plan_add,
@@ -295,56 +367,340 @@ pub fn run_resolve_check(
     }
 
     if is_real {
-        match cargo_resolve(
-            &manifest,
-            &workdir,
-            &registry_dir,
-            no_dev,
-            print_buildrequires,
-        ) {
+        match cargo_resolve(&manifest, &workdir, &registry_dir, no_dev, true) {
             Ok(outcome) => {
                 println!("Result: ok");
-                print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
+                print_buildrequires_after_resolve(
+                    buildrequires_mode,
+                    buildrequires_report,
+                    &manifest,
+                    &outcome,
+                )?;
                 Ok(0)
             }
             Err(e) => {
                 println!("Result: failed");
                 eprintln!("{:?}", e);
+                print_buildrequires_after_failed_resolve(
+                    buildrequires_mode,
+                    buildrequires_report,
+                    &manifest,
+                )?;
                 Ok(1)
             }
         }
     } else {
-        match cargo_resolve_virtual_with_options(
-            &manifest,
-            &registry_dir,
-            &targets,
-            no_dev,
-            print_buildrequires,
-        ) {
+        match cargo_resolve_virtual_with_options(&manifest, &registry_dir, &targets, no_dev, true) {
             Ok(outcome) => {
                 println!("Result: ok");
-                print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
+                print_buildrequires_after_resolve(
+                    buildrequires_mode,
+                    buildrequires_report,
+                    &manifest,
+                    &outcome,
+                )?;
                 Ok(0)
             }
             Err(e) => {
                 println!("Result: failed");
                 eprintln!("{:?}", e);
+                print_buildrequires_after_failed_resolve(
+                    buildrequires_mode,
+                    buildrequires_report,
+                    &manifest,
+                )?;
                 Ok(1)
             }
         }
     }
 }
 
-fn print_buildrequires_if_requested(print_buildrequires: bool, buildrequires: &[String]) {
-    if !print_buildrequires {
-        return;
-    }
-
-    println!();
-    println!("BuildRequires:");
+fn print_buildrequires(buildrequires: &[String]) {
     for line in buildrequires {
         println!("{}", line);
     }
+}
+
+fn print_buildrequires_after_resolve(
+    mode: BuildRequiresMode,
+    report_path: Option<&Path>,
+    manifest: &Path,
+    outcome: &ResolveOutcome,
+) -> Result<()> {
+    let (buildrequires, report) = buildrequires_for_mode(mode, manifest, outcome)?;
+    print_buildrequires(&buildrequires);
+
+    if let Some(path) = report_path {
+        write_buildrequires_report(path, &render_buildrequires_report(&report))?;
+    }
+    if report.missing_flattened_requirements > 0 {
+        match (mode, report_path) {
+            (BuildRequiresMode::Roots, Some(path)) => {
+                eprintln!(
+                    "BuildRequires roots validation details were written to {}",
+                    path.display()
+                );
+            }
+            (BuildRequiresMode::Roots, None) => {}
+            (_, Some(path)) => {
+                eprintln!(
+                    "BuildRequires {} validation: {} flattened requirement(s) are not covered",
+                    mode, report.missing_flattened_requirements
+                );
+                eprintln!("BuildRequires report: {}", path.display());
+            }
+            (_, None) => {
+                eprintln!(
+                    "BuildRequires {} validation: {} flattened requirement(s) are not covered",
+                    mode, report.missing_flattened_requirements
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_buildrequires_after_failed_resolve(
+    mode: BuildRequiresMode,
+    report_path: Option<&Path>,
+    manifest: &Path,
+) -> Result<()> {
+    if mode != BuildRequiresMode::Roots {
+        eprintln!(
+            "BuildRequires fallback skipped: --buildrequires-mode {} needs a generated Cargo.lock",
+            mode
+        );
+        return Ok(());
+    }
+
+    let mut roots = root_buildrequires_from_manifest(manifest, &[])?;
+    roots
+        .notes
+        .push("resolve failed; printed best-effort root BuildRequires from Cargo.toml".to_string());
+    let report = BuildRequiresReport {
+        mode,
+        root_direct_deps: roots.direct_dep_count,
+        root_feature_requirements: roots.feature_requirement_count,
+        flattened_requirements: 0,
+        covered_flattened_requirements: 0,
+        missing_flattened_requirements: 0,
+        missing_by_package: BTreeMap::new(),
+        missing_by_reason: BTreeMap::new(),
+        validation: None,
+        notes: roots.notes,
+    };
+    eprintln!("BuildRequires fallback: using Cargo.toml because resolve failed");
+    print_buildrequires(&roots.lines);
+    let visible_notes = user_visible_fallback_notes(&report.notes);
+    if !visible_notes.is_empty() {
+        eprintln!("BuildRequires fallback notes:");
+        for note in visible_notes {
+            eprintln!("- {note}");
+        }
+    }
+    if let Some(path) = report_path {
+        write_buildrequires_report(path, &render_buildrequires_report(&report))?;
+        eprintln!("BuildRequires report: {}", path.display());
+    }
+    Ok(())
+}
+
+fn user_visible_fallback_notes(notes: &[String]) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|note| note.contains("path dependency"))
+        .cloned()
+        .collect()
+}
+
+fn buildrequires_for_mode(
+    mode: BuildRequiresMode,
+    manifest: &Path,
+    outcome: &ResolveOutcome,
+) -> Result<(Vec<String>, BuildRequiresReport)> {
+    match mode {
+        BuildRequiresMode::Flattened => {
+            let report = BuildRequiresReport {
+                mode,
+                root_direct_deps: 0,
+                root_feature_requirements: 0,
+                flattened_requirements: outcome.buildrequires.len(),
+                covered_flattened_requirements: outcome.buildrequires.len(),
+                missing_flattened_requirements: 0,
+                missing_by_package: BTreeMap::new(),
+                missing_by_reason: BTreeMap::new(),
+                validation: None,
+                notes: Vec::new(),
+            };
+            Ok((outcome.buildrequires.clone(), report))
+        }
+        BuildRequiresMode::Roots => {
+            let roots = root_buildrequires_from_manifest(manifest, &outcome.lock_packages)?;
+            let report = roots_report_best_effort(mode, &roots, &outcome.buildrequires)?;
+            Ok((roots.lines, report))
+        }
+    }
+}
+
+fn roots_report_best_effort(
+    mode: BuildRequiresMode,
+    roots: &RootBuildRequires,
+    flattened_buildrequires: &[String],
+) -> Result<BuildRequiresReport> {
+    match resolve_buildrequires_ruyispec_root().and_then(|ruyispec_root| {
+        validate_buildrequires_closure(&roots.lines, flattened_buildrequires, &ruyispec_root)
+    }) {
+        Ok(validation) => Ok(report_from_validation(
+            mode,
+            roots.direct_dep_count,
+            roots.feature_requirement_count,
+            validation,
+            roots.notes.clone(),
+        )),
+        Err(err) => {
+            let mut notes = roots.notes.clone();
+            notes.push(format!(
+                "closure validation skipped: {err:#}; printed root BuildRequires from Cargo.toml"
+            ));
+            Ok(BuildRequiresReport {
+                mode,
+                root_direct_deps: roots.direct_dep_count,
+                root_feature_requirements: roots.feature_requirement_count,
+                flattened_requirements: flattened_buildrequires.len(),
+                covered_flattened_requirements: 0,
+                missing_flattened_requirements: 0,
+                missing_by_package: BTreeMap::new(),
+                missing_by_reason: BTreeMap::new(),
+                validation: None,
+                notes,
+            })
+        }
+    }
+}
+
+fn report_from_validation(
+    mode: BuildRequiresMode,
+    root_direct_deps: usize,
+    root_feature_requirements: usize,
+    validation: BuildRequiresClosureValidation,
+    notes: Vec<String>,
+) -> BuildRequiresReport {
+    BuildRequiresReport {
+        mode,
+        root_direct_deps,
+        root_feature_requirements,
+        flattened_requirements: validation.flattened_requirements,
+        covered_flattened_requirements: validation.covered_flattened_requirements,
+        missing_flattened_requirements: validation.missing_flattened_requirements,
+        missing_by_package: validation.missing_by_package.clone(),
+        missing_by_reason: validation.missing_by_reason.clone(),
+        validation: Some(validation),
+        notes,
+    }
+}
+
+fn resolve_buildrequires_ruyispec_root() -> Result<PathBuf> {
+    match crate::config::resolve_ruyispec_dir(None, true) {
+        Ok(path) => Ok(path),
+        Err(config_err) => {
+            let fallback = PathBuf::from("/root/git/ruyia");
+            if fallback.is_dir() {
+                Ok(fallback)
+            } else {
+                Err(config_err)
+                    .context("failed to resolve ruyispec root for BuildRequires closure validation")
+            }
+        }
+    }
+}
+
+fn render_buildrequires_report(report: &BuildRequiresReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("mode: {}\n", report.mode));
+    out.push_str(&format!("root direct deps: {}\n", report.root_direct_deps));
+    out.push_str(&format!(
+        "root feature requirements: {}\n",
+        report.root_feature_requirements
+    ));
+    out.push_str(&format!(
+        "flattened requirements: {}\n",
+        report.flattened_requirements
+    ));
+    out.push_str(&format!(
+        "covered flattened requirements: {}\n",
+        report.covered_flattened_requirements
+    ));
+    out.push_str(&format!(
+        "missing flattened requirements: {}\n",
+        report.missing_flattened_requirements
+    ));
+
+    if let Some(validation) = &report.validation {
+        out.push_str(&format!(
+            "closure capabilities: {}\n",
+            validation.closure_capabilities
+        ));
+        out.push_str(&format!(
+            "provider specs scanned: {}\n",
+            validation.provider_specs_scanned
+        ));
+        out.push_str(&format!(
+            "provider Cargo.toml files scanned: {}\n",
+            validation.provider_cargo_toml_files_scanned
+        ));
+        out.push_str(&format!(
+            "provider Cargo feature edges added: {}\n",
+            validation.provider_cargo_feature_edges_added
+        ));
+        out.push_str(&format!(
+            "validated root requirements: {}\n",
+            validation.root_requirements
+        ));
+    }
+
+    if !report.notes.is_empty() {
+        out.push_str("\nnotes:\n");
+        for note in &report.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+    }
+
+    out.push_str("\nmissing by crate:\n");
+    if report.missing_by_package.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for (package, requirements) in &report.missing_by_package {
+            out.push_str(&format!("- {package}: {}\n", requirements.len()));
+            for requirement in requirements {
+                out.push_str(&format!("  {requirement}\n"));
+            }
+        }
+    }
+
+    out.push_str("\nmissing by reason:\n");
+    if report.missing_by_reason.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for (reason, requirements) in &report.missing_by_reason {
+            out.push_str(&format!("- {reason}: {}\n", requirements.len()));
+            for requirement in requirements {
+                out.push_str(&format!("  {requirement}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+fn write_buildrequires_report(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +714,8 @@ fn run_resolve_check_plan_missing(
     targets: &ManifestTargets,
     is_real: bool,
     no_dev: bool,
-    print_buildrequires: bool,
+    buildrequires_mode: BuildRequiresMode,
+    buildrequires_report: Option<&Path>,
     plan_session: Option<&str>,
     plan_reset: bool,
     plan_add: &[String],
@@ -414,11 +771,16 @@ fn run_resolve_check_plan_missing(
         }
 
         iterations += 1;
-        match cargo_resolve_prepared(&prepared.manifest, overlay.path(), print_buildrequires) {
+        match cargo_resolve_prepared(&prepared.manifest, overlay.path(), true) {
             Ok(outcome) => {
                 finish_plan_run(&mut overlay, "ok", "resolve ok", iterations)?;
                 println!("Result: ok");
-                print_buildrequires_if_requested(print_buildrequires, &outcome.buildrequires);
+                print_buildrequires_after_resolve(
+                    buildrequires_mode,
+                    buildrequires_report,
+                    manifest,
+                    &outcome,
+                )?;
                 return Ok(0);
             }
             Err(err) => {
@@ -494,7 +856,7 @@ fn run_resolve_check_plan_missing(
                             print_continue_with_upgrade_command(
                                 manifest,
                                 no_dev,
-                                print_buildrequires,
+                                true,
                                 plan_session,
                                 &candidate,
                             );
@@ -624,14 +986,17 @@ fn cargo_resolve_prepared(
         .with_context(|| format!("failed to open workspace at {}", manifest.display()))?;
 
     ops::generate_lockfile(&ws).context("cargo resolve failed")?;
-    let buildrequires = if print_buildrequires {
+    let (buildrequires, lock_packages) = if print_buildrequires {
         let lockfile = ws.root().join("Cargo.lock");
-        buildrequires_from_lockfile(&lockfile)?
+        buildrequires_and_lock_packages_from_lockfile(&lockfile)?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
-    Ok(ResolveOutcome { buildrequires })
+    Ok(ResolveOutcome {
+        buildrequires,
+        lock_packages,
+    })
 }
 
 fn create_overlay_registry(
@@ -2339,6 +2704,29 @@ fn discover_workspace_dependency_manifest(parent_manifest: &Path) -> Result<Opti
     Ok(None)
 }
 
+fn discover_workspace_manifest(parent_manifest: &Path) -> Result<Option<PathBuf>> {
+    let mut dir = parent_manifest.parent();
+    while let Some(current) = dir {
+        let candidate = current.join("Cargo.toml");
+        if candidate.is_file() {
+            let content = fs::read_to_string(&candidate)
+                .with_context(|| format!("failed to read {}", candidate.display()))?;
+            let doc: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("failed to parse {}", candidate.display()))?;
+            if doc
+                .get("workspace")
+                .and_then(|workspace| workspace.as_table())
+                .is_some()
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        dir = current.parent();
+    }
+
+    Ok(None)
+}
+
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -2638,41 +3026,6 @@ fn detect_real_mode(targets: &ManifestTargets, workdir: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Registry directory resolution
-// ---------------------------------------------------------------------------
-
-fn resolve_registry_dir() -> Result<PathBuf> {
-    // Try takopack.toml first.
-    if let Some((config_path, config)) = load_takopack_toml()? {
-        if let Some(registry) = config.registry {
-            if let Some(local_path) = registry.local_path {
-                let path = if local_path.is_absolute() {
-                    local_path
-                } else {
-                    config_path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(local_path)
-                };
-                return Ok(path);
-            }
-        }
-    }
-
-    // Fall back to the same default as registry-sync.
-    default_registry_dir()
-}
-
-/// `$XDG_DATA_HOME/takopack/cargo-registry` or
-/// `~/.local/share/takopack/cargo-registry`.
-fn default_registry_dir() -> Result<PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine XDG_DATA_HOME / home directory for default registry path")
-    })?;
-    Ok(data_dir.join("takopack").join("cargo-registry"))
-}
-
-// ---------------------------------------------------------------------------
 // Cargo API resolve – real mode
 // ---------------------------------------------------------------------------
 
@@ -2692,6 +3045,10 @@ fn cargo_resolve(
         let (tmp_project, tmp_manifest) = make_no_dev_real_project(manifest, workdir)?;
         _tmp_project = Some(tmp_project);
         tmp_manifest
+    } else if real_manifest_needs_workspace_isolation(manifest)? {
+        let (tmp_project, tmp_manifest) = make_isolated_real_project(manifest, workdir)?;
+        _tmp_project = Some(tmp_project);
+        tmp_manifest
     } else {
         _tmp_project = None;
         manifest
@@ -2707,14 +3064,17 @@ fn cargo_resolve(
         .with_context(|| format!("failed to open workspace at {}", manifest.display()))?;
 
     ops::generate_lockfile(&ws).context("cargo resolve failed")?;
-    let buildrequires = if print_buildrequires {
+    let (buildrequires, lock_packages) = if print_buildrequires {
         let lockfile = ws.root().join("Cargo.lock");
-        buildrequires_from_lockfile(&lockfile)?
+        buildrequires_and_lock_packages_from_lockfile(&lockfile)?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
-    Ok(ResolveOutcome { buildrequires })
+    Ok(ResolveOutcome {
+        buildrequires,
+        lock_packages,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,6 +3093,7 @@ fn cargo_resolve_virtual_with_options(
 ) -> Result<ResolveOutcome> {
     let tmp = tempfile::tempdir().context("failed to create temporary directory")?;
     let tmp_path = tmp.path();
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
 
     // Copy Cargo.toml
     let tmp_manifest = tmp_path.join("Cargo.toml");
@@ -2744,6 +3105,7 @@ fn cargo_resolve_virtual_with_options(
 
     // Create stub target files based on manifest declarations.
     create_virtual_stubs(tmp_path, targets)?;
+    copy_virtual_path_dependencies(manifest, manifest_dir, tmp_path)?;
 
     let tmp_manifest = tmp_manifest
         .canonicalize()
@@ -2757,14 +3119,45 @@ fn cargo_resolve_virtual_with_options(
         .with_context(|| format!("failed to open workspace at {}", tmp_manifest.display()))?;
 
     ops::generate_lockfile(&ws).context("cargo resolve failed")?;
-    let buildrequires = if print_buildrequires {
+    let (buildrequires, lock_packages) = if print_buildrequires {
         let lockfile = ws.root().join("Cargo.lock");
-        buildrequires_from_lockfile(&lockfile)?
+        buildrequires_and_lock_packages_from_lockfile(&lockfile)?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
-    Ok(ResolveOutcome { buildrequires })
+    Ok(ResolveOutcome {
+        buildrequires,
+        lock_packages,
+    })
+}
+
+fn copy_virtual_path_dependencies(
+    manifest: &Path,
+    manifest_dir: &Path,
+    tmp_path: &Path,
+) -> Result<()> {
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    for path in manifest_path_dependencies(&doc, manifest_dir) {
+        if !path.is_dir() {
+            continue;
+        }
+        let rel = path.strip_prefix(manifest_dir).unwrap_or(&path);
+        if rel.is_absolute() {
+            continue;
+        }
+        let dest = tmp_path.join(rel);
+        if dest.exists() {
+            continue;
+        }
+        fs::create_dir_all(&dest)
+            .with_context(|| format!("failed to create {}", dest.display()))?;
+        copy_project_tree_for_resolve(&path, &dest)?;
+    }
+    Ok(())
 }
 
 /// Create stub source files in `project_dir` so that Cargo finds all
@@ -2811,7 +3204,42 @@ fn create_virtual_stubs(project_dir: &Path, targets: &ManifestTargets) -> Result
 // no-dev manifest view
 // ---------------------------------------------------------------------------
 
-fn make_no_dev_real_project(
+fn real_manifest_needs_workspace_isolation(manifest: &Path) -> Result<bool> {
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest.display()))?;
+    let content = fs::read_to_string(&manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    if doc
+        .get("workspace")
+        .and_then(|workspace| workspace.as_table())
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let mut dir = manifest.parent().and_then(Path::parent);
+    while let Some(current) = dir {
+        let candidate = current.join("Cargo.toml");
+        if candidate.is_file() {
+            let content = fs::read_to_string(&candidate)
+                .with_context(|| format!("failed to read {}", candidate.display()))?;
+            let doc: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("failed to parse {}", candidate.display()))?;
+            return Ok(doc
+                .get("workspace")
+                .and_then(|workspace| workspace.as_table())
+                .is_none());
+        }
+        dir = current.parent();
+    }
+
+    Ok(false)
+}
+
+fn make_isolated_real_project(
     manifest: &Path,
     workdir: &Path,
 ) -> Result<(tempfile::TempDir, PathBuf)> {
@@ -2825,17 +3253,189 @@ fn make_no_dev_real_project(
         .strip_prefix(&workdir)
         .with_context(|| format!("{} is not under {}", manifest.display(), workdir.display()))?
         .to_path_buf();
+    let workdir_name = workdir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no directory name", workdir.display()))?;
+
+    let tmp = tempfile::tempdir().context("failed to create isolated temporary project")?;
+    let tmp_workdir = tmp.path().join(workdir_name);
+    fs::create_dir_all(&tmp_workdir)
+        .with_context(|| format!("failed to create {}", tmp_workdir.display()))?;
+    let external_paths = collect_external_path_dependency_roots(&workdir)?;
+    copy_project_tree_for_resolve(&workdir, &tmp_workdir)?;
+    copy_external_path_dependencies_for_resolve(&external_paths, tmp.path())?;
+
+    let tmp_manifest = tmp_workdir.join(manifest_rel);
+    let tmp_manifest = tmp_manifest
+        .canonicalize()
+        .context("failed to canonicalize isolated temp manifest")?;
+
+    Ok((tmp, tmp_manifest))
+}
+
+fn make_no_dev_real_project(
+    manifest: &Path,
+    workdir: &Path,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    let workdir = workdir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", workdir.display()))?;
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest.display()))?;
+    let copy_root = discover_workspace_manifest(&manifest)?
+        .and_then(|workspace_manifest| workspace_manifest.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| workdir.clone())
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "failed to canonicalize resolve copy root for {}",
+                manifest.display()
+            )
+        })?;
+    let manifest_rel = manifest
+        .strip_prefix(&copy_root)
+        .with_context(|| {
+            format!(
+                "{} is not under {}",
+                manifest.display(),
+                copy_root.display()
+            )
+        })?
+        .to_path_buf();
+    let copy_root_name = copy_root
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no directory name", copy_root.display()))?;
 
     let tmp = tempfile::tempdir().context("failed to create no-dev temporary project")?;
-    copy_project_tree_for_resolve(&workdir, tmp.path())?;
+    let tmp_copy_root = tmp.path().join(copy_root_name);
+    fs::create_dir_all(&tmp_copy_root)
+        .with_context(|| format!("failed to create {}", tmp_copy_root.display()))?;
+    let external_paths = collect_external_path_dependency_roots(&copy_root)?;
+    copy_project_tree_for_resolve(&copy_root, &tmp_copy_root)?;
+    copy_external_path_dependencies_for_resolve(&external_paths, tmp.path())?;
 
-    let tmp_manifest = tmp.path().join(manifest_rel);
-    strip_dev_dependencies_from_project(tmp.path())?;
+    let tmp_manifest = tmp_copy_root.join(manifest_rel);
+    strip_dev_dependencies_from_project(&tmp_copy_root)?;
+    for external in &external_paths {
+        if let Some(tmp_external) = tmp_path_for_external_dependency(external, tmp.path()) {
+            if tmp_external.exists() {
+                strip_dev_dependencies_from_project(&tmp_external)?;
+            }
+        }
+    }
     let tmp_manifest = tmp_manifest
         .canonicalize()
         .context("failed to canonicalize no-dev temp manifest")?;
 
     Ok((tmp, tmp_manifest))
+}
+
+fn collect_external_path_dependency_roots(copy_root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    collect_external_path_dependency_roots_from_tree(copy_root, copy_root, &mut paths)?;
+    Ok(paths)
+}
+
+fn collect_external_path_dependency_roots_from_tree(
+    tree_root: &Path,
+    copy_root: &Path,
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in WalkDir::new(tree_root)
+        .into_iter()
+        .filter_entry(|entry| should_copy_resolve_entry(entry.path(), tree_root))
+    {
+        let entry = entry.context("failed to walk project manifests for path dependencies")?;
+        if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
+            continue;
+        }
+        let manifest = entry.path();
+        let manifest_dir = manifest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", manifest.display()))?;
+        let content = fs::read_to_string(manifest)
+            .with_context(|| format!("failed to read {}", manifest.display()))?;
+        let doc: toml::Value = toml::from_str(&content)
+            .with_context(|| format!("failed to parse {}", manifest.display()))?;
+        for path in manifest_path_dependencies(&doc, manifest_dir) {
+            if !path.starts_with(copy_root) && paths.insert(path.clone()) {
+                collect_external_path_dependency_roots_from_tree(&path, copy_root, paths)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn manifest_path_dependencies(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Some(root) = doc.as_table() else {
+        return paths;
+    };
+    collect_path_dependencies_from_table(root, manifest_dir, &mut paths);
+    if let Some(workspace_deps) = root
+        .get("workspace")
+        .and_then(|value| value.get("dependencies"))
+        .and_then(|value| value.as_table())
+    {
+        collect_path_dependencies_from_dependency_table(workspace_deps, manifest_dir, &mut paths);
+    }
+    if let Some(targets) = root.get("target").and_then(|value| value.as_table()) {
+        for target in targets.values() {
+            if let Some(target) = target.as_table() {
+                collect_path_dependencies_from_table(target, manifest_dir, &mut paths);
+            }
+        }
+    }
+    paths
+}
+
+fn collect_path_dependencies_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    manifest_dir: &Path,
+    paths: &mut Vec<PathBuf>,
+) {
+    for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        let Some(deps) = table.get(section).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        collect_path_dependencies_from_dependency_table(deps, manifest_dir, paths);
+    }
+}
+
+fn collect_path_dependencies_from_dependency_table(
+    deps: &toml::map::Map<String, toml::Value>,
+    manifest_dir: &Path,
+    paths: &mut Vec<PathBuf>,
+) {
+    for dep in deps.values() {
+        if let Some(dep_table) = dep.as_table() {
+            if let Some(path) = dependency_path_from_table(dep_table, manifest_dir) {
+                paths.push(path);
+            }
+        }
+    }
+}
+
+fn copy_external_path_dependencies_for_resolve(
+    paths: &BTreeSet<PathBuf>,
+    tmp_parent: &Path,
+) -> Result<()> {
+    for path in paths {
+        if let Some(dest) = tmp_path_for_external_dependency(path, tmp_parent) {
+            if dest.exists() {
+                continue;
+            }
+            fs::create_dir_all(&dest)
+                .with_context(|| format!("failed to create {}", dest.display()))?;
+            copy_project_tree_for_resolve(path, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn tmp_path_for_external_dependency(path: &Path, tmp_parent: &Path) -> Option<PathBuf> {
+    path.file_name().map(|name| tmp_parent.join(name))
 }
 
 fn copy_project_tree_for_resolve(source_dir: &Path, dest_dir: &Path) -> Result<()> {
@@ -2942,10 +3542,981 @@ fn strip_dev_dependencies_from_manifest(manifest: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Root BuildRequires output
+// ---------------------------------------------------------------------------
+
+fn root_buildrequires_from_manifest(
+    manifest: &Path,
+    lock_packages: &[LockPackage],
+) -> Result<RootBuildRequires> {
+    let source_root = source_root_for_manifest(manifest)?;
+    let mut walker = RootBuildRequiresWalker::new(lock_packages, source_root);
+    walker.walk_manifest(manifest, &default_requested_features(), None)?;
+
+    let lines = walker.lines.into_iter().collect::<Vec<_>>();
+    let feature_requirement_count = lines.len();
+    Ok(RootBuildRequires {
+        lines,
+        direct_dep_count: walker.active_edges.len(),
+        feature_requirement_count,
+        notes: walker.notes,
+    })
+}
+
+struct RootBuildRequiresWalker<'a> {
+    lock_packages: &'a [LockPackage],
+    lines: BTreeSet<String>,
+    notes: Vec<String>,
+    seen_manifest_features: BTreeMap<PathBuf, BTreeSet<String>>,
+    active_edges: BTreeSet<(PathBuf, String)>,
+    source_root: PathBuf,
+}
+
+impl<'a> RootBuildRequiresWalker<'a> {
+    fn new(lock_packages: &'a [LockPackage], source_root: PathBuf) -> Self {
+        Self {
+            lock_packages,
+            lines: BTreeSet::new(),
+            notes: Vec::new(),
+            seen_manifest_features: BTreeMap::new(),
+            active_edges: BTreeSet::new(),
+            source_root,
+        }
+    }
+
+    fn walk_manifest(
+        &mut self,
+        manifest: &Path,
+        requested_features: &BTreeSet<String>,
+        workspace_hint: Option<&WorkspaceDependencyContext>,
+    ) -> Result<()> {
+        let manifest = canonical_or_original(manifest);
+        let mut requested_features_with_base = requested_features.clone();
+        requested_features_with_base.insert(BASE_FEATURE_SENTINEL.to_string());
+        let seen_features = self
+            .seen_manifest_features
+            .entry(manifest.clone())
+            .or_default();
+        let old_len = seen_features.len();
+        seen_features.extend(requested_features_with_base);
+        if seen_features.len() == old_len {
+            return Ok(());
+        }
+        let current_features = seen_features
+            .iter()
+            .filter(|feature| feature.as_str() != BASE_FEATURE_SENTINEL)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        let content = fs::read_to_string(&manifest)
+            .with_context(|| format!("failed to read {}", manifest.display()))?;
+        let doc: toml::Value = toml::from_str(&content)
+            .with_context(|| format!("failed to parse {}", manifest.display()))?;
+        let root = doc
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("{} is not a TOML table", manifest.display()))?;
+        if root
+            .get("package")
+            .and_then(|value| value.as_table())
+            .is_none()
+        {
+            if root
+                .get("workspace")
+                .and_then(|value| value.as_table())
+                .is_some()
+            {
+                takopack_bail!(
+                    "roots BuildRequires mode needs a concrete package manifest; this is a virtual workspace, so pass a member Cargo.toml such as <workspace>/<crate>/Cargo.toml"
+                );
+            }
+            takopack_bail!("roots BuildRequires mode requires a root [package] manifest");
+        }
+
+        let workspace_context = load_workspace_dependency_context(&manifest, &doc, workspace_hint)?;
+        let workspace_doc = workspace_context
+            .as_ref()
+            .map(|context| &context.doc)
+            .unwrap_or(&doc);
+        let manifest_dir = manifest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", manifest.display()))?;
+        let workspace_dir = workspace_context
+            .as_ref()
+            .and_then(|context| context.manifest.parent())
+            .unwrap_or(manifest_dir);
+
+        let mut deps = BTreeMap::new();
+        let mut local_notes = Vec::new();
+        collect_root_dependency_sections(
+            root,
+            workspace_doc,
+            manifest_dir,
+            workspace_dir,
+            false,
+            &mut deps,
+            &mut local_notes,
+        )?;
+        if let Some(targets) = root.get("target").and_then(|value| value.as_table()) {
+            let mut target_dep_count = 0usize;
+            for target in targets.values() {
+                let Some(target) = target.as_table() else {
+                    continue;
+                };
+                let before = deps.len();
+                collect_root_dependency_sections(
+                    target,
+                    workspace_doc,
+                    manifest_dir,
+                    workspace_dir,
+                    true,
+                    &mut deps,
+                    &mut local_notes,
+                )?;
+                target_dep_count += deps.len().saturating_sub(before);
+            }
+            if target_dep_count > 0 {
+                local_notes.push(format!(
+                    "included {target_dep_count} target-specific dependency declaration(s) conservatively"
+                ));
+            }
+        }
+        for note in local_notes {
+            self.note(note);
+        }
+
+        let activation = collect_root_feature_activation(&doc, &deps, &current_features);
+        for note in activation.notes {
+            self.note(note);
+        }
+
+        let mut active_deps = deps
+            .values()
+            .filter(|dep| !dep.optional)
+            .map(|dep| dep.alias.clone())
+            .collect::<BTreeSet<_>>();
+        active_deps.extend(activation.active_optional_deps);
+
+        let mut dependency_features = deps
+            .iter()
+            .map(|(alias, dep)| (alias.clone(), dep.features.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (alias, features) in activation.dependency_features {
+            dependency_features
+                .entry(alias)
+                .or_default()
+                .extend(features);
+        }
+        for (alias, feature) in activation.weak_dependency_features {
+            if active_deps.contains(&alias) {
+                dependency_features
+                    .entry(alias)
+                    .or_default()
+                    .insert(feature);
+            }
+        }
+
+        let root_lock = root_lock_package(&doc, self.lock_packages);
+        let mut skipped = 0usize;
+        for alias in &active_deps {
+            let Some(dep) = deps.get(alias) else {
+                continue;
+            };
+            self.active_edges.insert((manifest.clone(), alias.clone()));
+
+            let mut features = dependency_features.remove(alias).unwrap_or_default();
+            if dep.default_features {
+                features.insert("default".to_string());
+            }
+
+            if let Some(path) = &dep.path {
+                self.walk_path_dependency(dep, path, &features, workspace_context.as_ref())?;
+                continue;
+            }
+
+            if dep.non_registry_source {
+                skipped += 1;
+                self.note(format!(
+                    "skipped dependency `{}` because it is not a registry dependency",
+                    dep.alias
+                ));
+                continue;
+            }
+
+            let mut selected_notes = Vec::new();
+            let selected = selected_lock_package_for_dependency(
+                dep,
+                root_lock,
+                self.lock_packages,
+                &mut selected_notes,
+            );
+            for note in selected_notes {
+                self.note(note);
+            }
+
+            let Some(selected) = selected else {
+                if emit_fallback_buildrequires(dep, &features, &mut self.lines) {
+                    self.note(format!(
+                        "dependency `{}` was generated from Cargo.toml because no selected registry package was found in Cargo.lock",
+                        dep.alias
+                    ));
+                } else {
+                    skipped += 1;
+                    self.note(format!(
+                        "skipped dependency `{}` because no selected registry package was found in Cargo.lock",
+                        dep.alias
+                    ));
+                }
+                continue;
+            };
+            if !selected
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("registry+"))
+            {
+                skipped += 1;
+                self.note(format!(
+                    "skipped dependency `{}` because the selected package source is not a registry",
+                    dep.alias
+                ));
+                continue;
+            }
+
+            emit_selected_registry_buildrequires(
+                dep,
+                &selected.version,
+                &features,
+                &mut self.lines,
+            );
+        }
+        if skipped > 0 {
+            self.note(format!(
+                "skipped {skipped} active dependency declaration(s) without registry BuildRequires output"
+            ));
+        }
+        let inherited = deps.values().filter(|dep| dep.inherited_workspace).count();
+        if inherited > 0 {
+            self.note(format!(
+                "resolved {inherited} workspace-inherited dependency declaration(s)"
+            ));
+        }
+        let target_specific = deps.values().filter(|dep| dep.target_specific).count();
+        if target_specific > 0 {
+            self.note(
+                "target-specific dependencies are included conservatively; cfg evaluation is not yet implemented",
+            );
+        }
+
+        Ok(())
+    }
+
+    fn walk_path_dependency(
+        &mut self,
+        dep: &RootDependency,
+        path: &Path,
+        features: &BTreeSet<String>,
+        workspace_hint: Option<&WorkspaceDependencyContext>,
+    ) -> Result<()> {
+        let dep_dir = canonical_or_original(path);
+        let manifest = dep_dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            self.note(format!(
+                "skipped path dependency `{}` because {} does not exist",
+                dep.alias,
+                manifest.display()
+            ));
+            return Ok(());
+        }
+
+        if !dep_dir.starts_with(&self.source_root) {
+            self.note(format!(
+                "path dependency `{}` points outside source root: {}; package source must include it or patch the path",
+                dep.alias,
+                dep_dir.display()
+            ));
+        }
+        self.walk_manifest(&manifest, features, workspace_hint)
+    }
+
+    fn note(&mut self, note: impl Into<String>) {
+        let note = note.into();
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
+    }
+}
+
+fn default_requested_features() -> BTreeSet<String> {
+    BTreeSet::from(["default".to_string()])
+}
+
+fn source_root_for_manifest(manifest: &Path) -> Result<PathBuf> {
+    if let Some(workspace_manifest) = discover_workspace_manifest(manifest)? {
+        if let Some(parent) = workspace_manifest.parent() {
+            return Ok(canonical_or_original(parent));
+        }
+    }
+    Ok(canonical_or_original(
+        manifest.parent().unwrap_or_else(|| Path::new(".")),
+    ))
+}
+
+fn emit_selected_registry_buildrequires(
+    dep: &RootDependency,
+    version: &Version,
+    features: &BTreeSet<String>,
+    lines: &mut BTreeSet<String>,
+) {
+    if features.is_empty() {
+        lines.insert(buildrequires_line_for_dependency(
+            &dep.package,
+            version,
+            None,
+        ));
+    } else {
+        for feature in features {
+            lines.insert(buildrequires_line_for_dependency(
+                &dep.package,
+                version,
+                Some(feature),
+            ));
+        }
+    }
+}
+
+fn load_workspace_dependency_context(
+    parent_manifest: &Path,
+    parent_doc: &toml::Value,
+    workspace_hint: Option<&WorkspaceDependencyContext>,
+) -> Result<Option<WorkspaceDependencyContext>> {
+    if let Some(context) = workspace_hint
+        .filter(|context| manifest_is_workspace_ancestor(parent_manifest, &context.manifest))
+        .filter(|context| {
+            canonical_or_original(&context.manifest) != canonical_or_original(parent_manifest)
+        })
+        .filter(|context| has_workspace_dependencies(&context.doc))
+    {
+        return Ok(Some(context.clone()));
+    }
+
+    if has_workspace_dependencies(parent_doc) {
+        return Ok(Some(WorkspaceDependencyContext {
+            manifest: parent_manifest.to_path_buf(),
+            doc: parent_doc.clone(),
+        }));
+    }
+
+    let Some(discovered) = discover_workspace_dependency_manifest(parent_manifest)? else {
+        return Ok(None);
+    };
+    if canonical_or_original(&discovered) == canonical_or_original(parent_manifest) {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&discovered)
+        .with_context(|| format!("failed to read {}", discovered.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", discovered.display()))?;
+    Ok(Some(WorkspaceDependencyContext {
+        manifest: discovered,
+        doc,
+    }))
+}
+
+fn collect_root_dependency_sections(
+    table: &toml::map::Map<String, toml::Value>,
+    workspace_doc: &toml::Value,
+    manifest_dir: &Path,
+    workspace_dir: &Path,
+    target_specific: bool,
+    deps: &mut BTreeMap<String, RootDependency>,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    for section in ["dependencies", "build-dependencies"] {
+        let Some(section_table) = table.get(section).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        for (alias, dep_value) in section_table {
+            let dep = root_dependency_from_value(
+                alias,
+                dep_value,
+                workspace_doc,
+                manifest_dir,
+                workspace_dir,
+                target_specific,
+            )
+            .with_context(|| format!("failed to parse dependency `{alias}` in [{section}]"))?;
+            merge_root_dependency(deps, dep, notes);
+        }
+    }
+    Ok(())
+}
+
+fn merge_root_dependency(
+    deps: &mut BTreeMap<String, RootDependency>,
+    dep: RootDependency,
+    notes: &mut Vec<String>,
+) {
+    match deps.get_mut(&dep.alias) {
+        Some(existing) => {
+            if existing.package != dep.package {
+                notes.push(format!(
+                    "dependency alias `{}` maps to both `{}` and `{}`; keeping `{}`",
+                    dep.alias, existing.package, dep.package, existing.package
+                ));
+                return;
+            }
+            existing.optional = existing.optional && dep.optional;
+            existing.default_features = existing.default_features || dep.default_features;
+            existing.features.extend(dep.features);
+            existing.inherited_workspace |= dep.inherited_workspace;
+            existing.target_specific |= dep.target_specific;
+        }
+        None => {
+            deps.insert(dep.alias.clone(), dep);
+        }
+    }
+}
+
+fn root_dependency_from_value(
+    alias: &str,
+    dep_value: &toml::Value,
+    workspace_doc: &toml::Value,
+    manifest_dir: &Path,
+    workspace_dir: &Path,
+    target_specific: bool,
+) -> Result<RootDependency> {
+    let (mut dep, inherited_workspace) = match dep_value {
+        toml::Value::String(_) => (
+            dependency_from_simple_value(alias, dep_value, manifest_dir)?,
+            false,
+        ),
+        toml::Value::Table(table)
+            if table
+                .get("workspace")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false) =>
+        {
+            let workspace_value = workspace_dependencies(workspace_doc)
+                .and_then(|deps| deps.get(alias))
+                .ok_or_else(|| anyhow::anyhow!("workspace dependency `{alias}` was not found"))?;
+            let mut dep = dependency_from_simple_value(alias, workspace_value, workspace_dir)?;
+            overlay_dependency_table(&mut dep, table, manifest_dir);
+            (dep, true)
+        }
+        toml::Value::Table(_) => (
+            dependency_from_simple_value(alias, dep_value, manifest_dir)?,
+            false,
+        ),
+        _ => {
+            takopack_bail!("unsupported dependency value for `{alias}`");
+        }
+    };
+
+    dep.inherited_workspace = inherited_workspace;
+    dep.target_specific = target_specific;
+    Ok(dep)
+}
+
+fn dependency_from_simple_value(
+    alias: &str,
+    dep_value: &toml::Value,
+    base_dir: &Path,
+) -> Result<RootDependency> {
+    match dep_value {
+        toml::Value::String(_) => Ok(RootDependency {
+            alias: alias.to_string(),
+            package: alias.to_string(),
+            version_requirement: dep_value.as_str().map(str::to_string),
+            path: None,
+            non_registry_source: false,
+            optional: false,
+            default_features: true,
+            features: BTreeSet::new(),
+            inherited_workspace: false,
+            target_specific: false,
+        }),
+        toml::Value::Table(table) => {
+            let mut dep = RootDependency {
+                alias: alias.to_string(),
+                package: table
+                    .get("package")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(alias)
+                    .to_string(),
+                version_requirement: table
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                path: dependency_path_from_table(table, base_dir),
+                non_registry_source: dependency_has_non_registry_source(table),
+                optional: table
+                    .get("optional")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                default_features: table
+                    .get("default-features")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                features: BTreeSet::new(),
+                inherited_workspace: false,
+                target_specific: false,
+            };
+            dep.features.extend(features_from_dependency_table(table));
+            Ok(dep)
+        }
+        _ => {
+            takopack_bail!("unsupported dependency value for `{alias}`");
+        }
+    }
+}
+
+fn overlay_dependency_table(
+    dep: &mut RootDependency,
+    table: &toml::map::Map<String, toml::Value>,
+    base_dir: &Path,
+) {
+    if let Some(package) = table.get("package").and_then(|value| value.as_str()) {
+        dep.package = package.to_string();
+    }
+    if let Some(version) = table.get("version").and_then(|value| value.as_str()) {
+        dep.version_requirement = Some(version.to_string());
+    }
+    if let Some(optional) = table.get("optional").and_then(|value| value.as_bool()) {
+        dep.optional = optional;
+    }
+    if let Some(default_features) = table
+        .get("default-features")
+        .and_then(|value| value.as_bool())
+    {
+        dep.default_features = default_features;
+    }
+    if let Some(path) = dependency_path_from_table(table, base_dir) {
+        dep.path = Some(path);
+    }
+    dep.non_registry_source |= dependency_has_non_registry_source(table);
+    dep.features.extend(features_from_dependency_table(table));
+}
+
+fn features_from_dependency_table(table: &toml::map::Map<String, toml::Value>) -> BTreeSet<String> {
+    table
+        .get("features")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flat_map(|features| features.iter())
+        .filter_map(|feature| feature.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn dependency_path_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    base_dir: &Path,
+) -> Option<PathBuf> {
+    let path = table.get("path")?.as_str()?;
+    Some(canonical_or_original(&base_dir.join(path)))
+}
+
+fn dependency_has_non_registry_source(table: &toml::map::Map<String, toml::Value>) -> bool {
+    table.get("git").is_some() || table.get("registry").is_some()
+}
+
+fn collect_root_feature_activation(
+    doc: &toml::Value,
+    deps: &BTreeMap<String, RootDependency>,
+    requested_features: &BTreeSet<String>,
+) -> RootFeatureActivation {
+    let Some(features) = doc.get("features").and_then(|value| value.as_table()) else {
+        return RootFeatureActivation::default();
+    };
+    let mut activation = RootFeatureActivation::default();
+    let mut visiting = BTreeSet::new();
+    for feature in requested_features {
+        expand_root_feature(feature, features, deps, &mut visiting, &mut activation);
+    }
+    activation
+}
+
+fn expand_root_feature(
+    feature: &str,
+    features: &toml::map::Map<String, toml::Value>,
+    deps: &BTreeMap<String, RootDependency>,
+    visiting: &mut BTreeSet<String>,
+    activation: &mut RootFeatureActivation,
+) {
+    if !visiting.insert(feature.to_string()) {
+        return;
+    }
+    let Some(items) = features.get(feature).and_then(|value| value.as_array()) else {
+        visiting.remove(feature);
+        return;
+    };
+    for item in items {
+        let Some(item) = item.as_str() else {
+            continue;
+        };
+        apply_root_feature_item(item, features, deps, visiting, activation);
+    }
+    visiting.remove(feature);
+}
+
+fn apply_root_feature_item(
+    item: &str,
+    features: &toml::map::Map<String, toml::Value>,
+    deps: &BTreeMap<String, RootDependency>,
+    visiting: &mut BTreeSet<String>,
+    activation: &mut RootFeatureActivation,
+) {
+    if let Some(alias) = item.strip_prefix("dep:") {
+        if deps.contains_key(alias) {
+            activation.active_optional_deps.insert(alias.to_string());
+        } else {
+            activation.notes.push(format!(
+                "root feature references unknown dependency `{alias}`"
+            ));
+        }
+        return;
+    }
+    if let Some((alias, feature)) = item.split_once("?/") {
+        activation
+            .weak_dependency_features
+            .push((alias.to_string(), feature.to_string()));
+        return;
+    }
+    if let Some((alias, feature)) = item.split_once('/') {
+        if deps.contains_key(alias) {
+            activation.active_optional_deps.insert(alias.to_string());
+            activation
+                .dependency_features
+                .entry(alias.to_string())
+                .or_default()
+                .insert(feature.to_string());
+        } else {
+            activation.notes.push(format!(
+                "root feature references unknown dependency `{alias}`"
+            ));
+        }
+        return;
+    }
+    if features.contains_key(item) {
+        expand_root_feature(item, features, deps, visiting, activation);
+        return;
+    }
+    if deps.get(item).is_some_and(|dep| dep.optional) {
+        activation.active_optional_deps.insert(item.to_string());
+    }
+}
+
+fn root_lock_package<'a>(
+    doc: &toml::Value,
+    lock_packages: &'a [LockPackage],
+) -> Option<&'a LockPackage> {
+    let package = doc.get("package")?.as_table()?;
+    let name = package.get("name")?.as_str()?;
+    let version = package.get("version")?.as_str()?;
+    let version = Version::parse(version).ok()?;
+    lock_packages.iter().find(|package| {
+        package.name == name
+            && package.version == version
+            && package
+                .source
+                .as_deref()
+                .map(|source| !source.starts_with("registry+"))
+                .unwrap_or(true)
+    })
+}
+
+fn selected_lock_package_for_dependency(
+    dep: &RootDependency,
+    root_lock: Option<&LockPackage>,
+    lock_packages: &[LockPackage],
+    notes: &mut Vec<String>,
+) -> Option<SelectedPackage> {
+    if let Some(root_lock) = root_lock {
+        let mut matches = root_lock
+            .dependencies
+            .iter()
+            .filter_map(|dependency| parse_lock_dependency_ref(dependency))
+            .filter(|dependency| dependency.name == dep.package)
+            .filter_map(|dependency| find_lock_package_for_ref(&dependency, lock_packages))
+            .collect::<Vec<_>>();
+        dedup_selected_packages(&mut matches);
+        if matches.len() == 1 {
+            return matches.pop();
+        }
+        if matches.len() > 1 {
+            notes.push(format!(
+                "dependency `{}` has multiple root lockfile candidates; selected the newest version",
+                dep.alias
+            ));
+            return matches
+                .into_iter()
+                .max_by(|left, right| left.version.cmp(&right.version));
+        }
+    }
+
+    let mut candidates = lock_packages
+        .iter()
+        .filter(|package| package.name == dep.package)
+        .filter(|package| {
+            package
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("registry+"))
+        })
+        .map(|package| SelectedPackage {
+            version: package.version.clone(),
+            source: package.source.clone(),
+        })
+        .collect::<Vec<_>>();
+    dedup_selected_packages(&mut candidates);
+    if candidates.len() > 1 {
+        notes.push(format!(
+            "dependency `{}` has multiple selected versions in Cargo.lock; selected the newest version",
+            dep.alias
+        ));
+    }
+    candidates
+        .into_iter()
+        .max_by(|left, right| left.version.cmp(&right.version))
+}
+
+#[derive(Debug, Clone)]
+struct LockDependencyRef {
+    name: String,
+    version: Option<Version>,
+    source: Option<String>,
+}
+
+fn parse_lock_dependency_ref(value: &str) -> Option<LockDependencyRef> {
+    let mut parts = value.split_whitespace();
+    let name = parts.next()?.to_string();
+    let version = parts.next().and_then(|part| Version::parse(part).ok());
+    let source = value
+        .split_once('(')
+        .and_then(|(_, rest)| rest.rsplit_once(')').map(|(source, _)| source.to_string()));
+    Some(LockDependencyRef {
+        name,
+        version,
+        source,
+    })
+}
+
+fn find_lock_package_for_ref(
+    dependency: &LockDependencyRef,
+    lock_packages: &[LockPackage],
+) -> Option<SelectedPackage> {
+    let mut candidates = lock_packages
+        .iter()
+        .filter(|package| package.name == dependency.name)
+        .filter(|package| {
+            dependency
+                .version
+                .as_ref()
+                .map(|version| package.version == *version)
+                .unwrap_or(true)
+        })
+        .filter(|package| {
+            dependency
+                .source
+                .as_deref()
+                .map(|source| package.source.as_deref() == Some(source))
+                .unwrap_or(true)
+        })
+        .filter(|package| {
+            package
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("registry+"))
+        })
+        .map(|package| SelectedPackage {
+            version: package.version.clone(),
+            source: package.source.clone(),
+        })
+        .collect::<Vec<_>>();
+    dedup_selected_packages(&mut candidates);
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        candidates
+            .into_iter()
+            .max_by(|left, right| left.version.cmp(&right.version))
+    }
+}
+
+fn dedup_selected_packages(packages: &mut Vec<SelectedPackage>) {
+    packages.sort_by(|left, right| {
+        left.version
+            .cmp(&right.version)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    packages.dedup_by(|left, right| left.version == right.version && left.source == right.source);
+}
+
+fn emit_fallback_buildrequires(
+    dep: &RootDependency,
+    features: &BTreeSet<String>,
+    lines: &mut BTreeSet<String>,
+) -> bool {
+    let crate_name = match root_dependency_crate_name_from_requirement(dep) {
+        Some(crate_name) => crate_name,
+        None => dep.package.replace('_', "-"),
+    };
+    let requirement = dep
+        .version_requirement
+        .as_deref()
+        .and_then(root_dependency_requirement_text);
+
+    if features.is_empty() {
+        lines.insert(buildrequires_line_from_parts(
+            &crate_name,
+            requirement.as_deref(),
+            None,
+        ));
+    } else {
+        for feature in features {
+            lines.insert(buildrequires_line_from_parts(
+                &crate_name,
+                requirement.as_deref(),
+                Some(&feature),
+            ));
+        }
+    }
+    true
+}
+
+fn root_dependency_crate_name_from_requirement(dep: &RootDependency) -> Option<String> {
+    let lower_bound = dep
+        .version_requirement
+        .as_deref()
+        .and_then(root_dependency_lower_bound)?;
+    let version = Version::parse(&lower_bound).ok()?;
+    let capability_name = dep.package.replace('_', "-");
+    Some(format!(
+        "{}-{}",
+        capability_name,
+        calculate_compat_version(&version)
+    ))
+}
+
+fn root_dependency_requirement_text(requirement: &str) -> Option<String> {
+    root_dependency_lower_bound(requirement).map(|version| format!(">= {version}"))
+}
+
+fn root_dependency_lower_bound(requirement: &str) -> Option<String> {
+    let req = semver::VersionReq::parse(requirement).ok()?;
+    req.comparators
+        .iter()
+        .filter_map(lower_bound_from_comparator)
+        .max_by(compare_version_strings)
+}
+
+fn lower_bound_from_comparator(comparator: &semver::Comparator) -> Option<String> {
+    use semver::Op;
+
+    match comparator.op {
+        Op::Exact | Op::GreaterEq | Op::Tilde | Op::Caret => {
+            Some(comparator_lower_bound(comparator))
+        }
+        Op::Greater => Some(comparator_strict_lower_bound(comparator)),
+        Op::Wildcard if comparator.minor.is_some() || comparator.patch.is_some() => {
+            Some(comparator_lower_bound(comparator))
+        }
+        Op::Wildcard | Op::Less | Op::LessEq => None,
+        _ => None,
+    }
+}
+
+fn comparator_lower_bound(comparator: &semver::Comparator) -> String {
+    let mut version = format!(
+        "{}.{}.{}",
+        comparator.major,
+        comparator.minor.unwrap_or(0),
+        comparator.patch.unwrap_or(0)
+    );
+    if !comparator.pre.is_empty() {
+        version.push('-');
+        version.push_str(comparator.pre.as_str());
+    }
+    version
+}
+
+fn comparator_strict_lower_bound(comparator: &semver::Comparator) -> String {
+    if !comparator.pre.is_empty() {
+        return comparator_lower_bound(comparator);
+    }
+
+    match (comparator.minor, comparator.patch) {
+        (Some(minor), Some(patch)) => format!("{}.{}.{}", comparator.major, minor, patch + 1),
+        (Some(minor), None) => format!("{}.{}.0", comparator.major, minor + 1),
+        (None, None) => format!("{}.0.0", comparator.major + 1),
+        (None, Some(patch)) => format!("{}.0.{}", comparator.major, patch + 1),
+    }
+}
+
+fn compare_version_strings(left: &String, right: &String) -> std::cmp::Ordering {
+    version_sort_key(left).cmp(&version_sort_key(right))
+}
+
+fn version_sort_key(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-'])
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+fn buildrequires_line_for_dependency(
+    crate_name: &str,
+    version: &Version,
+    feature: Option<&str>,
+) -> String {
+    let capability_name = crate_name.replace('_', "-");
+    let compat = calculate_compat_version(version);
+    let clean_version = clean_semver_without_build(version);
+    let cap = match feature {
+        Some(feature) => format!(
+            "{}-{}/{}",
+            capability_name,
+            compat,
+            normalize_feature_name(feature)
+        ),
+        None => format!("{}-{}", capability_name, compat),
+    };
+    format!("BuildRequires:  crate({cap}) >= {clean_version}")
+}
+
+fn buildrequires_line_from_parts(
+    crate_name: &str,
+    requirement: Option<&str>,
+    feature: Option<&str>,
+) -> String {
+    let cap = match feature {
+        Some(feature) => format!("{}/{}", crate_name, normalize_feature_name(feature)),
+        None => crate_name.to_string(),
+    };
+    match requirement {
+        Some(requirement) => format!("BuildRequires:  crate({cap}) {requirement}"),
+        None => format!("BuildRequires:  crate({cap})"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BuildRequires output
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
+    let (buildrequires, _) = buildrequires_and_lock_packages_from_lockfile(lockfile)?;
+    Ok(buildrequires)
+}
+
+fn buildrequires_and_lock_packages_from_lockfile(
+    lockfile: &Path,
+) -> Result<(Vec<String>, Vec<LockPackage>)> {
+    let packages = lock_packages_from_lockfile(lockfile)?;
+    Ok((buildrequires_from_lock_packages(&packages), packages))
+}
+
+fn lock_packages_from_lockfile(lockfile: &Path) -> Result<Vec<LockPackage>> {
     let content = fs::read_to_string(lockfile)
         .with_context(|| format!("failed to read generated {}", lockfile.display()))?;
     let doc: toml::Value = toml::from_str(&content)
@@ -2955,18 +4526,11 @@ fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
         .and_then(|value| value.as_array())
         .ok_or_else(|| anyhow::anyhow!("generated Cargo.lock has no package array"))?;
 
-    let mut buildrequires = BTreeSet::new();
+    let mut parsed = Vec::new();
     for package in packages {
         let Some(package) = package.as_table() else {
             continue;
         };
-        let Some(source) = package.get("source").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if !source.starts_with("registry+") {
-            continue;
-        }
-
         let Some(name) = package.get("name").and_then(|value| value.as_str()) else {
             continue;
         };
@@ -2975,16 +4539,51 @@ fn buildrequires_from_lockfile(lockfile: &Path) -> Result<Vec<String>> {
         };
         let parsed_version = Version::parse(version)
             .with_context(|| format!("failed to parse lockfile version {}", version))?;
-        let compat = calculate_compat_version(&parsed_version);
-        let capability_name = name.replace('_', "-");
-        let clean_version = clean_semver_without_build(&parsed_version);
+        let source = package
+            .get("source")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let dependencies = package
+            .get("dependencies")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        parsed.push(LockPackage {
+            name: name.to_string(),
+            version: parsed_version,
+            source,
+            dependencies,
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn buildrequires_from_lock_packages(packages: &[LockPackage]) -> Vec<String> {
+    let mut buildrequires = BTreeSet::new();
+    for package in packages {
+        if !package
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+"))
+        {
+            continue;
+        }
+        let compat = calculate_compat_version(&package.version);
+        let capability_name = package.name.replace('_', "-");
+        let clean_version = clean_semver_without_build(&package.version);
         buildrequires.insert(format!(
             "BuildRequires:  crate({}-{}) >= {}",
             capability_name, compat, clean_version
         ));
     }
 
-    Ok(buildrequires.into_iter().collect())
+    buildrequires.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3266,6 +4865,41 @@ path = "src/bin/cbuild.rs"
         assert!(tmp.path().join("src/lib.rs").exists());
     }
 
+    #[test]
+    fn test_copy_virtual_path_dependencies_copies_existing_relative_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("local/src")).unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+local = { path = "local" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("local/Cargo.toml"),
+            r#"[package]
+name = "local"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        copy_virtual_path_dependencies(
+            &source.path().join("Cargo.toml"),
+            source.path(),
+            tmp.path(),
+        )
+        .unwrap();
+
+        assert!(tmp.path().join("local/Cargo.toml").is_file());
+    }
+
     // -- no-dev sanitizer tests --
 
     #[test]
@@ -3423,6 +5057,107 @@ version = "0.5"
             .unwrap();
         assert!(windows_target.get("dependencies").is_some());
         assert!(windows_target.get("dev-dependencies").is_none());
+    }
+
+    #[test]
+    fn test_make_no_dev_real_project_copies_workspace_and_external_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let external = tmp.path().join("external_dep");
+        fs::create_dir_all(workspace.join("member/src")).unwrap();
+        fs::create_dir_all(workspace.join("local/src")).unwrap();
+        fs::create_dir_all(external.join("src")).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            r#"[workspace]
+members = ["member", "local"]
+
+[workspace.package]
+rust-version = "1.89.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("member/Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+rust-version.workspace = true
+
+[dependencies]
+local = { path = "../local" }
+external_dep = { path = "../../external_dep" }
+
+[dev-dependencies]
+claim = "0.5"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("local/Cargo.toml"),
+            r#"[package]
+name = "local"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            r#"[package]
+name = "external_dep"
+version = "0.1.0"
+
+[dev-dependencies]
+tempfile = "3"
+"#,
+        )
+        .unwrap();
+
+        let (_tmp, tmp_manifest) = make_no_dev_real_project(
+            &workspace.join("member/Cargo.toml"),
+            &workspace.join("member"),
+        )
+        .unwrap();
+        let tmp_workspace = tmp_manifest.parent().unwrap().parent().unwrap();
+        let tmp_parent = tmp_workspace.parent().unwrap();
+
+        assert!(tmp_workspace.join("Cargo.toml").is_file());
+        assert!(tmp_parent.join("external_dep/Cargo.toml").is_file());
+
+        let member_content = fs::read_to_string(&tmp_manifest).unwrap();
+        let member_doc: toml::Value = toml::from_str(&member_content).unwrap();
+        assert!(member_doc.get("dev-dependencies").is_none());
+
+        let external_content =
+            fs::read_to_string(tmp_parent.join("external_dep/Cargo.toml")).unwrap();
+        let external_doc: toml::Value = toml::from_str(&external_content).unwrap();
+        assert!(external_doc.get("dev-dependencies").is_none());
+    }
+
+    #[test]
+    fn test_real_manifest_needs_workspace_isolation_for_parent_package_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("child");
+        fs::create_dir_all(child.join("src")).unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "parent"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            child.join("Cargo.toml"),
+            r#"[package]
+name = "child"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::write(child.join("src/lib.rs"), "").unwrap();
+
+        assert!(real_manifest_needs_workspace_isolation(&child.join("Cargo.toml")).unwrap());
     }
 
     // -- plan-missing parser tests --
@@ -3794,6 +5529,313 @@ version = "{}"
     }
 
     // -- BuildRequires tests --
+
+    fn root_buildrequires_fixture(
+        manifest_content: &str,
+        registry_packages: &[(&str, &str)],
+    ) -> RootBuildRequires {
+        root_buildrequires_fixture_with_root_deps(
+            manifest_content,
+            &registry_packages
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            registry_packages,
+        )
+    }
+
+    fn root_buildrequires_fixture_with_root_deps(
+        manifest_content: &str,
+        root_deps: &[&str],
+        registry_packages: &[(&str, &str)],
+    ) -> RootBuildRequires {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(&manifest, manifest_content).unwrap();
+        let mut lock_packages = vec![LockPackage {
+            name: "app".to_string(),
+            version: Version::parse("0.1.0").unwrap(),
+            source: None,
+            dependencies: root_deps.iter().map(|dep| (*dep).to_string()).collect(),
+        }];
+        lock_packages.extend(registry_packages.iter().map(|(name, version)| LockPackage {
+            name: (*name).to_string(),
+            version: Version::parse(version).unwrap(),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+            dependencies: Vec::new(),
+        }));
+        root_buildrequires_from_manifest(&manifest, &lock_packages).unwrap()
+    }
+
+    fn assert_root_lines(result: &RootBuildRequires, expected: &[&str]) {
+        assert_eq!(
+            result.lines,
+            expected
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_default_features_emit_default() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(&result, &["BuildRequires:  crate(foo-1/default) >= 1.2.3"]);
+        assert_eq!(result.direct_dep_count, 1);
+    }
+
+    #[test]
+    fn test_root_buildrequires_default_features_false_no_features_emit_bare() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", default-features = false }
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(&result, &["BuildRequires:  crate(foo-1) >= 1.2.3"]);
+    }
+
+    #[test]
+    fn test_root_buildrequires_default_features_false_explicit_features() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", default-features = false, features = ["x"] }
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(&result, &["BuildRequires:  crate(foo-1/x) >= 1.2.3"]);
+    }
+
+    #[test]
+    fn test_root_buildrequires_falls_back_to_manifest_version_without_lock_package() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1.2", features = ["x"] }
+"#,
+            &[],
+        );
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(foo-1/default) >= 1.2.0",
+                "BuildRequires:  crate(foo-1/x) >= 1.2.0",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_rename_dependency_uses_real_package() {
+        let result = root_buildrequires_fixture_with_root_deps(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo_alias = { package = "real_crate", version = "1" }
+"#,
+            &["real_crate"],
+            &[("real_crate", "1.2.3")],
+        );
+
+        assert_root_lines(
+            &result,
+            &["BuildRequires:  crate(real-crate-1/default) >= 1.2.3"],
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_workspace_inherited_dependency() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[workspace]
+
+[workspace.dependencies]
+foo = { version = "1", default-features = false, features = ["x"] }
+
+[dependencies]
+foo = { workspace = true, features = ["y"] }
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(foo-1/x) >= 1.2.3",
+                "BuildRequires:  crate(foo-1/y) >= 1.2.3",
+            ],
+        );
+        assert!(result
+            .notes
+            .iter()
+            .any(|note| note.contains("workspace-inherited")));
+    }
+
+    #[test]
+    fn test_root_buildrequires_root_feature_dependency_feature() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", optional = true }
+
+[features]
+default = ["foo/bar"]
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(foo-1/bar) >= 1.2.3",
+                "BuildRequires:  crate(foo-1/default) >= 1.2.3",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_optional_dependency_via_dep_feature() {
+        let result = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", optional = true }
+
+[features]
+default = ["dep:foo"]
+"#,
+            &[("foo", "1.2.3")],
+        );
+
+        assert_root_lines(&result, &["BuildRequires:  crate(foo-1/default) >= 1.2.3"]);
+    }
+
+    #[test]
+    fn test_root_buildrequires_weak_dependency_feature_only_when_active() {
+        let active = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", default-features = false }
+
+[features]
+default = ["foo?/bar"]
+"#,
+            &[("foo", "1.2.3")],
+        );
+        assert_root_lines(&active, &["BuildRequires:  crate(foo-1/bar) >= 1.2.3"]);
+
+        let inactive = root_buildrequires_fixture(
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", optional = true, default-features = false }
+
+[features]
+default = ["foo?/bar"]
+"#,
+            &[("foo", "1.2.3")],
+        );
+        assert!(inactive.lines.is_empty());
+    }
+
+    #[test]
+    fn test_root_buildrequires_recurses_into_path_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::create_dir_all(tmp.path().join("local")).unwrap();
+        let manifest = tmp.path().join("app/Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+local = { path = "../local", default-features = false }
+
+[features]
+default = ["local/fast"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("local/Cargo.toml"),
+            r#"[package]
+name = "local"
+version = "0.1.0"
+
+[dependencies]
+foo = { version = "1", default-features = false }
+
+[features]
+default = []
+fast = ["foo/simd"]
+"#,
+        )
+        .unwrap();
+        let lock_packages = vec![
+            LockPackage {
+                name: "app".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["local".to_string()],
+            },
+            LockPackage {
+                name: "local".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["foo".to_string()],
+            },
+            LockPackage {
+                name: "foo".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let result = root_buildrequires_from_manifest(&manifest, &lock_packages).unwrap();
+
+        assert_root_lines(&result, &["BuildRequires:  crate(foo-1/simd) >= 1.2.3"]);
+    }
 
     #[test]
     fn test_buildrequires_from_lockfile_skips_non_registry_packages() {
