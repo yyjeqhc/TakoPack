@@ -102,6 +102,23 @@ struct WorkspaceDependencyContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct RootBuildRequiresOptions {
+    pub packages: Vec<String>,
+    pub features: Vec<String>,
+    pub default_features: bool,
+}
+
+impl Default for RootBuildRequiresOptions {
+    fn default() -> Self {
+        Self {
+            packages: Vec::new(),
+            features: Vec::new(),
+            default_features: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct BuildRequiresReport {
     mode: BuildRequiresMode,
     root_direct_deps: usize,
@@ -260,6 +277,7 @@ pub fn run_resolve_check(
     path: &Path,
     registry: Option<&Path>,
     no_dev: bool,
+    root_options: RootBuildRequiresOptions,
     _print_buildrequires: bool,
     buildrequires_mode: BuildRequiresMode,
     buildrequires_report: Option<&Path>,
@@ -328,6 +346,15 @@ pub fn run_resolve_check(
 
     println!("  mode: {}", if is_real { "real" } else { "virtual" });
     println!("  no_dev: {}", no_dev);
+    if !root_options.packages.is_empty() {
+        println!("  package: {}", root_options.packages.join(","));
+    }
+    if !root_options.default_features {
+        println!("  default_features: false");
+    }
+    if !root_options.features.is_empty() {
+        println!("  features: {}", root_options.features.join(","));
+    }
     if plan_missing {
         println!("  plan_missing: true");
         if let Some(name) = plan_session {
@@ -363,6 +390,7 @@ pub fn run_resolve_check(
             max_plan_iterations,
             plan_progress_interval,
             plan_session_storage,
+            root_options,
         );
     }
 
@@ -375,6 +403,8 @@ pub fn run_resolve_check(
                     buildrequires_report,
                     &manifest,
                     &outcome,
+                    !no_dev,
+                    &root_options,
                 )?;
                 Ok(0)
             }
@@ -385,6 +415,8 @@ pub fn run_resolve_check(
                     buildrequires_mode,
                     buildrequires_report,
                     &manifest,
+                    !no_dev,
+                    &root_options,
                 )?;
                 Ok(1)
             }
@@ -398,6 +430,8 @@ pub fn run_resolve_check(
                     buildrequires_report,
                     &manifest,
                     &outcome,
+                    !no_dev,
+                    &root_options,
                 )?;
                 Ok(0)
             }
@@ -408,6 +442,8 @@ pub fn run_resolve_check(
                     buildrequires_mode,
                     buildrequires_report,
                     &manifest,
+                    !no_dev,
+                    &root_options,
                 )?;
                 Ok(1)
             }
@@ -426,8 +462,16 @@ fn print_buildrequires_after_resolve(
     report_path: Option<&Path>,
     manifest: &Path,
     outcome: &ResolveOutcome,
+    include_dev_dependencies: bool,
+    root_options: &RootBuildRequiresOptions,
 ) -> Result<()> {
-    let (buildrequires, report) = buildrequires_for_mode(mode, manifest, outcome)?;
+    let (buildrequires, report) = buildrequires_for_mode(
+        mode,
+        manifest,
+        outcome,
+        include_dev_dependencies,
+        root_options,
+    )?;
     print_buildrequires(&buildrequires);
 
     if let Some(path) = report_path {
@@ -465,6 +509,8 @@ fn print_buildrequires_after_failed_resolve(
     mode: BuildRequiresMode,
     report_path: Option<&Path>,
     manifest: &Path,
+    include_dev_dependencies: bool,
+    root_options: &RootBuildRequiresOptions,
 ) -> Result<()> {
     if mode != BuildRequiresMode::Roots {
         eprintln!(
@@ -474,7 +520,8 @@ fn print_buildrequires_after_failed_resolve(
         return Ok(());
     }
 
-    let mut roots = root_buildrequires_from_manifest(manifest, &[])?;
+    let mut roots =
+        root_buildrequires_from_manifest(manifest, &[], include_dev_dependencies, root_options)?;
     roots
         .notes
         .push("resolve failed; printed best-effort root BuildRequires from Cargo.toml".to_string());
@@ -518,6 +565,8 @@ fn buildrequires_for_mode(
     mode: BuildRequiresMode,
     manifest: &Path,
     outcome: &ResolveOutcome,
+    include_dev_dependencies: bool,
+    root_options: &RootBuildRequiresOptions,
 ) -> Result<(Vec<String>, BuildRequiresReport)> {
     match mode {
         BuildRequiresMode::Flattened => {
@@ -536,7 +585,12 @@ fn buildrequires_for_mode(
             Ok((outcome.buildrequires.clone(), report))
         }
         BuildRequiresMode::Roots => {
-            let roots = root_buildrequires_from_manifest(manifest, &outcome.lock_packages)?;
+            let roots = root_buildrequires_from_manifest(
+                manifest,
+                &outcome.lock_packages,
+                include_dev_dependencies,
+                root_options,
+            )?;
             let report = roots_report_best_effort(mode, &roots, &outcome.buildrequires)?;
             Ok((roots.lines, report))
         }
@@ -724,6 +778,7 @@ fn run_resolve_check_plan_missing(
     max_plan_iterations: usize,
     plan_progress_interval: usize,
     plan_session_storage: PlanSessionStorage,
+    root_options: RootBuildRequiresOptions,
 ) -> Result<i32> {
     println!("Planning missing providers using overlay registry...");
     println!();
@@ -780,6 +835,8 @@ fn run_resolve_check_plan_missing(
                     buildrequires_report,
                     manifest,
                     &outcome,
+                    !no_dev,
+                    &root_options,
                 )?;
                 return Ok(0);
             }
@@ -3548,10 +3605,58 @@ fn strip_dev_dependencies_from_manifest(manifest: &Path) -> Result<()> {
 fn root_buildrequires_from_manifest(
     manifest: &Path,
     lock_packages: &[LockPackage],
+    include_dev_dependencies: bool,
+    options: &RootBuildRequiresOptions,
 ) -> Result<RootBuildRequires> {
     let source_root = source_root_for_manifest(manifest)?;
-    let mut walker = RootBuildRequiresWalker::new(lock_packages, source_root);
-    walker.walk_manifest(manifest, &default_requested_features(), None)?;
+    let mut walker =
+        RootBuildRequiresWalker::new(lock_packages, source_root, include_dev_dependencies);
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    let root = doc
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a TOML table", manifest.display()))?;
+    let requested_features = requested_features_from_options(options);
+
+    if root
+        .get("workspace")
+        .and_then(|value| value.as_table())
+        .is_some()
+    {
+        let workspace_context = WorkspaceDependencyContext {
+            manifest: manifest.to_path_buf(),
+            doc: doc.clone(),
+        };
+        if root
+            .get("package")
+            .and_then(|value| value.as_table())
+            .is_some()
+        {
+            walker.walk_manifest(manifest, &requested_features, Some(&workspace_context))?;
+        }
+        let member_manifests =
+            selected_workspace_member_manifests(manifest, &doc, &options.packages)?;
+        for member_manifest in member_manifests {
+            if canonical_or_original(&member_manifest) == canonical_or_original(manifest) {
+                continue;
+            }
+            walker.walk_manifest(
+                &member_manifest,
+                &requested_features,
+                Some(&workspace_context),
+            )?;
+        }
+        if walker.seen_manifest_features.is_empty() {
+            takopack_bail!("workspace BuildRequires mode found no package members");
+        }
+    } else {
+        if !options.packages.is_empty() {
+            takopack_bail!("--package requires a workspace root Cargo.toml");
+        }
+        walker.walk_manifest(manifest, &requested_features, None)?;
+    }
 
     let lines = walker.lines.into_iter().collect::<Vec<_>>();
     let feature_requirement_count = lines.len();
@@ -3563,6 +3668,157 @@ fn root_buildrequires_from_manifest(
     })
 }
 
+fn workspace_member_manifests(
+    workspace_manifest: &Path,
+    doc: &toml::Value,
+) -> Result<Vec<PathBuf>> {
+    let workspace_dir = workspace_manifest.parent().ok_or_else(|| {
+        anyhow::anyhow!("{} has no parent directory", workspace_manifest.display())
+    })?;
+    let workspace = doc
+        .get("workspace")
+        .and_then(|value| value.as_table())
+        .ok_or_else(|| anyhow::anyhow!("{} has no [workspace]", workspace_manifest.display()))?;
+    let excludes = workspace_string_array(workspace, "exclude");
+    let mut manifests = BTreeSet::new();
+
+    for member in workspace_string_array(workspace, "members") {
+        for member_dir in expand_workspace_member(workspace_dir, &member)? {
+            if workspace_member_is_excluded(workspace_dir, &member_dir, &excludes) {
+                continue;
+            }
+            let manifest = if member_dir
+                .file_name()
+                .is_some_and(|name| name == "Cargo.toml")
+            {
+                member_dir
+            } else {
+                member_dir.join("Cargo.toml")
+            };
+            if manifest_has_package(&manifest)? {
+                manifests.insert(canonical_or_original(&manifest));
+            }
+        }
+    }
+
+    Ok(manifests.into_iter().collect())
+}
+
+fn selected_workspace_member_manifests(
+    workspace_manifest: &Path,
+    doc: &toml::Value,
+    packages: &[String],
+) -> Result<Vec<PathBuf>> {
+    let manifests = workspace_member_manifests(workspace_manifest, doc)?;
+    if packages.is_empty() {
+        return Ok(manifests);
+    }
+
+    let package_set = packages.iter().collect::<BTreeSet<_>>();
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+    for manifest in manifests {
+        let Some(name) = package_name_from_manifest(&manifest)? else {
+            continue;
+        };
+        if package_set.contains(&name) {
+            seen.insert(name);
+            selected.push(manifest);
+        }
+    }
+
+    for package in packages {
+        if !seen.contains(package) {
+            takopack_bail!("workspace package `{package}` was not found");
+        }
+    }
+    Ok(selected)
+}
+
+fn workspace_string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Vec<String> {
+    table
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn expand_workspace_member(workspace_dir: &Path, member: &str) -> Result<Vec<PathBuf>> {
+    let pattern = workspace_dir.join(member);
+    let pattern = pattern.to_string_lossy().into_owned();
+    let mut paths = Vec::new();
+    for entry in glob::glob(&pattern)
+        .with_context(|| format!("invalid workspace member pattern `{member}`"))?
+    {
+        if let Ok(path) = entry {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn workspace_member_is_excluded(
+    workspace_dir: &Path,
+    member_dir: &Path,
+    excludes: &[String],
+) -> bool {
+    let rel = member_dir.strip_prefix(workspace_dir).unwrap_or(member_dir);
+    excludes.iter().any(|exclude| {
+        glob::Pattern::new(exclude)
+            .map(|pattern| pattern.matches_path(rel))
+            .unwrap_or(false)
+    })
+}
+
+fn manifest_has_package(manifest: &Path) -> Result<bool> {
+    if !manifest.is_file() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    Ok(doc
+        .get("package")
+        .and_then(|value| value.as_table())
+        .is_some())
+}
+
+fn package_name_from_manifest(manifest: &Path) -> Result<Option<String>> {
+    let content = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read {}", manifest.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", manifest.display()))?;
+    Ok(doc
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+        .map(str::to_string))
+}
+
+fn requested_features_from_options(options: &RootBuildRequiresOptions) -> BTreeSet<String> {
+    let mut features = BTreeSet::new();
+    if options.default_features {
+        features.insert("default".to_string());
+    }
+    for feature in &options.features {
+        features.extend(split_feature_list(feature));
+    }
+    features
+}
+
+fn split_feature_list(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_string)
+}
+
 struct RootBuildRequiresWalker<'a> {
     lock_packages: &'a [LockPackage],
     lines: BTreeSet<String>,
@@ -3570,10 +3826,15 @@ struct RootBuildRequiresWalker<'a> {
     seen_manifest_features: BTreeMap<PathBuf, BTreeSet<String>>,
     active_edges: BTreeSet<(PathBuf, String)>,
     source_root: PathBuf,
+    include_dev_dependencies: bool,
 }
 
 impl<'a> RootBuildRequiresWalker<'a> {
-    fn new(lock_packages: &'a [LockPackage], source_root: PathBuf) -> Self {
+    fn new(
+        lock_packages: &'a [LockPackage],
+        source_root: PathBuf,
+        include_dev_dependencies: bool,
+    ) -> Self {
         Self {
             lock_packages,
             lines: BTreeSet::new(),
@@ -3581,6 +3842,7 @@ impl<'a> RootBuildRequiresWalker<'a> {
             seen_manifest_features: BTreeMap::new(),
             active_edges: BTreeSet::new(),
             source_root,
+            include_dev_dependencies,
         }
     }
 
@@ -3653,6 +3915,7 @@ impl<'a> RootBuildRequiresWalker<'a> {
             manifest_dir,
             workspace_dir,
             false,
+            self.include_dev_dependencies,
             &mut deps,
             &mut local_notes,
         )?;
@@ -3669,6 +3932,7 @@ impl<'a> RootBuildRequiresWalker<'a> {
                     manifest_dir,
                     workspace_dir,
                     true,
+                    self.include_dev_dependencies,
                     &mut deps,
                     &mut local_notes,
                 )?;
@@ -3695,6 +3959,7 @@ impl<'a> RootBuildRequiresWalker<'a> {
             .map(|dep| dep.alias.clone())
             .collect::<BTreeSet<_>>();
         active_deps.extend(activation.active_optional_deps);
+        let feature_active_deps = active_deps.clone();
 
         let mut dependency_features = deps
             .iter()
@@ -3707,7 +3972,7 @@ impl<'a> RootBuildRequiresWalker<'a> {
                 .extend(features);
         }
         for (alias, feature) in activation.weak_dependency_features {
-            if active_deps.contains(&alias) {
+            if feature_active_deps.contains(&alias) {
                 dependency_features
                     .entry(alias)
                     .or_default()
@@ -3716,6 +3981,18 @@ impl<'a> RootBuildRequiresWalker<'a> {
         }
 
         let root_lock = root_lock_package(&doc, self.lock_packages);
+        let lockfile_optional_deps = lockfile_optional_dependencies(&deps, root_lock);
+        let lockfile_only_optional_deps = lockfile_optional_deps
+            .difference(&active_deps)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        active_deps.extend(lockfile_optional_deps);
+        if !lockfile_only_optional_deps.is_empty() {
+            self.note(format!(
+                "included {} inactive optional dependency declaration(s) because Cargo.lock requires their sources for offline resolution",
+                lockfile_only_optional_deps.len()
+            ));
+        }
         let mut skipped = 0usize;
         for alias in &active_deps {
             let Some(dep) = deps.get(alias) else {
@@ -3845,10 +4122,6 @@ impl<'a> RootBuildRequiresWalker<'a> {
     }
 }
 
-fn default_requested_features() -> BTreeSet<String> {
-    BTreeSet::from(["default".to_string()])
-}
-
 fn source_root_for_manifest(manifest: &Path) -> Result<PathBuf> {
     if let Some(workspace_manifest) = discover_workspace_manifest(manifest)? {
         if let Some(parent) = workspace_manifest.parent() {
@@ -3928,10 +4201,16 @@ fn collect_root_dependency_sections(
     manifest_dir: &Path,
     workspace_dir: &Path,
     target_specific: bool,
+    include_dev_dependencies: bool,
     deps: &mut BTreeMap<String, RootDependency>,
     notes: &mut Vec<String>,
 ) -> Result<()> {
-    for section in ["dependencies", "build-dependencies"] {
+    let sections: &[&str] = if include_dev_dependencies {
+        &["dependencies", "build-dependencies", "dev-dependencies"]
+    } else {
+        &["dependencies", "build-dependencies"]
+    };
+    for &section in sections {
         let Some(section_table) = table.get(section).and_then(|value| value.as_table()) else {
             continue;
         };
@@ -4223,6 +4502,25 @@ fn root_lock_package<'a>(
                 .map(|source| !source.starts_with("registry+"))
                 .unwrap_or(true)
     })
+}
+
+fn lockfile_optional_dependencies(
+    deps: &BTreeMap<String, RootDependency>,
+    root_lock: Option<&LockPackage>,
+) -> BTreeSet<String> {
+    let Some(root_lock) = root_lock else {
+        return BTreeSet::new();
+    };
+    root_lock
+        .dependencies
+        .iter()
+        .filter_map(|dependency| parse_lock_dependency_ref(dependency))
+        .filter_map(|dependency| {
+            deps.iter()
+                .find(|(_, dep)| dep.optional && dep.package == dependency.name)
+                .map(|(alias, _)| alias.clone())
+        })
+        .collect()
 }
 
 fn selected_lock_package_for_dependency(
@@ -5564,7 +5862,13 @@ version = "{}"
             source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
             dependencies: Vec::new(),
         }));
-        root_buildrequires_from_manifest(&manifest, &lock_packages).unwrap()
+        root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            false,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap()
     }
 
     fn assert_root_lines(result: &RootBuildRequires, expected: &[&str]) {
@@ -5649,6 +5953,131 @@ foo = { version = "1.2", features = ["x"] }
     }
 
     #[test]
+    fn test_root_buildrequires_dev_dependencies_follow_include_dev_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+
+[dev-dependencies]
+proptest = "1"
+"#,
+        )
+        .unwrap();
+        let lock_packages = vec![
+            LockPackage {
+                name: "app".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["foo".to_string(), "proptest".to_string()],
+            },
+            LockPackage {
+                name: "foo".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "proptest".to_string(),
+                version: Version::parse("1.9.0").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let without_dev = root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            false,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap();
+        let with_dev = root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            true,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap();
+
+        assert_root_lines(
+            &without_dev,
+            &["BuildRequires:  crate(foo-1/default) >= 1.2.3"],
+        );
+        assert_root_lines(
+            &with_dev,
+            &[
+                "BuildRequires:  crate(foo-1/default) >= 1.2.3",
+                "BuildRequires:  crate(proptest-1/default) >= 1.9.0",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_includes_lockfile_optional_dependency_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+igvm = { version = "0.4", optional = true }
+"#,
+        )
+        .unwrap();
+        let lock_packages = vec![
+            LockPackage {
+                name: "app".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["foo".to_string(), "igvm".to_string()],
+            },
+            LockPackage {
+                name: "foo".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "igvm".to_string(),
+                version: Version::parse("0.4.0").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let result = root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            false,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap();
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(foo-1/default) >= 1.2.3",
+                "BuildRequires:  crate(igvm-0.4/default) >= 0.4.0",
+            ],
+        );
+        assert!(result
+            .notes
+            .iter()
+            .any(|note| note.contains("inactive optional dependency")));
+    }
+
+    #[test]
     fn test_root_buildrequires_rename_dependency_uses_real_package() {
         let result = root_buildrequires_fixture_with_root_deps(
             r#"[package]
@@ -5697,6 +6126,230 @@ foo = { workspace = true, features = ["y"] }
             .notes
             .iter()
             .any(|note| note.contains("workspace-inherited")));
+    }
+
+    #[test]
+    fn test_root_buildrequires_virtual_workspace_uses_member_union() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("member-a")).unwrap();
+        fs::create_dir_all(tmp.path().join("member-b")).unwrap();
+        fs::create_dir_all(tmp.path().join("ignored")).unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[workspace]
+members = ["member-*", "ignored"]
+exclude = ["ignored"]
+
+[workspace.dependencies]
+bar = { version = "2", default-features = false, features = ["derive"] }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("member-a/Cargo.toml"),
+            r#"[package]
+name = "member-a"
+version = "0.1.0"
+
+[dependencies]
+foo = "1"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("member-b/Cargo.toml"),
+            r#"[package]
+name = "member-b"
+version = "0.1.0"
+
+[dependencies]
+bar = { workspace = true, features = ["std"] }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("ignored/Cargo.toml"),
+            r#"[package]
+name = "ignored"
+version = "0.1.0"
+
+[dependencies]
+baz = "3"
+"#,
+        )
+        .unwrap();
+        let lock_packages = vec![
+            LockPackage {
+                name: "member-a".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["foo".to_string()],
+            },
+            LockPackage {
+                name: "member-b".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["bar".to_string()],
+            },
+            LockPackage {
+                name: "foo".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "bar".to_string(),
+                version: Version::parse("2.3.4").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "baz".to_string(),
+                version: Version::parse("3.4.5").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let result = root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            false,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap();
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(bar-2/derive) >= 2.3.4",
+                "BuildRequires:  crate(bar-2/std) >= 2.3.4",
+                "BuildRequires:  crate(foo-1/default) >= 1.2.3",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_root_buildrequires_workspace_package_feature_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        fs::create_dir_all(tmp.path().join("tool")).unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[workspace]
+members = ["app", "lib", "tool"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("app/Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+lib = { path = "../lib" }
+default-only = { version = "1", optional = true }
+
+[features]
+default = ["dep:default-only"]
+mshv = ["lib/mshv"]
+kvm = ["lib/kvm"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("lib/Cargo.toml"),
+            r#"[package]
+name = "lib"
+version = "0.1.0"
+
+[dependencies]
+mshv-crate = { version = "1", optional = true }
+kvm-crate = { version = "2", optional = true }
+
+[features]
+default = []
+mshv = ["dep:mshv-crate"]
+kvm = ["dep:kvm-crate"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("tool/Cargo.toml"),
+            r#"[package]
+name = "tool"
+version = "0.1.0"
+
+[dependencies]
+tool-only = "3"
+"#,
+        )
+        .unwrap();
+        let lock_packages = vec![
+            LockPackage {
+                name: "app".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["lib".to_string(), "default-only".to_string()],
+            },
+            LockPackage {
+                name: "lib".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["mshv-crate".to_string(), "kvm-crate".to_string()],
+            },
+            LockPackage {
+                name: "tool".to_string(),
+                version: Version::parse("0.1.0").unwrap(),
+                source: None,
+                dependencies: vec!["tool-only".to_string()],
+            },
+            LockPackage {
+                name: "default-only".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "mshv-crate".to_string(),
+                version: Version::parse("1.2.3").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "kvm-crate".to_string(),
+                version: Version::parse("2.3.4").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+            LockPackage {
+                name: "tool-only".to_string(),
+                version: Version::parse("3.4.5").unwrap(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                dependencies: Vec::new(),
+            },
+        ];
+        let options = RootBuildRequiresOptions {
+            packages: vec!["app".to_string()],
+            features: vec!["mshv,kvm".to_string()],
+            default_features: false,
+        };
+
+        let result =
+            root_buildrequires_from_manifest(&manifest, &lock_packages, false, &options).unwrap();
+
+        assert_root_lines(
+            &result,
+            &[
+                "BuildRequires:  crate(default-only-1/default) >= 1.2.3",
+                "BuildRequires:  crate(kvm-crate-2/default) >= 2.3.4",
+                "BuildRequires:  crate(mshv-crate-1/default) >= 1.2.3",
+            ],
+        );
     }
 
     #[test]
@@ -5773,7 +6426,7 @@ default = ["foo?/bar"]
 "#,
             &[("foo", "1.2.3")],
         );
-        assert!(inactive.lines.is_empty());
+        assert_root_lines(&inactive, &["BuildRequires:  crate(foo-1) >= 1.2.3"]);
     }
 
     #[test]
@@ -5832,7 +6485,13 @@ fast = ["foo/simd"]
             },
         ];
 
-        let result = root_buildrequires_from_manifest(&manifest, &lock_packages).unwrap();
+        let result = root_buildrequires_from_manifest(
+            &manifest,
+            &lock_packages,
+            false,
+            &RootBuildRequiresOptions::default(),
+        )
+        .unwrap();
 
         assert_root_lines(&result, &["BuildRequires:  crate(foo-1/simd) >= 1.2.3"]);
     }

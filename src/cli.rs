@@ -293,6 +293,18 @@ pub enum CargoOpt {
         #[arg(long)]
         no_dev: bool,
 
+        /// Package/member whose build features should drive root BuildRequires
+        #[arg(short = 'p', long = "package", value_name = "SPEC")]
+        package: Vec<String>,
+
+        /// Space or comma separated Cargo features to enable for root BuildRequires
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+
+        /// Do not enable the default feature for root BuildRequires
+        #[arg(long)]
+        no_default_features: bool,
+
         /// Deprecated: resolve-check prints BuildRequires by default
         #[arg(long)]
         print_buildrequires: bool,
