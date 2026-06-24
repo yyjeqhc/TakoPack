@@ -114,11 +114,7 @@ fn real_main() -> Result<i32> {
                 CargoOpt::Vendor { args } => {
                     log::info!("starting vendor operation (recursive packaging)");
                     let mut packager = RecursivePackager::new(args.output)?;
-                    packager.process_crate_recursive(
-                        &args.crate_name,
-                        args.version.as_deref(),
-                        args.config,
-                    )?;
+                    packager.process_crate_recursive(&args.crate_name, args.version.as_deref())?;
                     packager.print_summary();
                     Ok(0)
                 }

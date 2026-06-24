@@ -264,7 +264,7 @@ fn process_complete_crate(
         let config = Config::parse(&config_path).context("failed to parse takopack.toml")?;
         (Some(config_path), config)
     } else {
-        (None, Config::default())
+        Config::load()?
     };
 
     // Create CrateInfo from local crate (now it has src/ so Cargo APIs will work)
@@ -318,6 +318,7 @@ fn process_complete_crate(
         !finish_args.no_overlay_write_back,
         None, // TODO: sha256: local packages don't have downloaded crate files, maybe consider record the sha256 when use pkg.
         finish_args.lockfile_deps, // Pass lockfile dependencies if available
+        finish_args.with_spdx,
     );
 
     if let Err(e) = &prepare_result {
@@ -548,6 +549,7 @@ edition = "2021"
             changelog_ready: false,
             copyright_guess_harder: false,
             no_overlay_write_back: false,
+            with_spdx: false,
             lockfile_deps: None,
         };
 

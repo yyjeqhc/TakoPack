@@ -60,8 +60,8 @@ takopack cargo pkg <CRATE_NAME>
 # 指定输出目录
 takopack cargo pkg <CRATE_NAME> <VERSION> --directory output_dir
 
-# 使用自定义配置
-takopack cargo pkg <CRATE_NAME> <VERSION> --config config.toml
+# 临时输出 TakoPack 内置 SPDX 头
+takopack cargo pkg <CRATE_NAME> <VERSION> --with-spdx
 
 # 示例
 takopack cargo pkg serde 1.0.210
@@ -101,6 +101,9 @@ takopack cargo localpkg path/to/Cargo.toml
 
 # 指定输出目录
 takopack cargo localpkg <PATH> -o output_dir
+
+# 临时输出 TakoPack 内置 SPDX 头
+takopack cargo localpkg <PATH> --with-spdx
 
 # 示例
 takopack cargo localpkg ./my-project

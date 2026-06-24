@@ -35,6 +35,11 @@ pub struct Config {
     pub source: Option<SourceOverride>,
     pub packages: HashMap<String, PackageOverride>,
 
+    #[serde(rename = "ruyispec")]
+    _ruyispec: Option<toml::Value>,
+    #[serde(rename = "registry")]
+    _registry: Option<toml::Value>,
+
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, IgnoredAny>,
 }
@@ -128,12 +133,26 @@ impl Default for Config {
             source: None,
             packages: HashMap::new(),
             requires_root: None,
+            _ruyispec: None,
+            _registry: None,
             unknown_fields: HashMap::new(),
         }
     }
 }
 
 impl Config {
+    pub fn load() -> Result<(Option<PathBuf>, Config)> {
+        let path = find_takopack_toml();
+        match path {
+            Some(path) => {
+                let config = Config::parse(&path)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                Ok((Some(path), config))
+            }
+            None => Ok((None, Config::default())),
+        }
+    }
+
     pub fn parse(src: &Path) -> Result<Config> {
         let mut config_file = File::open(src)?;
         let mut content = String::new();
