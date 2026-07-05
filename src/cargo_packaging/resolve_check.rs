@@ -9,15 +9,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use cargo::core::{Shell, Workspace};
+use cargo::core::Workspace;
 use cargo::ops;
 use cargo::util::GlobalContext;
+use cargo_util_terminal::Shell;
 use semver::Version;
 use serde_derive::Serialize;
 use toml::Value;
 
+use crate::cargo_packaging::local::materialize_manifest_backed_temp_crate;
 use crate::errors::Result;
-use crate::local_package::materialize_manifest_backed_temp_crate;
 
 #[derive(Debug, Clone)]
 pub struct ResolveReport {

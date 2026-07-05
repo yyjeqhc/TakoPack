@@ -1,9 +1,9 @@
 use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
 
-use crate::{
+use takopack::cargo_packaging::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     range_audit::RangeCapabilityPolicy,
-    recursive_package::RecursivePackageArgs,
+    recursive::RecursivePackageArgs,
 };
 
 const CLI_STYLE: Styles = Styles::styled()

@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs, PackageProcess};
+use crate::cargo_packaging::package::{
+    PackageExecuteArgs, PackageExtractArgs, PackageInitArgs, PackageProcess,
+};
 
 /// Arguments for recursive packaging command
 #[derive(Debug, Clone, Parser)]
@@ -344,7 +346,7 @@ impl RecursivePackager {
     /// This is more reliable than parsing the generated spec file
     fn extract_dependencies_from_crate_info(
         &self,
-        crate_info: &crate::crates::CrateInfo,
+        crate_info: &crate::cargo_packaging::crates::CrateInfo,
         current_crate: &str,
     ) -> Result<Vec<DependencySpec>> {
         use cargo::core::dependency::DepKind;

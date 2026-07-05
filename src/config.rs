@@ -523,11 +523,6 @@ fn require_directory(path: &Path, label: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-pub fn testing_ignore_debpolv() -> bool {
-    std::env::var_os("takopack_TESTING_IGNORE_takopack_POLICY_VIOLATION").as_deref()
-        == Some(OsStr::new("1"))
-}
-
 pub fn testing_ruzt() -> bool {
     std::env::var_os("takopack_TESTING_RUZT").as_deref() == Some(OsStr::new("1"))
 }

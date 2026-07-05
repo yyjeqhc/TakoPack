@@ -2,15 +2,15 @@ use std::path::PathBuf;
 
 use clap::{crate_version, Parser};
 
+use crate::cargo_packaging::crates::CrateInfo;
 use crate::config::{Config, PackageKey};
-use crate::crates::CrateInfo;
 use crate::errors::Result;
-use crate::takopack::{self, DebInfo};
+use crate::rpm::{self, RpmPackageInfo};
 use crate::util;
 pub struct PackageProcess {
     // below state is filled in during init
     pub crate_info: CrateInfo,
-    pub deb_info: DebInfo,
+    pub rpm_info: RpmPackageInfo,
     pub config_path: Option<PathBuf>,
     pub config: Config,
     pub sha256: Option<String>, // SHA256 hash of downloaded crate file
@@ -45,10 +45,10 @@ pub struct PackageExecuteArgs {
     /// Assume the changelog is already bumped, and leave it alone.
     #[arg(long)]
     pub changelog_ready: bool,
-    /// Guess extra values for d/copyright. Might be slow.
+    /// Reserved for compatibility with the original packaging pipeline.
     #[arg(long)]
     pub copyright_guess_harder: bool,
-    /// Don't write back hint files or d/changelog to the source overlay directory.
+    /// Don't write back generated hint files to the source overlay directory.
     #[arg(long)]
     pub no_overlay_write_back: bool,
     /// Include TakoPack's built-in SPDX header in generated spec files.
@@ -68,7 +68,7 @@ impl PackageProcess {
         config: Config,
     ) -> Result<Self> {
         crate_info.set_includes_excludes(config.orig_tar_excludes(), config.orig_tar_whitelist());
-        let deb_info = DebInfo::new(&crate_info, crate_version!(), config.semver_suffix);
+        let rpm_info = RpmPackageInfo::new(&crate_info, crate_version!(), config.semver_suffix);
 
         // Calculate SHA256 hash for downloaded crates
         let sha256 = match crate_info.calculate_sha256() {
@@ -84,7 +84,7 @@ impl PackageProcess {
 
         Ok(Self {
             crate_info,
-            deb_info,
+            rpm_info,
             config_path,
             config,
             sha256,
@@ -122,14 +122,14 @@ impl PackageProcess {
         assert!(self.source_modified.is_none());
         let Self {
             crate_info,
-            deb_info,
+            rpm_info,
             ..
         } = self;
         // vars read; begin stage
 
         let output_dir = extract
             .directory
-            .unwrap_or_else(|| deb_info.package_source_dir().to_path_buf());
+            .unwrap_or_else(|| rpm_info.package_source_dir().to_path_buf());
 
         let source_modified = crate_info.extract_crate(&output_dir)?;
 
@@ -163,12 +163,8 @@ impl PackageProcess {
         let output_dir = output_dir.as_ref().unwrap();
         // vars read; begin stage
 
-        let temp_output_dir = takopack::apply_overlay_and_patches(
-            crate_info,
-            config_path.as_deref(),
-            config,
-            output_dir,
-        )?;
+        let temp_output_dir =
+            rpm::apply_overlay_and_patches(crate_info, config_path.as_deref(), config, output_dir)?;
 
         // stage finished; set vars
         self.temp_output_dir = Some(temp_output_dir);
@@ -179,7 +175,7 @@ impl PackageProcess {
         assert!(self.orig_tarball.is_none());
         let Self {
             crate_info,
-            deb_info,
+            rpm_info,
             output_dir,
             source_modified,
             ..
@@ -191,8 +187,8 @@ impl PackageProcess {
         let orig_tarball = output_dir
             .parent()
             .unwrap()
-            .join(deb_info.orig_tarball_path());
-        takopack::prepare_orig_tarball(crate_info, &orig_tarball, *source_modified, output_dir)?;
+            .join(rpm_info.orig_tarball_path());
+        rpm::prepare_orig_tarball(crate_info, &orig_tarball, *source_modified, output_dir)?;
 
         // stage finished; set vars
         self.orig_tarball = Some(orig_tarball);
@@ -202,7 +198,7 @@ impl PackageProcess {
     pub fn prepare_takopack_folder(&mut self, args: PackageExecuteArgs) -> Result<()> {
         let Self {
             crate_info,
-            deb_info,
+            rpm_info,
             config_path,
             config,
             sha256,
@@ -212,9 +208,9 @@ impl PackageProcess {
         } = self;
         let output_dir = output_dir.as_ref().unwrap();
         let temp_output_dir = temp_output_dir.as_ref().unwrap();
-        takopack::prepare_takopack_folder(
+        rpm::prepare_takopack_folder(
             crate_info,
-            deb_info,
+            rpm_info,
             config_path.as_deref(),
             config,
             output_dir,

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value;
 
-use crate::recursive_package::RecursivePackager;
+use crate::cargo_packaging::recursive::RecursivePackager;
 
 /// Parse dependencies from Cargo.toml and recursively generate spec files for all dependencies
 pub fn parse_dependencies_from_toml(toml_path: &Path, output_dir: Option<PathBuf>) -> Result<()> {

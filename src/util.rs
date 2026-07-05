@@ -12,8 +12,10 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::lockfile_parser::DependencyGraph;
-use crate::package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs, PackageProcess};
+use crate::cargo_packaging::lockfile::DependencyGraph;
+use crate::cargo_packaging::package::{
+    PackageExecuteArgs, PackageExtractArgs, PackageInitArgs, PackageProcess,
+};
 use anyhow::{bail, Context, Result};
 use itertools::Itertools;
 use semver::Version;
@@ -242,8 +244,6 @@ where
     show_vec_with(it, std::string::ToString::to_string)
 }
 
-type TransitiveValueResult<K, V> = Result<Option<V>, (K, Vec<(K, V)>)>;
-
 pub fn expect_success(cmd: &mut Command, err: &str) -> Result<(), anyhow::Error> {
     match cmd.status() {
         Ok(status) if status.success() => Ok(()),
@@ -268,69 +268,6 @@ where
         }
     }
     seen
-}
-
-/// Get a value that might be set at a key or any of its ancestor keys,
-/// whichever is closest. Error if there are conflicting definitions.
-pub(crate) fn get_transitive_val<
-    'a,
-    P: Fn(K) -> Option<&'a Vec<K>>,
-    F: Fn(K) -> Option<V>,
-    K: 'a + Ord + Copy,
-    V: Eq + Ord,
->(
-    getparents: &'a P,
-    f: &F,
-    key: K,
-) -> TransitiveValueResult<K, V> {
-    let mut visited = std::collections::BTreeSet::new();
-    get_transitive_val_impl(getparents, f, key, &mut visited)
-}
-
-fn get_transitive_val_impl<
-    'a,
-    P: Fn(K) -> Option<&'a Vec<K>>,
-    F: Fn(K) -> Option<V>,
-    K: 'a + Ord + Copy,
-    V: Eq + Ord,
->(
-    getparents: &'a P,
-    f: &F,
-    key: K,
-    visited: &mut std::collections::BTreeSet<K>,
-) -> TransitiveValueResult<K, V> {
-    // Check for cycles
-    if visited.contains(&key) {
-        // Cycle detected, return None to break the recursion
-        return Ok(None);
-    }
-
-    visited.insert(key);
-
-    let here = f(key);
-    if here.is_some() {
-        // value overrides anything from parents
-        Ok(here)
-    } else {
-        let mut candidates = Vec::new();
-        for par in getparents(key).into_iter().flatten() {
-            if let Some(v) = get_transitive_val_impl(getparents, f, *par, visited)? {
-                candidates.push((*par, v))
-            }
-        }
-        if candidates.is_empty() {
-            Ok(None) // here is None
-        } else {
-            let mut values = candidates.iter().map(|(_, v)| v).collect::<Vec<_>>();
-            values.sort();
-            values.dedup();
-            if values.len() == 1 {
-                Ok(candidates.pop().map(|(_, v)| v))
-            } else {
-                Err((key, candidates)) // handle conflict
-            }
-        }
-    }
 }
 
 pub fn graph_from_succ<V, FV, FL, E>(

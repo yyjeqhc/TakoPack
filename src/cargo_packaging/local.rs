@@ -4,11 +4,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use toml::Value;
 
+use crate::cargo_packaging::crates::CrateInfo;
+use crate::cargo_packaging::package::PackageExecuteArgs;
+use crate::cargo_packaging::range_audit::{self, RangeCapabilityPolicy};
 use crate::config::Config;
-use crate::crates::CrateInfo;
-use crate::package::PackageExecuteArgs;
-use crate::range_audit::{self, RangeCapabilityPolicy};
-use crate::takopack::{self, DebInfo};
+use crate::rpm::{self, RpmPackageInfo};
 use crate::util::write_file_ensuring_dir;
 
 /// Process a local crate directory and generate spec file
@@ -277,8 +277,9 @@ fn process_complete_crate(
 
     log::info!("Crate: {} {}", crate_name, version);
 
-    // Create DebInfo
-    let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
+    // Create RpmPackageInfo
+    let rpm_info =
+        RpmPackageInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
     let output_names = crate::util::rust_crate_output_names(crate_name, version);
 
@@ -306,9 +307,9 @@ fn process_complete_crate(
     log::info!("Preparing takopack folder");
 
     // Apply overrides and generate spec file
-    let prepare_result = takopack::prepare_takopack_folder(
+    let prepare_result = rpm::prepare_takopack_folder(
         &mut crate_info,
-        &deb_info,
+        &rpm_info,
         config_path.as_deref(),
         &config,
         temp_crate_dir,
@@ -365,8 +366,8 @@ fn process_complete_crate(
 #[cfg(test)]
 mod tests {
     use super::{materialize_manifest_backed_temp_crate, process_local_package};
-    use crate::package::PackageExecuteArgs;
-    use crate::range_audit::RangeCapabilityPolicy;
+    use crate::cargo_packaging::package::PackageExecuteArgs;
+    use crate::cargo_packaging::range_audit::RangeCapabilityPolicy;
     use crate::util::rust_crate_output_names;
     use semver::Version;
     use std::fs;
