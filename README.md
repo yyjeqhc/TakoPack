@@ -46,6 +46,8 @@ Python 功能已内置：使用 `takopack py package <NAME> [VERSION] [-o output
 
 TakoPack 的 Rust/Cargo 操作都在 `cargo` 子命令下：
 
+当前保留的 Cargo 子命令包括 `pkg`、`localpkg`、`registry-sync`、`resolve-check` 和 `buildreqs`。批量文件处理、vendor 递归入口、Cargo.toml 递归解析入口以及手动 crates.io 缓存刷新入口已不再提供。
+
 #### 1. pkg - 打包单个 Crate
 
 从 crates.io 下载并为单个 crate 生成 RPM spec 文件。
@@ -70,7 +72,7 @@ takopack cargo pkg tokio
 
 **输出**:
 - 默认（无 `--directory`）：创建 `rust-{crate}-{compat_version}/` 目录
-- 指定 `--directory output_dir`：将 spec 和 Cargo.toml 直接放入 `output_dir/`
+- 指定 `--directory output_dir`：创建 `output_dir/rust-{crate}-{compat_version}/` 目录
 
 目录内容：
 - `rust-{crate}-{compat_version}.spec` - RPM spec 文件
@@ -112,7 +114,7 @@ takopack cargo localpkg ./Cargo.toml -o specs/
 
 **输出**:
 - 默认（无 `-o`）：在当前目录创建 `rust-{crate}-{compat_version}/` 子目录，包含 spec 和 Cargo.toml
-- 指定 `-o output_dir`：将 spec 和 Cargo.toml 直接放入 `output_dir/`，不创建子目录
+- 指定 `-o output_dir`：创建 `output_dir/rust-{crate}-{compat_version}/` 子目录，包含 spec 和 Cargo.toml
 
 **特点**:
 - 无需上传到 crates.io 即可生成 spec

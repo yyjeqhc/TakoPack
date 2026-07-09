@@ -1339,10 +1339,10 @@ mod tests {
             tarball.extend_from_slice(&header);
             tarball.extend_from_slice(data);
             let padding = (512 - (data.len() % 512)) % 512;
-            tarball.extend(std::iter::repeat(0).take(padding));
+            tarball.extend(std::iter::repeat_n(0, padding));
         }
 
-        tarball.extend(std::iter::repeat(0).take(1024));
+        tarball.extend(std::iter::repeat_n(0, 1024));
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &tarball).unwrap();

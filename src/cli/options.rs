@@ -1,9 +1,8 @@
 use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
 
-use crate::{
+use takopack::cargo_packaging::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     range_audit::RangeCapabilityPolicy,
-    recursive_package::RecursivePackageArgs,
 };
 
 const CLI_STYLE: Styles = Styles::styled()
@@ -33,9 +32,6 @@ pub enum Opt {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum CargoOpt {
-    /// Update the crates.io index cache
-    #[command(alias = "u")]
-    Update,
     /// Package a single Rust crate and generate RPM spec file
     #[command(alias = "pkg")]
     Package {
@@ -49,34 +45,6 @@ pub enum CargoOpt {
         #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
         range_capability_policy: RangeCapabilityPolicy,
     },
-    /// Recursively package a crate and all its dependencies (vendor mode)
-    #[command(alias = "v")]
-    Vendor {
-        #[command(flatten)]
-        args: RecursivePackageArgs,
-    },
-    /// Parse Cargo.toml dependencies and recursively generate spec files for all
-    #[command(name = "parsetoml", alias = "parse")]
-    ParseToml {
-        /// Path to Cargo.toml file
-        #[arg(value_name = "CARGO_TOML")]
-        toml_path: std::path::PathBuf,
-
-        /// Output root directory. Each package is generated under this root.
-        #[arg(short, long, value_name = "OUT_ROOT")]
-        output: Option<std::path::PathBuf>,
-    },
-    /// Batch process multiple crates from a text file (one crate per line: "crate_name version")
-    #[command(name = "batch")]
-    Batch {
-        /// Path to text file containing crate list (one per line: "name version")
-        #[arg(value_name = "FILE")]
-        file: std::path::PathBuf,
-
-        /// Output root directory. Each package is generated under this root.
-        #[arg(short, long, value_name = "OUT_ROOT")]
-        output: Option<std::path::PathBuf>,
-    },
     /// Package from a local crate directory (with Cargo.toml)
     #[command(name = "localpkg", alias = "local")]
     LocalPackage {
@@ -84,12 +52,12 @@ pub enum CargoOpt {
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
 
-        /// Final output package directory. Files are written directly into this directory.
+        /// Output root directory. The package directory is created under this root.
         #[arg(
             short = 'o',
             long = "directory",
             alias = "output",
-            value_name = "OUT_DIR"
+            value_name = "OUT_ROOT"
         )]
         output: Option<std::path::PathBuf>,
 

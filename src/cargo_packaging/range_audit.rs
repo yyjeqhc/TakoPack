@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use semver::{Comparator, Op, Version, VersionReq};
 
-use crate::crates::dependency_is_runtime_candidate;
-use crate::takopack::spec::normalize_crate_name;
+use crate::cargo_packaging::crates::dependency_is_runtime_candidate;
+use crate::rpm::spec::normalize_crate_name;
 use crate::util::calculate_compat_version;
 
 // ---------------------------------------------------------------------------
@@ -23,20 +23,15 @@ use crate::util::calculate_compat_version;
 // ---------------------------------------------------------------------------
 
 /// Policy for handling range capability warnings during spec generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum RangeCapabilityPolicy {
     /// Print warnings to stderr but continue generating the spec.
+    #[default]
     Warn,
     /// Print errors and exit non-zero; abort spec generation.
     Error,
     /// Suppress all range capability diagnostics (old behaviour).
     Allow,
-}
-
-impl Default for RangeCapabilityPolicy {
-    fn default() -> Self {
-        RangeCapabilityPolicy::Warn
-    }
 }
 
 impl fmt::Display for RangeCapabilityPolicy {
@@ -498,9 +493,7 @@ fn collect_dependency_paths(manifest: &toml::Value) -> Vec<String> {
     paths
 }
 
-fn dependency_tables<'a>(
-    manifest: &'a toml::Value,
-) -> Vec<&'a toml::map::Map<String, toml::Value>> {
+fn dependency_tables(manifest: &toml::Value) -> Vec<&toml::map::Map<String, toml::Value>> {
     let mut tables = Vec::new();
 
     for section in &["dependencies", "build-dependencies", "dev-dependencies"] {

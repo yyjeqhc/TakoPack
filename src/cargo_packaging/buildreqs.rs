@@ -5,8 +5,8 @@ use std::path::Path;
 
 use semver::Version;
 
+use crate::cargo_packaging::resolve_check::{self, LockPackage};
 use crate::errors::Result;
-use crate::resolve_check::{self, LockPackage};
 use crate::util::calculate_compat_version;
 
 pub fn run_buildreqs(path: &Path, registry: Option<&Path>) -> Result<i32> {

@@ -56,8 +56,6 @@ pub struct SpecPackage {
     pub description: String,
     pub requires: Vec<CrateRequirement>,
     pub provides: Vec<CrateCapability>,
-    pub obsoletes: Vec<String>,
-    pub conflicts: Vec<String>,
     pub extra_lines: Vec<String>,
 }
 
@@ -262,12 +260,6 @@ fn render_package_metadata<W: Write>(out: &mut W, package: &SpecPackage) -> fmt:
     }
     for capability in &package.provides {
         writeln!(out, "{}", render_crate_provides(capability))?;
-    }
-    for obsolete in &package.obsoletes {
-        writeln!(out, "Obsoletes:      {}", obsolete)?;
-    }
-    for conflict in &package.conflicts {
-        writeln!(out, "Conflicts:      {}", conflict)?;
     }
     for line in &package.extra_lines {
         writeln!(out, "{}", line)?;

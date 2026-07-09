@@ -3,31 +3,18 @@ use std::fmt::{self, Write};
 
 use cargo::{core::Dependency, util::OptVersionReq};
 use semver::Version;
-use textwrap::fill;
 
+use crate::cargo_packaging::crates::dependency_is_runtime_candidate;
 use crate::config::{self, Config, PackageKey};
-use crate::crates::dependency_is_runtime_candidate;
 use crate::errors::*;
-use crate::takopack::spec::{
+use crate::rpm::spec::{
     self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
 };
-
-#[derive(Default, Debug)]
-pub struct BuildDeps {
-    pub(crate) build_depends: Vec<String>,
-    pub(crate) build_depends_indep: Vec<String>,
-    pub(crate) build_depends_arch: Vec<String>,
-}
 
 pub struct Source {
     name: String,
     version: String,
     full_version: String, // Full version including build metadata (e.g., "0.7.5+spec-1.1.0")
-    section: String,
-    standards: String,
-    build_deps: BuildDeps,
-    vcs_git: String,
-    vcs_browser: String,
     homepage: String,
     crate_name: String,
     license: String,
@@ -37,19 +24,9 @@ pub struct Source {
 
 pub struct Package {
     name: String,
-    arch: String,
-    multi_arch: Option<String>,
-    section: Option<String>,
-    depends: Vec<String>,
     crate_deps: Vec<CrateDep>, // Structured dependencies for crate() format
     crate_requires: Vec<CrateRequirement>, // Structured external crate requirements from Cargo.toml
-    recommends: Vec<String>,
-    suggests: Vec<String>,
-    provides: Vec<String>,
     feature_provides: Vec<String>, // Structured Cargo feature aliases provided by this package
-    breaks: Vec<String>,
-    replaces: Vec<String>,
-    conflicts: Vec<String>,
     summary: Description,
     description: Description,
     extra_lines: Vec<String>,
@@ -196,17 +173,6 @@ impl Description {
     }
 }
 
-pub struct PkgTest {
-    name: String,
-    crate_name: String,
-    feature: String,
-    version: String,
-    extra_test_args: Vec<String>,
-    depends: Vec<String>,
-    extra_restricts: Vec<String>,
-    architecture: Vec<String>,
-}
-
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Package name uses hyphens instead of underscores
@@ -269,53 +235,6 @@ impl fmt::Display for Source {
         spec::render_source_requirements_section(f, &source)?;
         Ok(())
     }
-}
-
-fn clean_package_name(pkg_name: &str) -> String {
-    // Legacy fallback for Debian-style package names used in Obsoletes/Conflicts.
-    // New RPM crate capability generation should use structured Cargo feature data.
-    // Convert old format to new format and remove version numbers
-    // librust-proc-macro2-1+default-dev -> rust-proc-macro2-default
-    // librust-heck-0.5+default-devel -> rust-heck-default
-
-    let mut name = pkg_name.to_string();
-
-    // Remove -devel or -dev suffix
-    if name.ends_with("-devel") {
-        name = name[..name.len() - 6].to_string();
-    } else if name.ends_with("-dev") {
-        name = name[..name.len() - 4].to_string();
-    }
-
-    // Replace librust- with rust-
-    if name.starts_with("librust-") {
-        name = name.replacen("librust-", "rust-", 1);
-    }
-
-    // Replace + with -
-    name = name.replace('+', "-");
-
-    // Remove version numbers from package name
-    let parts: Vec<&str> = name.split('-').collect();
-    let cleaned_parts: Vec<&str> = parts
-        .into_iter()
-        .filter(|part| {
-            // Keep part if it doesn't look like a version number
-            // Version numbers are: pure digits, or digits with dots (like 0.5, 1.0, etc)
-            if part.is_empty() {
-                return false;
-            }
-            // Check if it's a version number: starts with digit and only contains digits/dots
-            if part.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && part.chars().all(|c| c.is_ascii_digit() || c == '.')
-            {
-                return false; // This is a version number, filter it out
-            }
-            true
-        })
-        .collect();
-
-    cleaned_parts.join("-")
 }
 
 fn crate_requirements_from_cargo_deps(
@@ -477,79 +396,6 @@ fn compare_version_strings(a: &String, b: &String) -> std::cmp::Ordering {
     }
 }
 
-#[cfg(test)]
-/// 简化的包名解析函数
-/// 规则：
-/// 1. 去掉开头的 rust- 或 librust-
-/// 2. 去掉末尾的 -dev 或 -devel
-/// 3. + 号后面是 feature 名称
-/// 4. + 号左边，最右边的 - 后面如果是版本号（数字和点组成），则为版本
-/// 5. 版本号前面的是 crate 名称
-///
-/// 示例：
-///   rust-md-5-0.10+default-dev -> CrateDep { crate_name: "md-5", feature: Some("default") }
-///   rust-serde-1+derive-dev -> CrateDep { crate_name: "serde", feature: Some("derive") }
-///   rust-utf-8-0.7-dev -> CrateDep { crate_name: "utf-8", feature: None }
-///   rust-proc-macro2-1-dev -> CrateDep { crate_name: "proc-macro2", feature: None }
-fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
-    let mut name = pkg_name.trim();
-
-    // 1. 去掉开头的 rust- 或 librust-
-    if name.starts_with("librust-") {
-        name = &name[8..];
-    } else if name.starts_with("rust-") {
-        name = &name[5..];
-    } else {
-        return None;
-    }
-
-    // 2. 去掉末尾的 -dev 或 -devel
-    if name.ends_with("-devel") {
-        name = &name[..name.len() - 6];
-    } else if name.ends_with("-dev") {
-        name = &name[..name.len() - 4];
-    }
-
-    // 3. 按 + 分割，提取 feature
-    let (crate_and_version, feature) = if let Some(plus_idx) = name.find('+') {
-        let left = &name[..plus_idx];
-        let right = &name[plus_idx + 1..];
-        (left, Some(right.to_string()))
-    } else {
-        (name, None)
-    };
-
-    // 4. 从右往左找最后一个看起来像版本号的段
-    // 版本号特征：只包含数字和点，且以数字开头
-    let parts: Vec<&str> = crate_and_version.split('-').collect();
-
-    // 找到最后一个版本号段的位置
-    let version_idx = parts.iter().rposition(|part| {
-        !part.is_empty()
-            && part.chars().next().is_some_and(|c| c.is_ascii_digit())
-            && part.chars().all(|c| c.is_ascii_digit() || c == '.')
-    });
-
-    // 5. 提取 crate 名称（版本号前面的所有部分）
-    let crate_name = if let Some(idx) = version_idx {
-        if idx > 0 {
-            parts[..idx].join("-")
-        } else {
-            // 如果版本号在第一个位置，这不太可能，但保险起见
-            crate_and_version.to_string()
-        }
-    } else {
-        // 没有找到版本号，整个就是 crate 名称
-        crate_and_version.to_string()
-    };
-
-    if crate_name.is_empty() {
-        return None;
-    }
-
-    Some(CrateDep::new(crate_name, feature))
-}
-
 impl fmt::Display for Package {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let spec_package = SpecPackage {
@@ -558,8 +404,6 @@ impl fmt::Display for Package {
             description: format!("{}", self.description),
             requires: self.spec_requires(),
             provides: self.spec_provides(),
-            obsoletes: self.spec_obsoletes(),
-            conflicts: self.spec_conflicts(),
             extra_lines: self.extra_lines.clone(),
         };
 
@@ -608,49 +452,6 @@ fn requirement_has_version(requirement: &CrateRequirement) -> bool {
     !matches!(requirement.requirement, RequirementVersion::None)
 }
 
-impl fmt::Display for PkgTest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let extra_args = if self.extra_test_args.is_empty() {
-            "".into()
-        } else {
-            format!(" {}", self.extra_test_args.join(" "))
-        };
-        writeln!(
-            f,
-            "Test-Command: /usr/share/cargo/bin/cargo-auto-test {} {} --all-targets{}",
-            self.crate_name, self.version, extra_args,
-        )?;
-        writeln!(f, "Features: test-name={}:{}", &self.name, &self.feature)?;
-        // TODO: drop the below workaround when rust-lang/cargo#5133 is fixed.
-        // The downside of our present work-around is that more dependencies
-        // must be installed, which makes it harder to actually run the tests
-        let cargo_bug_fixed = false;
-        let default_deps = if cargo_bug_fixed { &self.name } else { "@" };
-
-        let depends = if self.depends.is_empty() {
-            "".into()
-        } else {
-            format!(", {}", self.depends.join(", "))
-        };
-        writeln!(f, "Depends: dh-cargo (>= 31){}, {}", depends, default_deps)?;
-
-        let restricts = if self.extra_restricts.is_empty() {
-            "".into()
-        } else {
-            format!(", {}", self.extra_restricts.join(", "))
-        };
-        writeln!(
-            f,
-            "Restrictions: allow-stderr, skip-not-installable{}",
-            restricts,
-        )?;
-        if !self.architecture.is_empty() {
-            writeln!(f, "Architecture: {}", self.architecture.join(" "))?;
-        }
-        Ok(())
-    }
-}
-
 impl Source {
     pub fn pkg_prefix() -> &'static str {
         if config::testing_ruzt() {
@@ -668,10 +469,7 @@ impl Source {
         name_suffix: Option<&str>,
         crate_name: &str,
         home: &str,
-        repository: &str,
         license: &str,
-        lib: bool,
-        build_deps: BuildDeps,
         full_version: String,   // Full version including build metadata
         sha256: Option<String>, // SHA256 hash of downloaded crate file
     ) -> Result<Source> {
@@ -679,34 +477,10 @@ impl Source {
             None => basename.to_string(),
             Some(suf) => format!("{}{}", basename, suf),
         };
-        let section = if lib {
-            "rust"
-        } else {
-            "FIXME-IN-THE-SOURCE-SECTION"
-        };
-        let vcs_browser = format!(
-            "https://salsa.debian.org/rust-team/takopack-conf/tree/master/src/{}",
-            pkgbase
-        );
-        // Use repository from Cargo.toml if available
-        let vcs_git = if !repository.is_empty() {
-            if repository.starts_with("http://") || repository.starts_with("https://") {
-                format!("git:{}", repository)
-            } else {
-                repository.to_string()
-            }
-        } else {
-            String::new()
-        };
         Ok(Source {
-            name: dsc_name(&pkgbase),
+            name: rpm_source_name(&pkgbase),
             version: version.to_string(),
             full_version,
-            section: section.to_string(),
-            standards: "4.7.2".to_string(),
-            build_deps,
-            vcs_git,
-            vcs_browser,
             homepage: home.to_string(),
             crate_name: crate_name.to_string(),
             license: license.to_string(),
@@ -720,61 +494,8 @@ impl Source {
     }
 
     pub fn apply_overrides(&mut self, config: &Config, with_spdx: bool) {
-        if let Some(section) = config.section() {
-            self.section = section.to_string();
-        }
-
-        if let Some(policy) = config.policy_version() {
-            self.standards = policy.to_string();
-        }
-
-        self.build_deps.build_depends.extend(
-            config
-                .build_depends()
-                .into_iter()
-                .flatten()
-                .map(String::to_string),
-        );
-        self.build_deps.build_depends_arch.extend(
-            config
-                .build_depends_arch()
-                .into_iter()
-                .flatten()
-                .map(String::to_string),
-        );
-        self.build_deps.build_depends_indep.extend(
-            config
-                .build_depends_indep()
-                .into_iter()
-                .flatten()
-                .map(String::to_string),
-        );
-        let bdeps_ex = config
-            .build_depends_excludes()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        self.build_deps
-            .build_depends
-            .retain(|x| !bdeps_ex.contains(x));
-
-        self.build_deps
-            .build_depends_arch
-            .retain(|x| !bdeps_ex.contains(x));
-
-        self.build_deps
-            .build_depends_indep
-            .retain(|x| !bdeps_ex.contains(x));
-
         if let Some(homepage) = config.homepage() {
             self.homepage = homepage.to_string();
-        }
-
-        if let Some(vcs_git) = config.vcs_git() {
-            self.vcs_git = vcs_git.to_string();
-        }
-
-        if let Some(vcs_browser) = config.vcs_browser() {
-            self.vcs_browser = vcs_browser.to_string();
         }
 
         self.with_spdx = with_spdx;
@@ -842,26 +563,6 @@ impl Package {
         capabilities
     }
 
-    fn spec_obsoletes(&self) -> Vec<String> {
-        self.replaces
-            .iter()
-            .map(|rep| {
-                let cleaned = rep.split('(').next().unwrap_or(rep).trim();
-                clean_package_name(cleaned)
-            })
-            .collect()
-    }
-
-    fn spec_conflicts(&self) -> Vec<String> {
-        self.breaks
-            .iter()
-            .map(|brk| {
-                let cleaned = brk.split('(').next().unwrap_or(brk).trim();
-                clean_package_name(cleaned)
-            })
-            .collect()
-    }
-
     /// Apply lockfile dependencies
     pub fn apply_lockfile_deps(&mut self, lockfile_deps: &HashMap<String, semver::Version>) {
         for dep in &mut self.crate_deps {
@@ -895,79 +596,29 @@ impl Package {
     pub fn new(
         basename: &str,
         name_suffix: Option<&str>,
-        version: &Version,
         summary: Description,
         description: Description,
         feature: Option<&str>,
         f_deps: Vec<&str>,
-        o_deps: Vec<String>,
         ori_deps: Vec<Dependency>,
         f_provides: Vec<&str>,
-        f_recommends: Vec<&str>,
-        f_suggests: Vec<&str>,
         all_features: Vec<String>, // All features from Cargo.toml (only used for base package)
     ) -> Result<Package> {
-        // for d in &o_deps {
-        //     println!("dep: {}", d);
-        //     // dep: rust-winapi-x86-64-pc-windows-gnu-0.4+default-dev
-        // }
         let pkgbase = match name_suffix {
             None => basename.to_string(),
             Some(suf) => format!("{}{}", basename, suf),
         };
-        let deb_feature2 = &|p: &str, f: &str| match f {
-            "" => deb_name(p),
-            _ => deb_feature_name(p, f),
-        };
-        let deb_feature = &|f: &str| deb_feature2(&pkgbase, f);
 
-        let filter_provides = &|x: Vec<&str>| {
-            x.into_iter()
-                .filter(|f| !f_provides.contains(f))
-                .map(deb_feature)
-                .collect()
-        };
-        let (recommends, suggests) = match feature {
-            Some(_) => (vec![], vec![]),
-            None => (filter_provides(f_recommends), filter_provides(f_suggests)),
-        };
-
-        // Provides for all possible versions, see:
-        // https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=901827#35
-        // https://wiki.debian.org/Teams/RustPackaging/Policy#Package_provides
-        let mut provides = vec![];
-        // Only provide unversioned package names for RPM spec format
-        let version_suffixes = ["".to_string()];
-        for suffix in version_suffixes.iter() {
-            // don't provide unversioned variants in semver-suffix packages
-            if name_suffix.is_some() && suffix.is_empty() {
-                continue;
-            };
-
-            let p = format!("{}{}", basename, suffix);
-            provides.push(deb_feature2(&p, feature.unwrap_or("")));
-            provides.extend(f_provides.iter().map(|f| deb_feature2(&p, f)));
-        }
-        let provides_self = deb_feature(feature.unwrap_or(""));
-        // rust dropped Vec::remove_item for annoying reasons, the below is
-        // an unofficialy recommended replacement from the RFC #40062
-        let i = provides.iter().position(|x| *x == *provides_self);
-        i.map(|i| provides.remove(i));
-
-        let mut depends = vec![];
         let mut crate_deps = vec![];
 
         if feature.is_some() && !f_deps.contains(&"") {
-            // in dh-cargo we symlink /usr/share/doc/{$feature => $main} pkg
-            // so we always need this direct dependency, even if the feature
-            // only indirectly depends on the bare library via another
-            depends.push(deb_feature(""));
+            // Feature subpackages depend directly on the base crate package,
+            // even when the feature only reaches it through another feature.
             crate_deps.push(CrateDep::new("%{pkgname}".to_string(), None));
         }
 
         // Build crate_deps from f_deps (internal feature dependencies, no version)
         for f in &f_deps {
-            depends.push(deb_feature(f));
             if f.is_empty() {
                 // Empty feature means dependency on base crate
                 crate_deps.push(CrateDep::new("%{pkgname}".to_string(), None));
@@ -977,64 +628,19 @@ impl Package {
             }
         }
 
-        for o_dep in o_deps.iter() {
-            depends.push(o_dep.clone());
-        }
         let crate_requires = crate_requirements_from_cargo_deps(&ori_deps, basename);
-        let mut breaks = vec![];
-        let mut replaces = vec![];
-        if name_suffix.is_some() && feature.is_none() {
-            // B+R needs to be set on "real" package, not virtual ones
-            // constrain by "next" version, so that it is possible to install a newer,
-            // non-suffixed package at the same time
-            let mut next_version = version.clone();
-            next_version.patch += 1;
-            breaks.push(format!("{} (<< {}~)", deb_name(basename), next_version));
-            replaces.push(format!("{} (<< {}~)", deb_name(basename), next_version));
-        }
-        let conflicts = vec![];
 
         Ok(Package {
             name: match feature {
-                None => deb_name(&pkgbase),
-                Some(f) => deb_feature_name(&pkgbase, f),
+                None => rpm_package_name(&pkgbase),
+                Some(f) => rpm_feature_package_name(&pkgbase, f),
             },
-            arch: "any".to_string(),
-            // This is the best but not ideal option for us.
-            //
-            // Currently takopack M-A spec has a deficiency where a package X that
-            // build-depends on a (M-A:foreign+arch:all) package that itself
-            // depends on an arch:any package Z, will pick up the BUILD_ARCH of
-            // package Z instead of the HOST_ARCH. This is because we currently
-            // have no way of telling dpkg to use HOST_ARCH when checking that the
-            // dependencies of Y are satisfied, which is done at install-time
-            // without any knowledge that we're about to do a cross-compile. It
-            // is also problematic to tell dpkg to "accept any arch" because of
-            // the presence of non-M-A:same packages in the archive, that are not
-            // co-installable - different arches of Z might be depended-upon by
-            // two conflicting chains. (dpkg has so far chosen not to add an
-            // exception for the case where package Z is M-A:same co-installable).
-            //
-            // The recommended work-around for now from the dpkg developers is to
-            // make our packages arch:any M-A:same even though this results in
-            // duplicate packages in the takopack archive. For very large crates we
-            // will eventually want to make takopack generate -data packages that
-            // are arch:all and have the arch:any -dev packages depend on it.
-            multi_arch: Some("same".to_string()),
-            section: None,
-            depends,
             crate_deps,
             crate_requires,
-            recommends,
-            suggests,
-            provides,
             feature_provides: f_provides
                 .iter()
                 .map(|feature| feature.to_string())
                 .collect(),
-            breaks,
-            replaces,
-            conflicts,
             summary,
             description,
             extra_lines: vec![],
@@ -1044,68 +650,12 @@ impl Package {
         })
     }
 
-    pub fn new_bin(
-        basename: &str,
-        name_suffix: Option<&str>,
-        section: Option<&str>,
-        summary: Description,
-        description: Description,
-    ) -> Self {
-        let (name, mut provides) = match name_suffix {
-            None => (basename.to_string(), vec![]),
-            Some(suf) => (
-                format!("{}{}", basename, suf),
-                vec![format!("{} (= ${{binary:Version}})", basename)],
-            ),
-        };
-        provides.push("${cargo:Provides}".to_string());
-        Package {
-            name,
-            arch: "any".to_string(),
-            multi_arch: None,
-            section: section.map(|s| s.to_string()),
-            depends: vec![
-                "${misc:Depends}".to_string(),
-                "${shlibs:Depends}".to_string(),
-                "${cargo:Depends}".to_string(),
-            ],
-            crate_deps: vec![],
-            crate_requires: vec![],
-            recommends: vec!["${cargo:Recommends}".to_string()],
-            suggests: vec!["${cargo:Suggests}".to_string()],
-            provides,
-            feature_provides: vec![],
-            breaks: vec![],
-            replaces: vec![],
-            conflicts: vec![],
-            summary,
-            description,
-            extra_lines: vec![
-                "Built-Using: ${cargo:Built-Using}".to_string(),
-                "Static-Built-Using: ${cargo:Static-Built-Using}".to_string(),
-            ],
-            feature: None,
-            crate_name: None,
-            all_features: vec![],
-        }
-    }
-
     pub fn new_extra(name: String) -> Self {
         Package {
             name,
-            arch: Default::default(),
-            multi_arch: Default::default(),
-            section: Default::default(),
-            depends: Default::default(),
             crate_deps: Default::default(),
             crate_requires: Default::default(),
-            recommends: Default::default(),
-            suggests: Default::default(),
-            provides: Default::default(),
             feature_provides: Default::default(),
-            breaks: Default::default(),
-            replaces: Default::default(),
-            conflicts: Default::default(),
             summary: Description::new(Default::default(), Default::default()),
             description: Description::new(Default::default(), Default::default()),
             extra_lines: Default::default(),
@@ -1119,76 +669,12 @@ impl Package {
         self.name.as_str()
     }
 
-    #[allow(dead_code)]
-    fn write_description(&self, out: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(out, "Description: {}", &self.summary)?;
-        let description = format!("{}", &self.description);
-        for line in fill(description.trim(), 79).lines() {
-            let line = line.trim_end();
-            if line.is_empty() {
-                writeln!(out, " .")?;
-            } else if line.starts_with("- ") {
-                writeln!(out, "  {}", line)?;
-            } else {
-                writeln!(out, " {}", line)?;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::result_unit_err)]
-    pub fn summary_check_len(&self) -> std::result::Result<(), ()> {
-        if self.summary.prefix.len() <= 80 {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    pub fn apply_overrides(&mut self, config: &Config, key: PackageKey, f_provides: Vec<&str>) {
-        if let Some(section) = config.package_section(key) {
-            self.section = Some(section.to_string());
-        }
+    pub fn apply_overrides(&mut self, config: &Config, key: PackageKey) {
         self.summary
             .apply_overrides(&config.summary, config.package_summary(key));
         self.description
             .apply_overrides(&config.description, config.package_description(key));
 
-        self.depends.extend(config::package_field_for_feature(
-            |x| config.package_depends(x),
-            key,
-            &f_provides,
-        ));
-        self.recommends.extend(config::package_field_for_feature(
-            |x| config.package_recommends(x),
-            key,
-            &f_provides,
-        ));
-        self.suggests.extend(config::package_field_for_feature(
-            |x| config.package_suggests(x),
-            key,
-            &f_provides,
-        ));
-        self.provides.extend(config::package_field_for_feature(
-            |x| config.package_provides(x),
-            key,
-            &f_provides,
-        ));
-        self.breaks.extend(config::package_field_for_feature(
-            |x| config.package_breaks(x),
-            key,
-            &f_provides,
-        ));
-        self.replaces.extend(config::package_field_for_feature(
-            |x| config.package_replaces(x),
-            key,
-            &f_provides,
-        ));
-        self.conflicts.extend(config::package_field_for_feature(
-            |x| config.package_conflicts(x),
-            key,
-            &f_provides,
-        ));
         self.extra_lines.extend(
             config
                 .package_extra_lines(key)
@@ -1196,12 +682,6 @@ impl Package {
                 .flatten()
                 .map(|s| s.to_string()),
         );
-        if let Some(architecture) = config.package_architecture(key) {
-            self.arch = architecture.join(" ");
-        }
-        if let Some(multi_arch) = config.package_multi_arch(key) {
-            self.multi_arch = Some(multi_arch.to_owned());
-        }
     }
 }
 
@@ -1221,35 +701,10 @@ impl fmt::Display for Description {
     }
 }
 
-impl PkgTest {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: &str,
-        crate_name: &str,
-        feature: &str,
-        version: &str,
-        extra_test_args: Vec<&str>,
-        depends: &[String],
-        extra_restricts: Vec<&str>,
-        architecture: &[&str],
-    ) -> Result<PkgTest> {
-        Ok(PkgTest {
-            name: name.to_string(),
-            crate_name: crate_name.to_string(),
-            feature: feature.to_string(),
-            version: version.to_string(),
-            extra_test_args: extra_test_args.iter().map(|x| x.to_string()).collect(),
-            depends: depends.to_vec(),
-            extra_restricts: extra_restricts.iter().map(|x| x.to_string()).collect(),
-            architecture: architecture.iter().map(|x| x.to_string()).collect(),
-        })
-    }
-}
-
 /// Translates a semver into a takopack-format upstream version.
 /// Omits the build metadata, and uses a ~ before the prerelease version so it
 /// compares earlier than the subsequent release.
-pub fn deb_upstream_version(v: &Version) -> String {
+pub fn rpm_upstream_version(v: &Version) -> String {
     let mut s = format!("{}.{}.{}", v.major, v.minor, v.patch);
     if !v.pre.is_empty() {
         // Use '-' instead of '~' for prerelease versions in RPM spec
@@ -1258,34 +713,36 @@ pub fn deb_upstream_version(v: &Version) -> String {
     s
 }
 
-pub fn base_deb_name(crate_name: &str) -> String {
+pub fn base_crate_package_name(crate_name: &str) -> String {
     crate_name.replace('_', "-").to_lowercase()
 }
 
-pub fn dsc_name(name: &str) -> String {
-    format!("{}-{}", Source::pkg_prefix(), base_deb_name(name))
+pub fn rpm_source_name(name: &str) -> String {
+    format!("{}-{}", Source::pkg_prefix(), base_crate_package_name(name))
 }
 
-pub fn deb_name(name: &str) -> String {
-    format!("{}-{}", Package::pkg_prefix(), base_deb_name(name))
+pub fn rpm_package_name(name: &str) -> String {
+    format!(
+        "{}-{}",
+        Package::pkg_prefix(),
+        base_crate_package_name(name)
+    )
 }
 
-pub fn deb_feature_name(name: &str, feature: &str) -> String {
+pub fn rpm_feature_package_name(name: &str, feature: &str) -> String {
     format!(
         "{}-{}-{}",
         Package::pkg_prefix(),
-        base_deb_name(name),
-        base_deb_name(feature)
+        base_crate_package_name(name),
+        base_crate_package_name(feature)
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        crate_requirements_from_cargo_deps, parse_package_name_simple, BuildDeps, CrateDep, Source,
-    };
-    use crate::crates::{all_dependencies_and_features, transitive_deps};
-    use crate::takopack::spec;
+    use super::{crate_requirements_from_cargo_deps, CrateDep, Source};
+    use crate::cargo_packaging::crates::{all_dependencies_and_features, transitive_deps};
+    use crate::rpm::spec;
     use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
     use cargo::util::toml::read_manifest;
     use cargo::GlobalContext;
@@ -1346,10 +803,7 @@ mod tests {
             None,
             "clap",
             "https://example.invalid/clap",
-            "",
             "MIT OR Apache-2.0",
-            true,
-            BuildDeps::default(),
             "4.6.1".to_string(),
             None,
         )
@@ -1563,16 +1017,5 @@ windows = ["dep:windows-sys"]
             "crate(%{pkgname}/std) = %{version}",
             CrateDep::new("%{pkgname}".to_string(), Some("std".to_string())).to_crate_format()
         );
-    }
-
-    #[test]
-    fn legacy_package_parser_only_uses_explicit_plus_features() {
-        let plain_rc = parse_package_name_simple("rust-example-rc-dev").unwrap();
-        assert_eq!("example-rc", plain_rc.crate_name);
-        assert_eq!(None, plain_rc.feature.as_deref());
-
-        let feature_rc = parse_package_name_simple("rust-example-1.0+rc-dev").unwrap();
-        assert_eq!("example", feature_rc.crate_name);
-        assert_eq!(Some("rc"), feature_rc.feature.as_deref());
     }
 }
