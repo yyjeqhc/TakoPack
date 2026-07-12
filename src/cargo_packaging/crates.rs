@@ -7,8 +7,8 @@ use cargo::{
     },
     ops::{self, PackageMessageFormat, PackageOpts, Packages},
     sources::{
-        source::{MaybePackage, QueryKind, Source},
-        IndexSummary, RegistrySource, SourceConfigMap,
+        source::{MaybePackage, QueryKind},
+        IndexSummary, SourceConfigMap,
     },
     util::{
         cache_lock::CacheLockMode, interning::InternedString, toml::read_manifest, FileLock,
@@ -31,7 +31,6 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::{self, ffi::OsStr};
 
-use crate::config::testing_ignore_debpolv;
 use crate::errors::*;
 #[derive(Debug)]
 pub struct CrateInfo {
@@ -56,25 +55,9 @@ pub type CrateDepInfo = BTreeMap<
 >;
 
 fn fetch_candidates(registry: &mut PackageRegistry, dep: &Dependency) -> Result<Vec<IndexSummary>> {
-    let mut summaries = match registry.query_vec(dep, QueryKind::Exact) {
-        std::task::Poll::Ready(res) => res?,
-        std::task::Poll::Pending => {
-            registry.block_until_ready()?;
-            return fetch_candidates(registry, dep);
-        }
-    };
+    let mut summaries = futures::executor::block_on(registry.query_vec(dep, QueryKind::Exact))?;
     summaries.sort_by(|a, b| b.package_id().partial_cmp(&a.package_id()).unwrap());
     Ok(summaries)
-}
-
-pub fn invalidate_crates_io_cache() -> Result<()> {
-    let context = GlobalContext::default()?;
-    let _lock = context.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-    let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
-    let yanked_whitelist = HashSet::new();
-    let mut r = RegistrySource::remote(source_id, &yanked_whitelist, &context)?;
-    r.invalidate_cache();
-    Ok(())
 }
 
 pub fn crate_name_ver_to_dep(crate_name: &str, version: Option<&str>) -> Result<Dependency> {
@@ -123,7 +106,7 @@ pub fn resolve_crates_io_version_req(crate_name: &str, version_req: &str) -> Res
             format_err!(
                 concat!(
                     "Couldn't find any crate matching {}\n",
-                    "Try `takopack update` to update the crates.io index."
+                    "Check the crate name, version requirement, and crates.io index/network state."
                 ),
                 show_dep(&dep)
             )
@@ -197,25 +180,15 @@ impl CrateInfo {
         let (package, crate_file) = {
             let yanked_whitelist = HashSet::new();
 
-            let mut source = source_id.load(&context, &yanked_whitelist)?;
+            let source = source_id.load(&context, &yanked_whitelist)?;
 
             let package_id = match version {
                 None => {
                     let dep = Dependency::parse(crate_name, None, source_id)?;
                     let mut package_id: Option<PackageId> = None;
-                    loop {
-                        match source.query(&dep, QueryKind::Exact, &mut |p| {
-                            package_id = Some(p.package_id())
-                        }) {
-                            std::task::Poll::Ready(res) => {
-                                res?;
-                                break;
-                            }
-                            std::task::Poll::Pending => {
-                                source.block_until_ready()?;
-                            }
-                        }
-                    }
+                    futures::executor::block_on(source.query(&dep, QueryKind::Exact, &mut |p| {
+                        package_id = Some(p.package_id())
+                    }))?;
                     package_id.unwrap()
                 }
                 Some(version) => {
@@ -379,7 +352,7 @@ impl CrateInfo {
                 format_err!(
                     concat!(
                         "Couldn't find any crate matching {}\n",
-                        "Try `takopack update` to update the crates.io index."
+                        "Check the crate name, version requirement, and crates.io index/network state."
                     ),
                     show_dep(dependency)
                 )
@@ -684,9 +657,6 @@ impl CrateInfo {
             if self.includes.iter().any(matches) {
                 takopack_info!("Suspicious file, on whitelist so ignored: {:?}", path);
                 Ok(false)
-            } else if testing_ignore_debpolv() {
-                takopack_warn!("Suspicious file, ignoring as per override: {:?}", path);
-                Ok(false)
             } else {
                 // Allow .c and .a files without error for RPM packaging
                 // TODO: allow may cause issues.
@@ -858,7 +828,7 @@ impl CrateInfo {
             fs::write(path.join("Cargo.toml.orig"), orig_toml.as_bytes())?;
             fs::remove_dir_all(path.join("target"))?;
             source_modified = true;
-            // avoid lintian errors about package-contains-ancient-file
+            // avoid stale timestamps in generated source archives
             // TODO: do we want to do this for unmodified tarballs? it would
             // force us to modify them, but otherwise we get that ugly warning
             let last_mtime = FileTime::from_unix_time(last_mtime as i64, 0);

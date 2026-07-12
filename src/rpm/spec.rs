@@ -56,8 +56,6 @@ pub struct SpecPackage {
     pub description: String,
     pub requires: Vec<CrateRequirement>,
     pub provides: Vec<CrateCapability>,
-    pub obsoletes: Vec<String>,
-    pub conflicts: Vec<String>,
     pub extra_lines: Vec<String>,
 }
 
@@ -176,7 +174,18 @@ pub fn render_source_requirements_section<W: Write>(
 }
 
 pub fn render_main_package_section<W: Write>(out: &mut W, package: &SpecPackage) -> fmt::Result {
-    render_package_metadata(out, package)?;
+    for requirement in &package.requires {
+        writeln!(out, "{}", render_crate_requires(requirement))?;
+    }
+    if !package.requires.is_empty() && !package.provides.is_empty() {
+        writeln!(out)?;
+    }
+    for capability in &package.provides {
+        writeln!(out, "{}", render_crate_provides(capability))?;
+    }
+    for line in &package.extra_lines {
+        writeln!(out, "{}", line)?;
+    }
     render_description(out, None, &package.description)
 }
 
@@ -262,12 +271,6 @@ fn render_package_metadata<W: Write>(out: &mut W, package: &SpecPackage) -> fmt:
     }
     for capability in &package.provides {
         writeln!(out, "{}", render_crate_provides(capability))?;
-    }
-    for obsolete in &package.obsoletes {
-        writeln!(out, "Obsoletes:      {}", obsolete)?;
-    }
-    for conflict in &package.conflicts {
-        writeln!(out, "Conflicts:      {}", conflict)?;
     }
     for line in &package.extra_lines {
         writeln!(out, "{}", line)?;
@@ -364,6 +367,9 @@ mod tests {
         assert!(rendered.contains("%package     -n %{name}+rc"));
         assert!(rendered.contains("Provides:       crate(%{pkgname}/rc) = %{version}"));
         assert!(rendered.contains("Requires:       crate(base64-0.22) >= 0.22.1"));
+        assert!(rendered.contains(
+            "Requires:       crate(base64-0.22) >= 0.22.1\n\nProvides:       crate(%{pkgname}) = %{version}"
+        ));
     }
 
     #[test]

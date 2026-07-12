@@ -12,8 +12,6 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::lockfile_parser::DependencyGraph;
-use crate::package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs, PackageProcess};
 use anyhow::{bail, Context, Result};
 use itertools::Itertools;
 use semver::Version;
@@ -95,34 +93,20 @@ pub fn resolve_output_dir_with_base(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub fn package_final_output_dir(
-    explicit_dir: Option<&Path>,
+    output_root: Option<&Path>,
     output_names: &RustCrateOutputNames,
 ) -> Result<PathBuf> {
-    let default_dir;
-    let requested = match explicit_dir {
-        Some(path) => path,
-        None => {
-            default_dir = PathBuf::from(&output_names.directory);
-            &default_dir
-        }
-    };
-    resolve_output_dir(requested)
+    let root = output_root.unwrap_or_else(|| Path::new("."));
+    Ok(resolve_output_dir(root)?.join(&output_names.directory))
 }
 
 pub fn package_final_output_dir_with_base(
-    explicit_dir: Option<&Path>,
+    output_root: Option<&Path>,
     output_names: &RustCrateOutputNames,
     cwd: &Path,
 ) -> PathBuf {
-    let default_dir;
-    let requested = match explicit_dir {
-        Some(path) => path,
-        None => {
-            default_dir = PathBuf::from(&output_names.directory);
-            &default_dir
-        }
-    };
-    resolve_output_dir_with_base(requested, cwd)
+    let root = output_root.unwrap_or_else(|| Path::new("."));
+    resolve_output_dir_with_base(root, cwd).join(&output_names.directory)
 }
 
 #[cfg(unix)]
@@ -242,8 +226,6 @@ where
     show_vec_with(it, std::string::ToString::to_string)
 }
 
-type TransitiveValueResult<K, V> = Result<Option<V>, (K, Vec<(K, V)>)>;
-
 pub fn expect_success(cmd: &mut Command, err: &str) -> Result<(), anyhow::Error> {
     match cmd.status() {
         Ok(status) if status.success() => Ok(()),
@@ -268,69 +250,6 @@ where
         }
     }
     seen
-}
-
-/// Get a value that might be set at a key or any of its ancestor keys,
-/// whichever is closest. Error if there are conflicting definitions.
-pub(crate) fn get_transitive_val<
-    'a,
-    P: Fn(K) -> Option<&'a Vec<K>>,
-    F: Fn(K) -> Option<V>,
-    K: 'a + Ord + Copy,
-    V: Eq + Ord,
->(
-    getparents: &'a P,
-    f: &F,
-    key: K,
-) -> TransitiveValueResult<K, V> {
-    let mut visited = std::collections::BTreeSet::new();
-    get_transitive_val_impl(getparents, f, key, &mut visited)
-}
-
-fn get_transitive_val_impl<
-    'a,
-    P: Fn(K) -> Option<&'a Vec<K>>,
-    F: Fn(K) -> Option<V>,
-    K: 'a + Ord + Copy,
-    V: Eq + Ord,
->(
-    getparents: &'a P,
-    f: &F,
-    key: K,
-    visited: &mut std::collections::BTreeSet<K>,
-) -> TransitiveValueResult<K, V> {
-    // Check for cycles
-    if visited.contains(&key) {
-        // Cycle detected, return None to break the recursion
-        return Ok(None);
-    }
-
-    visited.insert(key);
-
-    let here = f(key);
-    if here.is_some() {
-        // value overrides anything from parents
-        Ok(here)
-    } else {
-        let mut candidates = Vec::new();
-        for par in getparents(key).into_iter().flatten() {
-            if let Some(v) = get_transitive_val_impl(getparents, f, *par, visited)? {
-                candidates.push((*par, v))
-            }
-        }
-        if candidates.is_empty() {
-            Ok(None) // here is None
-        } else {
-            let mut values = candidates.iter().map(|(_, v)| v).collect::<Vec<_>>();
-            values.sort();
-            values.dedup();
-            if values.len() == 1 {
-                Ok(candidates.pop().map(|(_, v)| v))
-            } else {
-                Err((key, candidates)) // handle conflict
-            }
-        }
-    }
 }
 
 pub fn graph_from_succ<V, FV, FL, E>(
@@ -552,109 +471,6 @@ pub fn backup_cargo_lock(
     Ok(backup_path)
 }
 
-/// Process a single crate
-/// If dep_graph is provided, use Cargo.lock dependencies for spec generation
-pub fn process_single_crate(
-    crate_name: &str,
-    version: &str,
-    base_dir: &PathBuf,
-    dep_graph: Option<&DependencyGraph>,
-) -> Result<()> {
-    // Convert base_dir to absolute path before changing directory
-    let base_dir_abs = fs::canonicalize(base_dir)
-        .with_context(|| format!("Failed to get absolute path for: {:?}", base_dir))?;
-
-    // Create a unique working directory for this crate to avoid conflicts
-    let work_dir = base_dir_abs.join(format!(".work_{}", crate_name.replace('/', "_")));
-    fs::create_dir_all(&work_dir)?;
-
-    // Save current directory
-    let original_dir = std::env::current_dir()?;
-
-    // Change to working directory
-    std::env::set_current_dir(&work_dir)
-        .with_context(|| format!("Failed to change to work directory: {:?}", work_dir))?;
-    let result = (|| -> Result<()> {
-        // Initialize package process
-        let init_args = PackageInitArgs {
-            crate_name: crate_name.to_string(),
-            version: Some(version.to_string()),
-        };
-
-        let extract_args = PackageExtractArgs {
-            directory: None, // Let it extract to current (work) directory
-        };
-
-        // Extract lockfile dependencies if dep_graph is provided
-        let lockfile_deps = dep_graph.and_then(|graph| {
-            // Parse version for lookup
-            if let Ok(ver) = semver::Version::parse(version) {
-                graph.get_dependencies_map(crate_name, &ver)
-            } else {
-                None
-            }
-        });
-        let finish_args = PackageExecuteArgs {
-            changelog_ready: false,
-            copyright_guess_harder: false,
-            no_overlay_write_back: false,
-            with_spdx: false,
-            lockfile_deps, // Pass lockfile dependencies
-        };
-
-        let mut process = PackageProcess::init(init_args)?;
-
-        // Extract crate (will create directory in work dir)
-        process.extract(extract_args)?;
-
-        // Apply overrides
-        process.apply_overrides()?;
-
-        // Prepare orig tarball
-        process.prepare_orig_tarball()?;
-
-        // Prepare takopack folder
-        process.prepare_takopack_folder(finish_args)?;
-
-        // Copy spec file to base_dir (use absolute path)
-        let output_path = process.output_dir.as_ref().unwrap();
-        let takopack_dir = output_path.join("takopack");
-        let output_names = rust_crate_output_names(crate_name, process.crate_info().version());
-        let source_spec = takopack_dir.join(&output_names.spec_file);
-
-        // Create target directory in base_dir_abs (not work_dir)
-        let target_dir = base_dir_abs.join(&output_names.directory);
-        fs::create_dir_all(&target_dir)?;
-        let final_spec = target_dir.join(&output_names.spec_file);
-
-        // Copy spec file to target directory
-        if source_spec.exists() {
-            fs::copy(&source_spec, &final_spec)?;
-            copy_normalized_cargo_toml_to_dir(output_path, &target_dir)?;
-            log::debug!("Copied spec file to: {:?}", final_spec);
-        } else {
-            return Err(anyhow::anyhow!(
-                "Spec file not found at: {}",
-                source_spec.display()
-            ));
-        }
-
-        Ok(())
-    })();
-
-    // Always restore original directory
-    std::env::set_current_dir(&original_dir)
-        .with_context(|| format!("Failed to restore original directory: {:?}", original_dir))?;
-
-    // Cleanup work directory
-    if work_dir.exists() {
-        fs::remove_dir_all(&work_dir)
-            .with_context(|| format!("Failed to cleanup work directory: {:?}", work_dir))?;
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -762,9 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_absolute_output_dir_remains_absolute() {
+    fn explicit_absolute_output_root_keeps_package_directory() {
         let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
-        let out = Path::new("/tmp/takopack-test/rust-libc-0.2");
+        let out = Path::new("/tmp/takopack-test");
 
         assert_eq!(
             package_final_output_dir_with_base(
@@ -772,7 +588,7 @@ mod tests {
                 &output_names,
                 Path::new("/root/git/TakoPack")
             ),
-            out
+            Path::new("/tmp/takopack-test/rust-libc-0.2")
         );
     }
 
@@ -788,16 +604,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_package_dir_is_not_replaced_by_generated_basename() {
+    fn explicit_output_root_contains_generated_package_directory() {
         let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
 
         assert_eq!(
             package_final_output_dir_with_base(
-                Some(Path::new("custom/final-libc-dir")),
+                Some(Path::new("custom/packages")),
                 &output_names,
                 Path::new("/repo")
             ),
-            Path::new("/repo/custom/final-libc-dir")
+            Path::new("/repo/custom/packages/rust-libc-0.2")
         );
 
         assert_eq!(

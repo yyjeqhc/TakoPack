@@ -55,7 +55,7 @@ pub fn process_python_package(
     })?;
 
     // If the package does not exist on PyPI, generate an editable skeleton
-    // instead of failing the whole batch.
+    // instead of failing the whole run.
     let pypi_json = match fetch_pypi_json(package_name) {
         Ok(v) => v,
         Err(e) => {

@@ -1,98 +1,87 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind, Seek, Write as IoWrite};
-use std::ops::Deref;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use control::BuildDeps;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use itertools::Itertools;
 use tar::{Archive, Builder};
 use tempfile;
 
-use crate::config::{package_field_for_feature, testing_ignore_debpolv, Config, PackageKey};
-use crate::crates::{
-    all_dependencies_and_features, show_dep, transitive_deps, CrateDepInfo, CrateInfo,
+use crate::cargo_packaging::crates::{
+    all_dependencies_and_features, show_dep, CrateDepInfo, CrateInfo,
 };
+use crate::config::{Config, PackageKey};
 use crate::errors::*;
-use crate::util::{self, copy_tree, expect_success, get_transitive_val, traverse_depth};
+use crate::util::{self, copy_tree, expect_success, traverse_depth};
 
-use self::control::{base_deb_name, deb_upstream_version};
-use self::control::{Description, Package, PkgTest, Source};
-pub use self::dependency::{deb_dep_add_nocheck, deb_deps};
+use self::metadata::{base_crate_package_name, rpm_upstream_version};
+use self::metadata::{Description, Package, Source};
 use self::spec::{
     render_build_check_install_placeholder, render_changelog_section, render_files_section,
     render_patch_prep_placeholder, SpecFiles,
 };
 
-pub mod control;
-mod dependency;
+pub mod metadata;
 pub mod spec;
 
-pub struct DebInfo {
+pub struct RpmPackageInfo {
     upstream_name: String,
     /// takopack package name without `rust-` prefix or any semver suffix
     base_package_name: String,
     /// Package name suffix after the base package name.
     /// Some implies semver_suffix, i.e. Some("") is different from None
     name_suffix: Option<String>,
-    uscan_version_pattern: Option<String>,
     /// takopack package name without `rust-` prefix
     package_name: String,
-    deb_upstream_version: String,
+    rpm_upstream_version: String,
     takopack_version: String,
     package_source_dir: PathBuf,
-    orig_tarball_path: PathBuf,
+    source_archive_path: PathBuf,
 }
 
-impl DebInfo {
+impl RpmPackageInfo {
     pub fn new(crate_info: &CrateInfo, takopack_version: &str, semver_suffix: bool) -> Self {
         let upstream_name = crate_info.package_id().name().to_string();
-        let name_dashed = base_deb_name(&upstream_name);
+        let name_dashed = base_crate_package_name(&upstream_name);
         let base_package_name = name_dashed.to_lowercase();
-        let deb_upstream_version = deb_upstream_version(crate_info.version());
+        let rpm_upstream_version = rpm_upstream_version(crate_info.version());
 
-        let (name_suffix, uscan_version_pattern, package_name) = if semver_suffix {
+        let (name_suffix, package_name) = if semver_suffix {
             // semver now includes full version for prerelease (e.g., 0.26.0-beta.1)
             // and compat version for normal releases (e.g., 0.26 or 1)
             let semver = crate_info.semver();
             let name_suffix = format!("-{}", &semver);
-            // See `man uscan` description of @ANY_VERSION@ on how these
-            // regex patterns were built.
-            let uscan = format!("[-_]?({}\\.\\d[\\-+\\.:\\~\\da-zA-Z]*)", &semver);
             let pkgname = format!("{}{}", base_package_name, &name_suffix);
-            (Some(name_suffix), Some(uscan), pkgname)
+            (Some(name_suffix), pkgname)
         } else {
-            (None, None, base_package_name.clone())
+            (None, base_package_name.clone())
         };
         let package_source_dir = PathBuf::from(format!(
             "{}-{}-{}",
             Source::pkg_prefix(),
             package_name,
-            deb_upstream_version
+            rpm_upstream_version
         ));
-        let orig_tarball_path = PathBuf::from(format!(
-            "{}-{}_{}.orig.tar.gz",
+        let source_archive_path = PathBuf::from(format!(
+            "{}-{}-{}.tar.gz",
             Source::pkg_prefix(),
             package_name,
-            deb_upstream_version
+            rpm_upstream_version
         ));
 
-        DebInfo {
+        RpmPackageInfo {
             upstream_name,
             base_package_name,
             name_suffix,
-            uscan_version_pattern,
             package_name,
-            deb_upstream_version,
+            rpm_upstream_version,
             takopack_version: takopack_version.to_string(),
             package_source_dir,
-            orig_tarball_path,
+            source_archive_path,
         }
     }
 
@@ -112,8 +101,8 @@ impl DebInfo {
         self.package_name.as_str()
     }
 
-    pub fn deb_upstream_version(&self) -> &str {
-        self.deb_upstream_version.as_str()
+    pub fn rpm_upstream_version(&self) -> &str {
+        self.rpm_upstream_version.as_str()
     }
 
     pub fn takopack_version(&self) -> &str {
@@ -124,17 +113,17 @@ impl DebInfo {
         self.package_source_dir.as_ref()
     }
 
-    pub fn orig_tarball_path(&self) -> &Path {
-        self.orig_tarball_path.as_ref()
+    pub fn source_archive_path(&self) -> &Path {
+        self.source_archive_path.as_ref()
     }
 }
 
-impl std::fmt::Debug for DebInfo {
+impl std::fmt::Debug for RpmPackageInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Package Name:   {}", self.package_name)?;
-        writeln!(f, "Version:        {}", self.deb_upstream_version)?;
+        writeln!(f, "Version:        {}", self.rpm_upstream_version)?;
         writeln!(f, "Source Dir:     {}", self.package_source_dir.display())?;
-        writeln!(f, "Tarball:        {}", self.orig_tarball_path.display())?;
+        writeln!(f, "Source Archive: {}", self.source_archive_path.display())?;
         if let Some(ref suffix) = self.name_suffix {
             writeln!(f, "Name Suffix:    {}", suffix)?;
         }
@@ -142,37 +131,43 @@ impl std::fmt::Debug for DebInfo {
     }
 }
 
-impl Clone for DebInfo {
+impl Clone for RpmPackageInfo {
     fn clone(&self) -> Self {
-        DebInfo {
+        RpmPackageInfo {
             upstream_name: self.upstream_name.clone(),
             base_package_name: self.base_package_name.clone(),
             name_suffix: self.name_suffix.clone(),
-            uscan_version_pattern: self.uscan_version_pattern.clone(),
             package_name: self.package_name.clone(),
-            deb_upstream_version: self.deb_upstream_version.clone(),
+            rpm_upstream_version: self.rpm_upstream_version.clone(),
             takopack_version: self.takopack_version.clone(),
             package_source_dir: self.package_source_dir.clone(),
-            orig_tarball_path: self.orig_tarball_path.clone(),
+            source_archive_path: self.source_archive_path.clone(),
         }
     }
 }
 
-pub fn prepare_orig_tarball(
+pub fn prepare_source_archive(
     crate_info: &CrateInfo,
-    tarball: &Path,
+    archive: &Path,
     src_modified: bool,
     output_dir: &Path,
 ) -> Result<()> {
     let crate_file = crate_info.crate_file();
+    let archive_parent = archive
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let tempdir = tempfile::Builder::new()
         .prefix("takopack")
-        .tempdir_in(".")?;
-    let temp_archive_path = tempdir.path().join(tarball);
+        .tempdir_in(archive_parent)?;
+    let archive_name = archive
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("source archive path has no file name"))?;
+    let temp_archive_path = tempdir.path().join(archive_name);
 
-    // Remove existing tarball file if it exists to avoid "File exists" error
-    if tarball.exists() {
-        fs::remove_file(tarball)?;
+    // Remove existing archive file if it exists to avoid "File exists" error.
+    if archive.exists() {
+        fs::remove_file(archive)?;
     }
 
     let mut create = fs::OpenOptions::new();
@@ -192,7 +187,7 @@ pub fn prepare_orig_tarball(
             let entry = entry?;
             let path = entry.path()?.into_owned();
             if path.ends_with("Cargo.toml") && path.iter().count() == 2 {
-                // Put the rewritten and original Cargo.toml back into the orig tarball
+                // Put the rewritten and original Cargo.toml back into the source archive.
                 let mut new_archive_append = |name: &str| {
                     let mut header = entry.header().clone();
                     let srcpath = output_dir.join(name);
@@ -212,7 +207,7 @@ pub fn prepare_orig_tarball(
                         } else {
                             writeln!(
                                 io::stderr(),
-                                "Filtered out files from .orig.tar.gz: {:?}",
+                                "Filtered out files from source archive: {:?}",
                                 &entry.path()?
                             )?;
                         }
@@ -226,7 +221,7 @@ pub fn prepare_orig_tarball(
         fs::copy(crate_file.path(), &temp_archive_path)?;
     }
 
-    fs::rename(temp_archive_path, tarball)?;
+    fs::rename(temp_archive_path, archive)?;
     Ok(())
 }
 
@@ -252,11 +247,21 @@ pub fn apply_overlay_and_patches(
         }
         copy_tree(p.as_path(), tempdir.path())?;
     }
-    if tempdir.path().join("control").exists() {
+    if fs::read_dir(tempdir.path())?.any(|entry| {
+        entry
+            .ok()
+            .and_then(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|ext| ext == OsStr::new("spec"))
+            })
+            .unwrap_or(false)
+    }) {
         takopack_warn!(
-            "Most of the time you shouldn't overlay takopack/control, \
+            "Most of the time you shouldn't overlay generated spec files; \
 it's a maintenance burden. Use takopack.toml instead."
-        )
+        );
     }
     // apply patches to Cargo.toml in case they exist, and re-read it
     if tempdir.path().join("patches").join("series").exists() {
@@ -311,12 +316,12 @@ it's a maintenance burden. Use takopack.toml instead."
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_takopack_folder(
     crate_info: &mut CrateInfo,
-    deb_info: &DebInfo,
+    rpm_info: &RpmPackageInfo,
     config_path: Option<&Path>,
     config: &Config,
     output_dir: &Path,
     tempdir: &tempfile::TempDir,
-    changelog_ready: bool,
+    _changelog_ready: bool,
     _copyright_guess_harder: bool,
     overlay_write_back: bool,
     sha256: Option<String>, // SHA256 hash of downloaded crate
@@ -358,9 +363,9 @@ pub fn prepare_takopack_folder(
         )?;
     }
 
-    // takopack/control & takopack/tests/control
-    let (_source, has_dev_depends, default_test_broken) = prepare_takopack_control(
-        deb_info,
+    // takopack/<spec>
+    let _source = prepare_takopack_spec(
+        rpm_info,
         crate_info,
         config,
         sha256,
@@ -369,86 +374,9 @@ pub fn prepare_takopack_folder(
         with_spdx,
     )?;
 
-    // for testing only, takopack/takopack_testing_bin/env
-    if testing_ignore_debpolv() {
-        fs::create_dir_all(tempdir.path().join("takopack_testing_bin"))?;
-        let mut env_hack = file("takopack_testing_bin/env")?;
-        #[cfg(unix)]
-        env_hack.set_permissions(fs::Permissions::from_mode(0o777))?;
-        // intercept calls to dh-cargo-built-using
-        writeln!(
-            env_hack,
-            r#"#!/bin/sh
-case "$*" in */usr/share/cargo/bin/dh-cargo-built-using*)
-echo "takopack testing: suppressing dh-cargo-built-using";;
-*) /usr/bin/env "$@";; esac
-"#
-        )?;
-    }
-
-    // takopack/rules
-    {
-        let mut rules = file("rules")?;
-        #[cfg(unix)]
-        rules.set_permissions(fs::Permissions::from_mode(0o777))?;
-        if has_dev_depends || testing_ignore_debpolv() {
-            // don't run any tests, we don't want extra B-D on dev-depends
-            // this could potentially cause B-D cycles so we avoid it
-            //
-            // also don't run crate tests during integration testing since some
-            // of them are brittle and fail; the purpose is to test takopack
-            // not the actual crates
-            write!(
-                rules,
-                "{}",
-                concat!(
-                    "#!/usr/bin/make -f\n",
-                    "%:\n",
-                    "\tdh $@ --buildsystem cargo\n"
-                )
-            )?;
-            // some crates need nightly to compile, annoyingly. only do this in
-            // testing; outside of testing the user should explicitly override
-            // takopack/rules to do this
-            if testing_ignore_debpolv() {
-                writeln!(rules, "export RUSTC_BOOTSTRAP := 1")?;
-                writeln!(
-                    rules,
-                    "export PATH := $(CURDIR)/takopack/takopack_testing_bin:$(PATH)"
-                )?;
-            }
-        } else {
-            write!(
-                rules,
-                "{}{}",
-                concat!(
-                    "#!/usr/bin/make -f\n",
-                    "%:\n",
-                    "\tdh $@ --buildsystem cargo\n",
-                    "\n",
-                    "override_dh_auto_test:\n",
-                ),
-                // TODO: this logic is slightly brittle if another feature
-                // "provides" the default feature. In this case, you need to
-                // set test_is_broken explicitly on package."lib+default" and
-                // not package."lib+theotherfeature".
-                if default_test_broken {
-                    "\tdh_auto_test -- test --all || true\n"
-                } else {
-                    "\tdh_auto_test -- test --all\n"
-                },
-            )?;
-        }
-    }
-
     if overlay_write_back {
         let overlay = config.overlay_dir(config_path);
         if let Some(p) = overlay.as_ref() {
-            if !changelog_ready {
-                // Special-case d/changelog:
-                // Always write it back, this is safe because of our prepending logic
-                new_hints.push("changelog".to_string());
-            }
             for hint in &new_hints {
                 let newpath = tempdir.path().join(hint);
                 let oldpath = p.join(hint);
@@ -462,50 +390,42 @@ echo "takopack testing: suppressing dh-cargo-built-using";;
     Ok(())
 }
 
-fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::Error>>(
-    deb_info: &DebInfo,
+fn prepare_takopack_spec<F: FnMut(&str) -> std::result::Result<fs::File, io::Error>>(
+    rpm_info: &RpmPackageInfo,
     crate_info: &CrateInfo,
     config: &Config,
     sha256: Option<String>, // SHA256 hash of downloaded crate
     lockfile_deps: Option<&HashMap<String, semver::Version>>, // Optional lockfile dependencies
     mut file: F,
     with_spdx: bool,
-) -> Result<(Source, bool, bool)> {
+) -> Result<Source> {
     let crate_name = crate_info.crate_name();
-    let deb_upstream_version = deb_info.deb_upstream_version();
-    let base_pkgname = deb_info.base_package_name();
-    let name_suffix = deb_info.name_suffix();
+    let base_pkgname = rpm_info.base_package_name();
+    let name_suffix = rpm_info.name_suffix();
 
     let lib = crate_info.is_lib();
-    let (bins, bin_name) = selected_binary_targets(crate_info, deb_info, config, lib);
-    let prepared =
-        prepare_control_source(deb_info, crate_info, config, sha256, lib, &bins, with_spdx)?;
+    let bins = crate_info.get_binary_targets();
+    let prepared = prepare_spec_source(rpm_info, crate_info, config, sha256, with_spdx)?;
 
     let output_names = util::rust_crate_output_names(crate_name, crate_info.version());
-    let mut control = io::BufWriter::new(file(&output_names.spec_file)?);
-    write!(control, "{}", prepared.source)?;
+    let mut spec_file = io::BufWriter::new(file(&output_names.spec_file)?);
+    write!(spec_file, "{}", prepared.source)?;
 
     if lib {
         write_library_packages(
-            &mut control,
-            &mut file,
-            &prepared.source,
-            crate_info,
+            &mut spec_file,
             config,
             &prepared.features_with_deps,
             base_pkgname,
             name_suffix,
             crate_name,
-            deb_upstream_version,
             &prepared.summary_prefix,
             &prepared.description_prefix,
-            &prepared.test_deps,
             lockfile_deps,
         )?;
     } else if !bins.is_empty() {
         write_binary_only_package(
-            &mut control,
-            crate_info,
+            &mut spec_file,
             config,
             &prepared.features_with_deps,
             base_pkgname,
@@ -518,84 +438,29 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         )?;
     }
 
-    if !bins.is_empty() {
-        prepare_binary_package_for_overrides(
-            config,
-            lib,
-            bin_name,
-            name_suffix,
-            crate_name,
-            &bins,
-            &prepared.summary_prefix,
-            &prepared.description_prefix,
-            lockfile_deps,
-        );
-    }
+    write_extra_packages(&mut spec_file, config)?;
+    write_trailing_spec_sections(&mut spec_file)?;
 
-    write_extra_packages(&mut control, config)?;
-    write_trailing_spec_sections(&mut control)?;
-
-    let default_test_broken =
-        feature_test_is_broken(config, &prepared.features_with_deps, "default")?;
-    Ok((prepared.source, prepared.has_dev_deps, default_test_broken))
+    Ok(prepared.source)
 }
 
-struct PreparedControl {
+struct PreparedSpec {
     source: Source,
     features_with_deps: CrateDepInfo,
-    has_dev_deps: bool,
-    test_deps: Vec<String>,
     summary_prefix: String,
     description_prefix: String,
 }
 
-fn selected_binary_targets<'a>(
-    crate_info: &'a CrateInfo,
-    deb_info: &'a DebInfo,
-    config: &'a Config,
-    lib: bool,
-) -> (Vec<&'a str>, &'a str) {
-    let mut bins = crate_info.get_binary_targets();
-    if lib && !bins.is_empty() && !config.build_bin_package() {
-        bins.clear();
-    }
-
-    let bin_name = if config.bin_name.eq(&Config::default().bin_name) {
-        let default_bin_name = deb_info.base_package_name();
-        if !bins.is_empty() {
-            takopack_info!(
-                "Generate binary crate with default name '{}', set bin_name to override or bin = false to disable.",
-                &default_bin_name
-            );
-        }
-        default_bin_name
-    } else {
-        config.bin_name.as_str()
-    };
-
-    (bins, bin_name)
-}
-
-fn prepare_control_source(
-    deb_info: &DebInfo,
+fn prepare_spec_source(
+    rpm_info: &RpmPackageInfo,
     crate_info: &CrateInfo,
     config: &Config,
     sha256: Option<String>,
-    lib: bool,
-    bins: &[&str],
     with_spdx: bool,
-) -> Result<PreparedControl> {
+) -> Result<PreparedSpec> {
     let crate_name = crate_info.crate_name();
     let features_with_deps = all_dependencies_and_features(crate_info.manifest())?;
     log_feature_deps("features_with_deps", &features_with_deps);
-
-    let dev_depends = deb_deps(config.allow_prerelease_deps, &crate_info.dev_dependencies())?;
-    let has_dev_deps = !dev_depends.is_empty();
-    let build_deps = build_deps_for_source(config, crate_info, &features_with_deps, lib, bins)?;
-    let test_deps: Vec<String> = Some(rustc_dep(&crate_info.rust_version(), false))
-        .into_iter()
-        .chain(dev_depends)
-        .collect();
 
     let meta = crate_info.metadata();
     let homepage = meta
@@ -603,19 +468,15 @@ fn prepare_control_source(
         .as_deref()
         .or(meta.repository.as_deref())
         .unwrap_or("");
-    let repository = meta.repository.as_deref().unwrap_or("");
     let license = meta.license.as_deref().unwrap_or("").replace('/', " OR ");
     let full_version = crate_info.version().to_string();
     let mut source = Source::new(
-        deb_info.base_package_name(),
-        deb_info.deb_upstream_version(),
-        deb_info.name_suffix(),
+        rpm_info.base_package_name(),
+        rpm_info.rpm_upstream_version(),
+        rpm_info.name_suffix(),
         crate_name,
         homepage,
-        repository,
         &license,
-        lib,
-        build_deps,
         full_version,
         sha256,
     )?;
@@ -632,185 +493,36 @@ fn prepare_control_source(
         }
     };
 
-    Ok(PreparedControl {
+    Ok(PreparedSpec {
         source,
         features_with_deps,
-        has_dev_deps,
-        test_deps,
         summary_prefix,
         description_prefix,
     })
 }
 
-fn build_deps_for_source(
-    config: &Config,
-    crate_info: &CrateInfo,
-    features_with_deps: &CrateDepInfo,
-    lib: bool,
-    bins: &[&str],
-) -> Result<BuildDeps> {
-    let mut build_deps = BuildDeps::default();
-    build_deps.build_depends.extend(
-        ["debhelper-compat (= 13)", "dh-sequence-cargo"]
-            .iter()
-            .map(|x| x.to_string()),
-    );
-
-    // note: please keep this in sync with build_order::dep_features
-    let (default_features, default_deps) = transitive_deps(features_with_deps, "default")?;
-    let extra_override_deps = package_field_for_feature(
-        |x| config.package_depends(x),
-        PackageKey::feature("default"),
-        &default_features,
-    );
-    let build_deps_arch = toolchain_deps(&crate_info.rust_version())
-        .into_iter()
-        .chain(deb_deps(config.allow_prerelease_deps, &default_deps)?)
-        .chain(extra_override_deps);
-
-    if !bins.is_empty() {
-        build_deps.build_depends_arch.extend(build_deps_arch);
-    } else {
-        if !lib {
-            log::warn!(
-                "Crate has no library or binary targets; generating source-only build dependencies"
-            );
-        }
-        build_deps
-            .build_depends_arch
-            .extend(build_deps_arch.map(|d| {
-                if config.skip_nocheck().unwrap_or(false) {
-                    d
-                } else {
-                    deb_dep_add_nocheck(&d)
-                }
-            }));
-    }
-
-    Ok(build_deps)
-}
-
-fn feature_test_is_broken(
-    config: &Config,
-    features_with_deps: &CrateDepInfo,
-    feature: &str,
-) -> Result<bool> {
-    let test_is_marked_broken = |f: &str| config.package_test_is_broken(PackageKey::feature(f));
-    let getparents = |f: &str| features_with_deps.get(f).map(|(d, _)| d);
-    match get_transitive_val(&getparents, &test_is_marked_broken, feature) {
-        Err((k, vv)) => takopack_bail!(
-            "{} {}: {}: {:?}",
-            "error trying to recursively determine test_is_broken for",
-            k,
-            "dependencies have inconsistent config values",
-            vv
-        ),
-        Ok(v) => Ok(v.unwrap_or(false)),
-    }
-}
-
-fn feature_test_architecture(
-    config: &Config,
-    features_with_deps: &CrateDepInfo,
-    feature: &str,
-) -> Result<Option<Vec<String>>> {
-    let getparents = |f: &str| features_with_deps.get(f).map(|(d, _)| d);
-    let feature_get_test_architecture =
-        |f: &str| config.package_test_architecture(PackageKey::feature(f));
-    match get_transitive_val(&getparents, &feature_get_test_architecture, feature) {
-        Err((k, vv)) => takopack_bail!(
-            "{} {}: {}: {:?}",
-            "error trying to recursively determine test_architecture for",
-            k,
-            "dependencies have inconsistent config values",
-            vv
-        ),
-        Ok(Some(v)) if v.is_empty() => Ok(None), // allow resetting via explicit empty list
-        Ok(other) => Ok(other.cloned()),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn write_library_packages<F>(
-    control: &mut io::BufWriter<fs::File>,
-    file: &mut F,
-    source: &Source,
-    crate_info: &CrateInfo,
+fn write_library_packages(
+    spec_file: &mut io::BufWriter<fs::File>,
     config: &Config,
     features_with_deps: &CrateDepInfo,
     base_pkgname: &str,
     name_suffix: Option<&str>,
     crate_name: &str,
-    deb_upstream_version: &str,
     summary_prefix: &str,
     description_prefix: &str,
-    test_deps: &[String],
     lockfile_deps: Option<&HashMap<String, semver::Version>>,
-) -> Result<()>
-where
-    F: FnMut(&str) -> std::result::Result<fs::File, io::Error>,
-{
-    let all_features: Vec<&str> = features_with_deps.keys().copied().collect();
-    let all_features_test_broken = match config.package_test_is_broken(PackageKey::feature("@")) {
-        Some(v) => v,
-        None => all_features.iter().any(|f| {
-            config
-                .package_test_is_broken(PackageKey::feature(f))
-                .unwrap_or(false)
-        }),
-    };
-    let all_features_test_arch = match feature_test_architecture(config, features_with_deps, "@")? {
-        Some(v) => v,
-        None => all_features
-            .iter()
-            .fold(HashSet::new(), |mut set, f| {
-                if let Ok(Some(arch)) = feature_test_architecture(config, features_with_deps, f) {
-                    set.extend(arch);
-                }
-                set
-            })
-            .into_iter()
-            .collect_vec(),
-    };
-    let all_features_test_arch: Vec<&str> =
-        all_features_test_arch.iter().map(AsRef::as_ref).collect();
-    let all_features_test_depends =
-        generate_test_dependencies("@", &all_features, config, test_deps);
-    let mut testctl = io::BufWriter::new(file("tests/control")?);
-    write!(
-        testctl,
-        "{}",
-        PkgTest::new(
-            source.name(),
-            crate_name,
-            "@",
-            deb_upstream_version,
-            vec!["--all-features"],
-            &all_features_test_depends,
-            if all_features_test_broken {
-                vec!["flaky"]
-            } else {
-                vec![]
-            },
-            all_features_test_arch.deref(),
-        )?
-    )?;
-
+) -> Result<()> {
     let transformed = transform_feature_packages(features_with_deps.clone(), config)?;
     let mut provides = transformed.provides;
     let reduced_features_with_deps = transformed.reduced_features_with_deps;
     let original_features = transformed.original_features;
-    let (recommends, suggests) = feature_recommendations(&provides);
-    let no_features_edge_case = is_no_features_edge_case(features_with_deps);
     let all_subpackage_features =
         collect_subpackage_features(&reduced_features_with_deps, &provides);
 
     for (feature, (f_deps, o_deps)) in reduced_features_with_deps.into_iter() {
         let pk = PackageKey::feature(feature);
         let f_provides = provides.remove(feature).unwrap();
-        let mut crate_features = f_provides.clone();
-        crate_features.push(feature);
-
         let summary_suffix = package_summary_suffix(feature, &f_provides);
         let description_suffix = package_description_suffix(crate_name, feature, &f_provides);
         let package_all_features = if feature.is_empty() {
@@ -826,7 +538,6 @@ where
         let mut package = Package::new(
             base_pkgname,
             name_suffix,
-            crate_info.version(),
             Description {
                 prefix: summary_prefix.to_string(),
                 suffix: summary_suffix,
@@ -841,50 +552,16 @@ where
                 Some(feature)
             },
             f_deps,
-            deb_deps(config.allow_prerelease_deps, &o_deps)?,
             o_deps.clone(),
             f_provides.clone(),
-            if feature.is_empty() {
-                recommends.clone()
-            } else {
-                vec![]
-            },
-            if feature.is_empty() {
-                suggests.clone()
-            } else {
-                vec![]
-            },
             package_all_features,
         )?;
 
         if let Some(lockfile) = lockfile_deps {
             package.apply_lockfile_deps(lockfile);
         }
-        package.apply_overrides(config, pk, f_provides);
-        write!(control, "{}", package)?;
-
-        if !feature.is_empty() {
-            let mut overrides =
-                io::BufWriter::new(file(&format!("{}.lintian-overrides", package.name()))?);
-            write!(
-                overrides,
-                "{} binary: empty-rust-library-declares-provides *",
-                package.name()
-            )?;
-        }
-
-        if !no_features_edge_case {
-            write_feature_tests(
-                &mut testctl,
-                &package,
-                crate_name,
-                deb_upstream_version,
-                &crate_features,
-                features_with_deps,
-                config,
-                test_deps,
-            )?;
-        }
+        package.apply_overrides(config, pk);
+        write!(spec_file, "{}", package)?;
     }
     assert!(provides.is_empty());
     Ok(())
@@ -902,11 +579,11 @@ fn transform_feature_packages(
 ) -> Result<TransformedFeatures> {
     let potential_corner_case = working_features_with_deps
         .keys()
-        .filter(|x| base_deb_name(x).as_str() != **x)
+        .filter(|x| base_crate_package_name(x).as_str() != **x)
         .cloned()
         .collect::<Vec<_>>();
     for f in potential_corner_case {
-        let f_ = base_deb_name(f);
+        let f_ = base_crate_package_name(f);
         if let Some((df1, dd1)) = working_features_with_deps.remove(f_.as_str()) {
             working_features_with_deps
                 .entry(f)
@@ -979,30 +656,6 @@ fn log_feature_deps(label: &str, features_with_deps: &CrateDepInfo) {
     );
 }
 
-fn feature_recommendations(
-    provides: &BTreeMap<&'static str, Vec<&'static str>>,
-) -> (Vec<&'static str>, Vec<&'static str>) {
-    let mut recommends = vec![];
-    let mut suggests = vec![];
-    for (&feature, features) in provides.iter() {
-        if feature.is_empty() {
-            continue;
-        } else if feature == "default" || features.contains(&"default") {
-            recommends.push(feature);
-        } else {
-            suggests.push(feature);
-        }
-    }
-    (recommends, suggests)
-}
-
-fn is_no_features_edge_case(features_with_deps: &CrateDepInfo) -> bool {
-    let mut no_features_edge_case = BTreeMap::new();
-    no_features_edge_case.insert("", (vec![], vec![]));
-    no_features_edge_case.insert("default", (vec![""], vec![]));
-    features_with_deps == &no_features_edge_case
-}
-
 fn collect_subpackage_features(
     reduced_features_with_deps: &CrateDepInfo,
     provides: &BTreeMap<&'static str, Vec<&'static str>>,
@@ -1061,55 +714,8 @@ fn package_description_suffix(crate_name: &str, feature: &str, f_provides: &[&st
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_feature_tests(
-    testctl: &mut io::BufWriter<fs::File>,
-    package: &Package,
-    crate_name: &str,
-    deb_upstream_version: &str,
-    crate_features: &[&str],
-    features_with_deps: &CrateDepInfo,
-    config: &Config,
-    test_deps: &[String],
-) -> Result<()> {
-    for f in crate_features {
-        let (feature_deps, _) = transitive_deps(features_with_deps, f)?;
-        let mut args = if *f == "default" || feature_deps.contains(&"default") {
-            vec![]
-        } else {
-            vec!["--no-default-features"]
-        };
-        if !f.is_empty() && *f != "default" {
-            args.push("--features");
-            args.push(f);
-        }
-
-        let test_depends = generate_test_dependencies(f, &feature_deps, config, test_deps);
-        let test_arch: Vec<String> =
-            feature_test_architecture(config, features_with_deps, f)?.unwrap_or_default();
-        let test_arch: Vec<&str> = test_arch.iter().map(AsRef::as_ref).collect();
-        let pkgtest = PkgTest::new(
-            package.name(),
-            crate_name,
-            f,
-            deb_upstream_version,
-            args,
-            &test_depends,
-            if feature_test_is_broken(config, features_with_deps, f)? {
-                vec!["flaky"]
-            } else {
-                vec![]
-            },
-            test_arch.deref(),
-        )?;
-        write!(testctl, "\n{}", pkgtest)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn write_binary_only_package(
-    control: &mut io::BufWriter<fs::File>,
-    crate_info: &CrateInfo,
+    spec_file: &mut io::BufWriter<fs::File>,
     config: &Config,
     features_with_deps: &CrateDepInfo,
     base_pkgname: &str,
@@ -1127,7 +733,6 @@ fn write_binary_only_package(
     let mut package = Package::new(
         base_pkgname,
         name_suffix,
-        crate_info.version(),
         Description {
             prefix: summary_prefix.to_string(),
             suffix: " - Rust source code".to_string(),
@@ -1138,10 +743,7 @@ fn write_binary_only_package(
         },
         None,
         vec![],
-        deb_deps(config.allow_prerelease_deps, base_deps)?,
         base_deps.clone(),
-        vec![],
-        vec![],
         vec![],
         vec![],
     )?;
@@ -1149,46 +751,9 @@ fn write_binary_only_package(
     if let Some(lockfile) = lockfile_deps {
         package.apply_lockfile_deps(lockfile);
     }
-    package.apply_overrides(config, PackageKey::feature(""), vec![]);
-    write!(control, "{}", package)?;
+    package.apply_overrides(config, PackageKey::feature(""));
+    write!(spec_file, "{}", package)?;
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_binary_package_for_overrides(
-    config: &Config,
-    lib: bool,
-    bin_name: &str,
-    name_suffix: Option<&str>,
-    crate_name: &str,
-    bins: &[&str],
-    summary_prefix: &str,
-    description_prefix: &str,
-    lockfile_deps: Option<&HashMap<String, semver::Version>>,
-) {
-    let mut bin_pkg = Package::new_bin(
-        bin_name,
-        name_suffix,
-        if !lib {
-            None
-        } else {
-            Some("FIXME-(packages.\"(name)\".section)")
-        },
-        Description {
-            prefix: summary_prefix.to_string(),
-            suffix: "".to_string(),
-        },
-        Description {
-            prefix: description_prefix.to_string(),
-            suffix: binary_description_suffix(crate_name, bins),
-        },
-    );
-
-    if let Some(lockfile) = lockfile_deps {
-        bin_pkg.apply_lockfile_deps(lockfile);
-    }
-    bin_pkg.apply_overrides(config, PackageKey::Bin, vec![]);
-    // Skip bin package output for RPM spec - we only need library packages.
 }
 
 fn binary_description_suffix(crate_name: &str, bins: &[&str]) -> String {
@@ -1199,19 +764,19 @@ fn binary_description_suffix(crate_name: &str, bins: &[&str]) -> String {
     )
 }
 
-fn write_extra_packages(control: &mut io::BufWriter<fs::File>, config: &Config) -> Result<()> {
+fn write_extra_packages(spec_file: &mut io::BufWriter<fs::File>, config: &Config) -> Result<()> {
     for configured in config.configured_packages() {
         if let PackageKey::Extra(package) = configured {
             let mut extra_pkg = Package::new_extra(package.to_string());
-            extra_pkg.apply_overrides(config, configured, vec![]);
-            write!(control, "\n{}", extra_pkg)?;
+            extra_pkg.apply_overrides(config, configured);
+            write!(spec_file, "\n{}", extra_pkg)?;
         }
     }
     Ok(())
 }
 
-fn write_trailing_spec_sections(control: &mut io::BufWriter<fs::File>) -> Result<()> {
-    writeln!(control)?;
+fn write_trailing_spec_sections(spec_file: &mut io::BufWriter<fs::File>) -> Result<()> {
+    writeln!(spec_file)?;
     let mut trailing_sections = String::new();
     render_patch_prep_placeholder(&mut trailing_sections)?;
     render_build_check_install_placeholder(&mut trailing_sections)?;
@@ -1223,28 +788,8 @@ fn write_trailing_spec_sections(control: &mut io::BufWriter<fs::File>) -> Result
         }],
     )?;
     render_changelog_section(&mut trailing_sections)?;
-    write!(control, "{}", trailing_sections)?;
+    write!(spec_file, "{}", trailing_sections)?;
     Ok(())
-}
-
-fn generate_test_dependencies(
-    f: &str,
-    feature_deps: &[&str],
-    config: &Config,
-    test_deps: &[String],
-) -> Vec<String> {
-    Some(f)
-        .iter()
-        .chain(feature_deps)
-        .flat_map(|f| {
-            config
-                .package_test_depends(PackageKey::feature(f))
-                .into_iter()
-                .flatten()
-        })
-        .map(|s| s.to_string())
-        .chain(test_deps.to_owned())
-        .collect::<Vec<_>>()
 }
 
 fn collapse_features(
@@ -1340,50 +885,4 @@ fn reduce_provides(
         .collect::<BTreeMap<_, _>>();
 
     (provides, features_with_deps)
-}
-
-pub(crate) fn toolchain_deps(min_rust_version: &Option<String>) -> Vec<String> {
-    let rustc = rustc_dep(min_rust_version, true);
-    // libstd-rust-dev here is needed to pick up the right arch variant for cross-builds!
-    ["cargo:native".into(), rustc, "libstd-rust-dev".into()].into()
-}
-
-fn rustc_dep(min_ver: &Option<String>, native: bool) -> String {
-    let native = if native { ":native" } else { "" };
-    if let Some(min_ver) = min_ver {
-        format!("rustc{native} (>= {min_ver})")
-    } else {
-        format!("rustc{native}")
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::rustc_dep;
-
-    #[test]
-    fn rustc_dep_includes_minver() {
-        assert_eq!(
-            "rustc:native (>= 1.65)",
-            rustc_dep(&Some("1.65".to_string()), true)
-        );
-    }
-
-    #[test]
-    fn rustc_dep_excludes_minver() {
-        assert_eq!("rustc:native", rustc_dep(&None, true));
-    }
-
-    #[test]
-    fn rustc_dep_includes_minver_autopkgtest() {
-        assert_eq!(
-            "rustc (>= 1.65)",
-            rustc_dep(&Some("1.65".to_string()), false)
-        );
-    }
-
-    #[test]
-    fn rustc_dep_excludes_minver_autopkgtest() {
-        assert_eq!("rustc", rustc_dep(&None, false));
-    }
 }
